@@ -31,6 +31,7 @@ const MUTED: Color = Color::Rgb(100, 116, 139);
 const PANEL: Color = Color::Rgb(15, 23, 42);
 const DEEP: Color = Color::Rgb(7, 12, 20);
 const BORDER: Color = Color::Rgb(51, 65, 85);
+const TERMINAL_LOGO: &str = " W╱╲╱ ";
 
 pub fn run(app: &mut WipsawApp) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -41,6 +42,7 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
         });
     }
 
+    let _popup_guard = NavigatorPopupGuard::new(app);
     let mut session = TerminalSession::enter()?;
     let mut navigator = Navigator::load(app)?;
 
@@ -191,6 +193,28 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
     Ok(())
 }
 
+struct NavigatorPopupGuard {
+    tmux: Option<crate::tmux::TmuxBackend>,
+    session: Option<String>,
+}
+
+impl NavigatorPopupGuard {
+    fn new(app: &WipsawApp) -> Self {
+        Self {
+            tmux: std::env::var_os("WIPSAW_PARENT_SESSION").map(|_| app.tmux.clone()),
+            session: std::env::var("WIPSAW_PARENT_SESSION").ok(),
+        }
+    }
+}
+
+impl Drop for NavigatorPopupGuard {
+    fn drop(&mut self) {
+        if let (Some(tmux), Some(session)) = (&self.tmux, &self.session) {
+            let _ = tmux.clear_navigator_guard(session);
+        }
+    }
+}
+
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     active: bool,
@@ -287,6 +311,7 @@ struct Navigator {
     tab_state: ListState,
     thread_state: ListState,
     active: Panel,
+    is_popup: bool,
     prefix_pending: bool,
     show_help: bool,
     prompt: Option<Prompt>,
@@ -296,6 +321,7 @@ struct Navigator {
 impl Navigator {
     fn load(app: &WipsawApp) -> Result<Self> {
         let mut navigator = Self::empty();
+        navigator.is_popup = std::env::var_os("WIPSAW_PARENT_SESSION").is_some();
         navigator.refresh(app)?;
         if let Some((workspace, tab)) = app.current_managed_context()?
             && let Some(index) = navigator
@@ -330,6 +356,7 @@ impl Navigator {
             tab_state: ListState::default(),
             thread_state: ListState::default(),
             active: Panel::Workspaces,
+            is_popup: false,
             prefix_pending: false,
             show_help: false,
             prompt: None,
@@ -504,6 +531,7 @@ impl Navigator {
 
     fn handle_prefix_key(&mut self, code: KeyCode) -> Action {
         match code {
+            KeyCode::Char('w') if self.is_popup => return Action::Quit,
             KeyCode::Char('w') => self.active = Panel::Workspaces,
             KeyCode::Char('t') => self.active = Panel::Tabs,
             KeyCode::Char('s') => self.active = Panel::Threads,
@@ -686,14 +714,14 @@ impl Navigator {
         let live_count = self.workspaces.iter().filter(|(_, live)| *live).count();
         let header = Line::from(vec![
             Span::styled(
-                " WIPSAW ",
+                TERMINAL_LOGO,
                 Style::default()
                     .fg(DEEP)
                     .bg(TEAL)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " // CUT CONTROL  ",
+                " WIPSAW // CUT CONTROL  ",
                 Style::default().fg(INK).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1128,10 +1156,11 @@ fn centered_rect(area: Rect, requested_width: u16, requested_height: u16) -> Rec
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::Navigator;
+    use super::{Action, Navigator};
 
     #[test]
     fn empty_navigator_renders_primary_table_of_contents() {
@@ -1153,5 +1182,16 @@ mod tests {
         assert!(content.contains("TABS"));
         assert!(content.contains("CODEX THREADS"));
         assert!(content.contains("CUT LINE"));
+    }
+
+    #[test]
+    fn prefix_w_closes_an_active_navigator_popup() {
+        let mut navigator = Navigator::empty();
+        navigator.is_popup = true;
+
+        assert!(matches!(
+            navigator.handle_prefix_key(KeyCode::Char('w')),
+            Action::Quit
+        ));
     }
 }

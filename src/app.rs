@@ -54,6 +54,14 @@ pub struct CodexThreadLaunch {
     pub return_shell: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WipsawInitialization {
+    pub status: String,
+    pub codex: CodexHomeProbe,
+    pub shortcut_bin: PathBuf,
+    pub tmux_socket: String,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TabLaunchSettings<'a> {
     pub account: Option<&'a str>,
@@ -79,7 +87,38 @@ impl WipsawApp {
             tmux,
         };
         app.adopt_current_codex_home()?;
+        app.tmux.write_config()?;
+        let has_live_workspace = app.registry.list_workspaces()?.iter().any(|workspace| {
+            app.tmux
+                .session_exists(&workspace.tmux_session)
+                .unwrap_or(false)
+        });
+        if has_live_workspace {
+            app.tmux.reload_config()?;
+        }
+        if let Some(home) = app.registry.preferred_codex_home(None)? {
+            app.registry
+                .apply_default_codex_home_to_unconfigured_tabs(&home)?;
+        }
         Ok(app)
+    }
+
+    pub fn initialize(&self) -> Result<WipsawInitialization> {
+        let home = self
+            .registry
+            .preferred_codex_home(None)?
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "Codex home",
+                message: "no Codex home is available; set CODEX_HOME before first startup or register one with `wipsaw home add`"
+                    .to_string(),
+            })?;
+        let codex = probe_home(&home)?;
+        Ok(WipsawInitialization {
+            status: "ready".to_string(),
+            codex,
+            shortcut_bin: self.paths.shortcut_bin_dir(),
+            tmux_socket: self.tmux.socket_name().to_string(),
+        })
     }
 
     pub fn create_workspace(&mut self, name: &str, cwd: &Path) -> Result<Workspace> {
@@ -95,6 +134,7 @@ impl WipsawApp {
         let workspace_id = WipsawId::new(EntityKind::Workspace);
         let manager_tab_id = WipsawId::new(EntityKind::Tab);
         let tmux_session = format!("wipsaw-{}", workspace_id.tmux_safe_suffix());
+        let default_home = self.registry.preferred_codex_home(None)?;
         let manager = self.tmux.create_workspace(&tmux_session, &cwd)?;
 
         let inserted = self.registry.insert_workspace_with_manager(NewWorkspace {
@@ -105,6 +145,8 @@ impl WipsawApp {
             manager_tab_id: manager_tab_id.as_str(),
             manager_window_id: &manager.id,
             manager_window_index: manager.index,
+            manager_account_id: default_home.as_ref().map(|home| home.account_id.as_str()),
+            manager_codex_home_id: default_home.as_ref().map(|home| home.id.as_str()),
         });
         if inserted.is_err() {
             let _ = self.tmux.kill_workspace(&tmux_session);
@@ -931,7 +973,7 @@ impl WipsawApp {
                     })
             })
             .transpose()?;
-        let home = settings
+        let explicit_home = settings
             .codex_home
             .map(|reference| {
                 self.registry
@@ -942,6 +984,12 @@ impl WipsawApp {
                     })
             })
             .transpose()?;
+        let home = match explicit_home {
+            Some(home) => Some(home),
+            None => self
+                .registry
+                .preferred_codex_home(account.as_ref().map(|account| account.id.as_str()))?,
+        };
         if let (Some(account), Some(home)) = (&account, &home)
             && account.id != home.account_id
         {

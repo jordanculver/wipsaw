@@ -1,4 +1,8 @@
-# Wipsaw
+<p align="center">
+  <img src="assets/brand/wipsaw-icon.png" alt="Wipsaw W and saw-tooth logo" width="220">
+</p>
+
+<h1 align="center">Wipsaw</h1>
 
 Wipsaw is a Linux-first, tmux-style workspace for managing Codex terminals,
 multiple Codex and ChatGPT accounts, remote hosts, and scheduled WIPs inherited
@@ -20,10 +24,15 @@ toolchain, the Codex CLI, and tmux 3.4 or later.
 git clone https://github.com/jordanculver/wipsaw.git
 cd wipsaw
 cargo install --path .
+wipsaw init
 wipsaw doctor
-wipsaw home list
 wipsaw
 ```
+
+`wipsaw init` adopts the active `CODEX_HOME` and existing authentication,
+verifies the exact Codex binary and app-server handshake, installs the managed
+shell shortcuts, and prints the selected account/home before anything is
+launched. It is safe to rerun as a setup or repair check.
 
 In the navigator, press `c` to create a workspace in the current directory,
 `l` to move to its tabs, and `c` again to create a shell tab. Move to Codex
@@ -38,6 +47,11 @@ account and home. Wipsaw references that directory in place, so the user's
 existing Codex authentication, sessions, settings, skills, and plugins remain
 available without another login or copied credential. Set
 `WIPSAW_AUTO_ADOPT_CODEX=0` to disable this behavior.
+
+App-server initialization is retried three times for transient process and
+pipe failures. If all attempts fail, Wipsaw includes the captured Codex stderr
+and points back to `wipsaw init` instead of returning only a closed-protocol
+message.
 
 Power users can then register additional, isolated account identities and
 Codex homes:
@@ -153,10 +167,13 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   compatibility checks and shell restoration after exit.
 - A responsive keyboard-first navigator for workspaces, tabs, and managed
   Codex threads, including create and rename prompts.
+- A Wipsaw logo asset for GitHub/Linux packaging and a compact saw-tooth mark
+  in the portable terminal header.
 - Wipsaw-only `codex`, `manager`, `lumberg`, and `lumbergh` overrides that are
   loaded after the user's Bash/Zsh/Oh My Zsh configuration without editing it.
 - `Ctrl-b w` navigator popup plus managed `Ctrl-b c`, `Ctrl-b ,`, and
-  `Ctrl-b m` bindings in the private tmux server.
+  `Ctrl-b m` bindings in the private tmux server. Navigator popups are guarded
+  per session, so repeating a popup binding toggles/closes instead of nesting.
 - Human-readable and JSON output suitable for the future MCP/manager layer.
 
 ## License

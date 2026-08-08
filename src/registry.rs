@@ -24,6 +24,8 @@ pub struct NewWorkspace<'a> {
     pub manager_tab_id: &'a str,
     pub manager_window_id: &'a str,
     pub manager_window_index: i64,
+    pub manager_account_id: Option<&'a str>,
+    pub manager_codex_home_id: Option<&'a str>,
 }
 
 pub struct NewTab<'a> {
@@ -270,13 +272,15 @@ impl Registry {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO tabs (id, workspace_id, name, tmux_window_id, tmux_window_index, cwd) VALUES (?1, ?2, 'manager', ?3, ?4, ?5)",
+            "INSERT INTO tabs (id, workspace_id, name, tmux_window_id, tmux_window_index, cwd, account_id, codex_home_id) VALUES (?1, ?2, 'manager', ?3, ?4, ?5, ?6, ?7)",
             params![
                 input.manager_tab_id,
                 input.id,
                 input.manager_window_id,
                 input.manager_window_index,
                 path_text(input.cwd),
+                input.manager_account_id,
+                input.manager_codex_home_id,
             ],
         )?;
         transaction.commit()?;
@@ -704,6 +708,15 @@ impl Registry {
         }
     }
 
+    pub fn apply_default_codex_home_to_unconfigured_tabs(&self, home: &CodexHome) -> Result<usize> {
+        self.connection
+            .execute(
+                "UPDATE tabs SET account_id = ?1, codex_home_id = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE account_id IS NULL AND codex_home_id IS NULL",
+                params![home.account_id, home.id],
+            )
+            .map_err(Into::into)
+    }
+
     fn codex_home_by_path(&self, path: &Path) -> Result<Option<CodexHome>> {
         self.connection
             .query_row(
@@ -853,6 +866,8 @@ mod tests {
                 manager_tab_id: "tab_01900000000070008000000000000000",
                 manager_window_id: "@1",
                 manager_window_index: 0,
+                manager_account_id: None,
+                manager_codex_home_id: None,
             })
             .unwrap();
         assert_eq!(workspace.name, "development");
@@ -960,6 +975,54 @@ mod tests {
     }
 
     #[test]
+    fn preferred_home_backfills_only_unconfigured_tabs() {
+        let (_root, mut registry) = registry();
+        registry
+            .insert_workspace_with_manager(NewWorkspace {
+                id: "ws_01900000000070008000000000000000",
+                name: "development",
+                tmux_session: "wipsaw-01900000",
+                cwd: Path::new("/tmp"),
+                manager_tab_id: "tab_01900000000070008000000000000000",
+                manager_window_id: "@1",
+                manager_window_index: 0,
+                manager_account_id: None,
+                manager_codex_home_id: None,
+            })
+            .unwrap();
+        registry
+            .bootstrap_current_codex(NewCurrentCodex {
+                account_id: "acct_01900000000070008000000000000000",
+                home_id: "home_01900000000070008000000000000000",
+                path: Path::new("/tmp/current-codex-home"),
+                codex_binary: Path::new("/usr/bin/codex"),
+            })
+            .unwrap();
+        let home = registry.preferred_codex_home(None).unwrap().unwrap();
+        assert_eq!(
+            registry
+                .apply_default_codex_home_to_unconfigured_tabs(&home)
+                .unwrap(),
+            1
+        );
+        let manager = registry
+            .tab_by_ref("ws_01900000000070008000000000000000", "manager")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manager.account_id.as_deref(),
+            Some(home.account_id.as_str())
+        );
+        assert_eq!(manager.codex_home_id.as_deref(), Some(home.id.as_str()));
+        assert_eq!(
+            registry
+                .apply_default_codex_home_to_unconfigured_tabs(&home)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn tabs_are_ordered_by_tmux_index() {
         let (_root, mut registry) = registry();
         let workspace = registry
@@ -971,6 +1034,8 @@ mod tests {
                 manager_tab_id: "tab_01900000000070008000000000000000",
                 manager_window_id: "@1",
                 manager_window_index: 0,
+                manager_account_id: None,
+                manager_codex_home_id: None,
             })
             .unwrap();
         registry
@@ -1019,6 +1084,8 @@ mod tests {
                 manager_tab_id: "tab_01900000000070008000000000000000",
                 manager_window_id: "@1",
                 manager_window_index: 0,
+                manager_account_id: None,
+                manager_codex_home_id: None,
             })
             .unwrap();
         let tab = registry
@@ -1076,6 +1143,8 @@ mod tests {
                 manager_tab_id: "tab_01900000000070008000000000000000",
                 manager_window_id: "@1",
                 manager_window_index: 0,
+                manager_account_id: None,
+                manager_codex_home_id: None,
             })
             .unwrap();
         let tab = registry

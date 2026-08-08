@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +13,8 @@ use crate::error::{Result, WipsawError};
 use crate::model::{CodexHome, ModelProfile};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_ATTEMPTS: usize = 3;
+const RETRY_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CodexHomeProbe {
@@ -268,6 +271,7 @@ fn thread_status(thread: &Value) -> String {
 struct AppServerClient {
     stdin: std::process::ChildStdin,
     receiver: Receiver<std::io::Result<String>>,
+    diagnostics: CapturedStderr,
     next_id: i64,
     reported_home: String,
     _child: ChildGuard,
@@ -275,12 +279,39 @@ struct AppServerClient {
 
 impl AppServerClient {
     fn connect(home: &CodexHome) -> Result<Self> {
+        let mut last_error = None;
+        let mut attempts = 0;
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            attempts = attempt;
+            match Self::connect_once(home) {
+                Ok(client) => return Ok(client),
+                Err(error) => {
+                    let retry = retryable_connect_error(&error) && attempt < CONNECT_ATTEMPTS;
+                    last_error = Some(error);
+                    if !retry {
+                        break;
+                    }
+                    thread::sleep(RETRY_DELAY * attempt as u32);
+                }
+            }
+        }
+        let detail = last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown initialization failure".to_string());
+        Err(WipsawError::CodexInitialization {
+            home: home.name.clone(),
+            attempts,
+            detail,
+        })
+    }
+
+    fn connect_once(home: &CodexHome) -> Result<Self> {
         let mut child = Command::new(&home.codex_binary)
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", &home.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: home.codex_binary.display().to_string(),
@@ -293,10 +324,15 @@ impl AppServerClient {
         let stdout = child.stdout.take().ok_or_else(|| {
             WipsawError::CodexProtocol("app-server stdout was unavailable".to_string())
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            WipsawError::CodexProtocol("app-server stderr was unavailable".to_string())
+        })?;
         let receiver = spawn_line_reader(stdout);
+        let diagnostics = CapturedStderr::spawn(stderr);
         let mut client = Self {
             stdin,
             receiver,
+            diagnostics,
             next_id: 1,
             reported_home: String::new(),
             _child: ChildGuard(child),
@@ -340,7 +376,7 @@ impl AppServerClient {
             &mut self.stdin,
             &json!({"method": method, "id": request_id, "params": params}),
         )?;
-        wait_for_response(&self.receiver, request_id, method)
+        wait_for_response(&self.receiver, &self.diagnostics, request_id, method)
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -374,33 +410,109 @@ fn spawn_line_reader(
 
 fn wait_for_response(
     receiver: &Receiver<std::io::Result<String>>,
+    diagnostics: &CapturedStderr,
     request_id: i64,
     operation: &'static str,
 ) -> Result<Value> {
     loop {
-        let line = receiver
-            .recv_timeout(RESPONSE_TIMEOUT)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => WipsawError::Timeout {
-                    operation,
-                    seconds: RESPONSE_TIMEOUT.as_secs(),
-                },
-                mpsc::RecvTimeoutError::Disconnected => WipsawError::CodexProtocol(format!(
-                    "app-server closed while waiting for {operation}"
-                )),
-            })??;
+        let line = match receiver.recv_timeout(RESPONSE_TIMEOUT) {
+            Ok(line) => line?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(WipsawError::CodexProtocol(with_diagnostics(
+                    format!(
+                        "app-server timed out after {}s while waiting for {operation}",
+                        RESPONSE_TIMEOUT.as_secs()
+                    ),
+                    diagnostics,
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(WipsawError::CodexProtocol(with_diagnostics(
+                    format!("app-server closed while waiting for {operation}"),
+                    diagnostics,
+                )));
+            }
+        };
         let value: Value = serde_json::from_str(&line).map_err(|error| {
-            WipsawError::CodexProtocol(format!("invalid JSON from app-server: {error}"))
+            WipsawError::CodexProtocol(with_diagnostics(
+                format!("invalid JSON from app-server: {error}"),
+                diagnostics,
+            ))
         })?;
         if value.get("id").and_then(Value::as_i64) != Some(request_id) {
             continue;
         }
         if let Some(error) = value.get("error") {
-            return Err(WipsawError::CodexProtocol(format!(
-                "request {request_id} failed: {error}"
+            return Err(WipsawError::CodexProtocol(with_diagnostics(
+                format!("request {request_id} failed: {error}"),
+                diagnostics,
             )));
         }
         return Ok(value);
+    }
+}
+
+fn retryable_connect_error(error: &WipsawError) -> bool {
+    match error {
+        WipsawError::CodexProtocol(message) => {
+            message.contains("closed while waiting for initialize")
+                || message.contains("timed out")
+                || message.contains("Broken pipe")
+        }
+        // During initialization, any pipe I/O error can be a child startup
+        // race. Deterministic executable/config errors use other variants.
+        WipsawError::Io(_) => true,
+        WipsawError::Timeout { .. } => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedStderr(Arc<Mutex<Vec<String>>>);
+
+impl CapturedStderr {
+    fn spawn(stderr: impl std::io::Read + Send + 'static) -> Self {
+        let captured = Self::default();
+        let writer = captured.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                let line = line
+                    .chars()
+                    .filter(|character| !character.is_control() || *character == '\t')
+                    .collect::<String>();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(mut lines) = writer.0.lock() {
+                    lines.push(line);
+                    if lines.len() > 12 {
+                        lines.remove(0);
+                    }
+                }
+            }
+        });
+        captured
+    }
+
+    fn snapshot(&self) -> String {
+        // stdout and stderr close together; give the stderr reader one short
+        // scheduling window before constructing the actionable error.
+        thread::sleep(Duration::from_millis(20));
+        let joined = self
+            .0
+            .lock()
+            .map(|lines| lines.join(" | "))
+            .unwrap_or_default();
+        joined.chars().take(2_000).collect()
+    }
+}
+
+fn with_diagnostics(message: String, diagnostics: &CapturedStderr) -> String {
+    let stderr = diagnostics.snapshot();
+    if stderr.is_empty() {
+        message
+    } else {
+        format!("{message}; stderr: {stderr}")
     }
 }
 
@@ -534,5 +646,77 @@ esac
         assert_eq!(inspection.name.as_deref(), Some("API work"));
         assert_eq!(inspection.status, "notLoaded");
         assert_eq!(inspection.native_updated_at, Some(1_700_000_001));
+    }
+
+    #[test]
+    fn initialization_retries_transient_app_server_closes() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        fs::create_dir(&home_path).unwrap();
+        let binary = root.path().join("flaky-codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'codex-cli test'
+  exit 0
+fi
+counter="$CODEX_HOME/start-count"
+count=0
+if [ -r "$counter" ]; then count=$(sed -n '1p' "$counter"); fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$counter"
+if [ "$count" -lt 3 ]; then
+  printf '%s\n' 'temporary app-server startup failure' >&2
+  exit 1
+fi
+IFS= read -r initialize
+printf '{"id":1,"result":{"codexHome":"%s"}}\n' "$CODEX_HOME"
+IFS= read -r initialized
+IFS= read -r list
+printf '%s\n' '{"id":2,"result":{"data":[]}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let report = probe_home(&test_home(binary, home_path.clone())).unwrap();
+        assert!(report.app_server_compatible);
+        assert_eq!(
+            fs::read_to_string(home_path.join("start-count"))
+                .unwrap()
+                .trim(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn initialization_error_includes_captured_stderr_and_recovery_hint() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        fs::create_dir(&home_path).unwrap();
+        let binary = root.path().join("broken-codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'codex-cli test'
+  exit 0
+fi
+printf '%s\n' 'fatal init: state database is locked' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = probe_home(&test_home(binary, home_path)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("after 3 attempt(s)"), "{message}");
+        assert!(
+            message.contains("fatal init: state database is locked"),
+            "{message}"
+        );
+        assert!(message.contains("wipsaw init"), "{message}");
     }
 }

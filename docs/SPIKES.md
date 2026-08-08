@@ -135,6 +135,27 @@ Result: the initial TUI and shortcut architecture is usable without changing
 global shell files. Nested SSH, custom shell profiles beyond Bash/Zsh, and the
 bundled-tmux distribution matrix remain follow-up work.
 
+Hardening update, 2026-08-08: repeated navigator prefix bindings now use a
+session guard, making `Ctrl-b w` a close/toggle while the popup is active
+instead of allowing recursively nested popups. Wipsaw also reloads its private
+tmux config for live registered workspaces after upgrades.
+
+### SPIKE-013: First-run Codex app-server recovery
+
+Status: Passed for the local alpha
+
+The first real managed workspace exposed an intermittent app-server close
+during `initialize`. The same registered Codex home and request subsequently
+passed direct initialization, `wipsaw home probe`, and eight concurrent probe
+processes, so authentication and the request shape were not the failure.
+
+The adapter now captures bounded app-server stderr, retries transient startup
+and pipe closes three times with backoff, and returns an initialization-specific
+error with a `wipsaw init` recovery path. Tests cover both a server that closes
+twice before succeeding and a persistent failure whose stderr must reach the
+operator. `wipsaw init` provides an idempotent first-run verification command,
+and new or previously unconfigured tabs inherit the preferred current home.
+
 ## Priority spikes
 
 ### SPIKE-005: Multi-account and multi-home isolation

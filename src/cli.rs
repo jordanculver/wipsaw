@@ -27,6 +27,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Adopt and verify the active Codex home, authentication, and app-server.
+    Init,
     /// Check local Wipsaw dependencies and state.
     Doctor,
     /// Manage durable tmux-backed workspaces.
@@ -242,6 +244,24 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut app = WipsawApp::from_env()?;
     match cli.command {
         None => crate::tui::run(&mut app)?,
+        Some(Command::Init) => {
+            let report = app.initialize()?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("Wipsaw initialization: {}", report.status);
+                println!(
+                    "  account: {} via home '{}'",
+                    report.codex.account_alias, report.codex.home_name
+                );
+                println!("  Codex home: {}", report.codex.configured_path);
+                println!("  Codex: {}", report.codex.codex_version);
+                println!("  app-server: ready");
+                println!("  shortcuts: {}", report.shortcut_bin.display());
+                println!("  tmux socket: {}", report.tmux_socket);
+                println!("  next: run `wipsaw`");
+            }
+        }
         Some(Command::Doctor) => {
             let report = DoctorReport::collect(&app);
             if cli.json {

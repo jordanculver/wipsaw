@@ -28,9 +28,9 @@ set-option -g pane-border-style 'fg=#334155'
 set-option -g pane-active-border-style 'fg=#5eead4'
 set-option -g message-style 'bg=#1f2937,fg=#e2e8f0'
 set-option -g mode-style 'bg=#0f766e,fg=#f8fafc'
-bind-key w display-popup -E -w 92% -h 88% 'env WIPSAW_PARENT_SESSION=#{session_name} WIPSAW_PARENT_WINDOW=#{window_id} wipsaw'
-bind-key c display-popup -E -w 92% -h 88% 'env WIPSAW_PARENT_SESSION=#{session_name} WIPSAW_PARENT_WINDOW=#{window_id} WIPSAW_TUI_START=new-tab wipsaw'
-bind-key , display-popup -E -w 92% -h 88% 'env WIPSAW_PARENT_SESSION=#{session_name} WIPSAW_PARENT_WINDOW=#{window_id} WIPSAW_TUI_START=rename-tab wipsaw'
+bind-key w if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} wipsaw"'
+bind-key c if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=new-tab wipsaw"'
+bind-key , if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=rename-tab wipsaw"'
 bind-key m run-shell 'manager'
 "#;
 
@@ -103,6 +103,12 @@ impl TmuxBackend {
             fs::write(&self.config_path, TMUX_CONFIG)?;
         }
         Ok(())
+    }
+
+    pub fn reload_config(&self) -> Result<()> {
+        let config = self.config_path.as_os_str().to_owned();
+        let args = self.base_args(vec![OsString::from("source-file"), config]);
+        self.run(&args).map(|_| ())
     }
 
     pub fn binary(&self) -> &Path {
@@ -211,6 +217,18 @@ impl TmuxBackend {
 
     pub fn switch_client(&self, session: &str) -> Result<()> {
         let args = self.base_args(["switch-client", "-t", session]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn clear_navigator_guard(&self, session: &str) -> Result<()> {
+        let args = self.base_args([
+            "set-option",
+            "-q",
+            "-u",
+            "-t",
+            session,
+            "@wipsaw_navigator_open",
+        ]);
         self.run(&args).map(|_| ())
     }
 
@@ -440,7 +458,15 @@ fn tmux_fields(line: &str) -> Vec<&str> {
 mod tests {
     use std::path::Path;
 
-    use super::{codex_launch_command, parse_window};
+    use super::{TMUX_CONFIG, codex_launch_command, parse_window};
+
+    #[test]
+    fn popup_bindings_expand_the_parent_context_before_launch() {
+        assert!(TMUX_CONFIG.contains(
+            "run-shell -C \"display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name}"
+        ));
+        assert!(TMUX_CONFIG.contains("-e WIPSAW_PARENT_WINDOW=#{window_id}"));
+    }
 
     #[test]
     fn window_format_is_parsed() {
