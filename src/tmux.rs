@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -44,6 +44,17 @@ pub struct TmuxWindow {
     pub name: String,
     pub active: bool,
     pub cwd: PathBuf,
+}
+
+pub struct CodexTabLaunch<'a> {
+    pub session: &'a str,
+    pub window_id: &'a str,
+    pub cwd: &'a Path,
+    pub codex_home: &'a Path,
+    pub codex_binary: &'a Path,
+    pub managed_thread_id: &'a str,
+    pub native_thread_id: &'a str,
+    pub return_shell: &'a Path,
 }
 
 impl TmuxBackend {
@@ -164,6 +175,26 @@ impl TmuxBackend {
         self.run(&args).map(|_| ())
     }
 
+    pub fn launch_codex_in_tab(&self, launch: CodexTabLaunch<'_>) -> Result<()> {
+        let target = format!("{}:{}", launch.session, launch.window_id);
+        let command = codex_launch_command(
+            launch.cwd,
+            launch.codex_home,
+            launch.codex_binary,
+            launch.managed_thread_id,
+            launch.native_thread_id,
+            launch.return_shell,
+        );
+        let args = self.base_args(vec![
+            OsString::from("respawn-pane"),
+            OsString::from("-k"),
+            OsString::from("-t"),
+            OsString::from(target),
+            OsString::from(command),
+        ]);
+        self.run(&args).map(|_| ())
+    }
+
     pub fn list_windows(&self, session: &str) -> Result<Vec<TmuxWindow>> {
         let args = self.base_args([
             "list-windows",
@@ -255,6 +286,30 @@ fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_owned()
 }
 
+fn codex_launch_command(
+    cwd: &Path,
+    codex_home: &Path,
+    codex_binary: &Path,
+    managed_thread_id: &str,
+    native_thread_id: &str,
+    return_shell: &Path,
+) -> String {
+    format!(
+        "cd {} && env CODEX_HOME={} WIPSAW_THREAD_ID={} WIPSAW_NATIVE_THREAD_ID={} {} resume {}; exec {} -l",
+        shell_quote(cwd.as_os_str()),
+        shell_quote(codex_home.as_os_str()),
+        shell_quote(OsStr::new(managed_thread_id)),
+        shell_quote(OsStr::new(native_thread_id)),
+        shell_quote(codex_binary.as_os_str()),
+        shell_quote(OsStr::new(native_thread_id)),
+        shell_quote(return_shell.as_os_str()),
+    )
+}
+
+fn shell_quote(value: &OsStr) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
 fn parse_window(line: &str) -> Result<TmuxWindow> {
     // tmux renders non-printing format separators as octal escapes when it
     // serializes formatted output (US, 0x1f, becomes the four bytes `\\037`).
@@ -281,7 +336,9 @@ fn parse_window(line: &str) -> Result<TmuxWindow> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_window;
+    use std::path::Path;
+
+    use super::{codex_launch_command, parse_window};
 
     #[test]
     fn window_format_is_parsed() {
@@ -298,5 +355,21 @@ mod tests {
         assert_eq!(window.id, "@3");
         assert_eq!(window.index, 2);
         assert_eq!(window.cwd.to_string_lossy(), "/tmp/project");
+    }
+
+    #[test]
+    fn codex_launch_is_shell_quoted_and_returns_to_the_shell() {
+        let command = codex_launch_command(
+            Path::new("/tmp/Jordan's project"),
+            Path::new("/tmp/codex home"),
+            Path::new("/opt/Codex CLI/codex"),
+            "thread_managed",
+            "native-123",
+            Path::new("/bin/zsh"),
+        );
+        assert!(command.contains("cd '/tmp/Jordan'\"'\"'s project'"));
+        assert!(command.contains("CODEX_HOME='/tmp/codex home'"));
+        assert!(command.contains("'/opt/Codex CLI/codex' resume 'native-123'"));
+        assert!(command.ends_with("exec '/bin/zsh' -l"));
     }
 }

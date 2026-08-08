@@ -6,8 +6,8 @@ from Wiphand.
 
 The project is currently in its first executable alpha slice. The Rust CLI can
 create and inspect private tmux workspaces/tabs, register isolated account and
-Codex-home metadata, and create named native Codex threads with Wipsaw-managed
-IDs. The Ratatui navigator, interactive thread launcher, WIP runtime transplant,
+Codex-home metadata, and create, inspect, and resume named native Codex threads
+with Wipsaw-managed IDs. The Ratatui navigator, WIP runtime transplant,
 secret-provider integration, and MCP server are not implemented yet.
 
 ## Quick start
@@ -66,7 +66,15 @@ wipsaw thread create "API implementation" \
 
 wipsaw thread list --home company-home
 wipsaw thread inspect thread_...
+wipsaw thread resume thread_... \
+  --workspace development \
+  --tab api \
+  --attach
 ```
+
+`thread resume` replaces the target tab's shell process with the Codex TUI,
+using the thread's owning Codex home and existing authentication. When Codex
+exits, Wipsaw starts the user's login shell again in that tab.
 
 API-key and access-token accounts require a reference such as
 `secret://account/company-openai`; the CLI rejects raw credential-looking
@@ -116,4 +124,6 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - Codex app-server home probing plus native thread create/name/inspect with the
   native ID, rollout path, resolved model, and Wipsaw ID persisted atomically
   with an optional tab binding.
+- Exact-ID Codex TUI resume inside a mapped tmux tab, with account/home
+  compatibility checks and shell restoration after exit.
 - Human-readable and JSON output suitable for the future MCP/manager layer.

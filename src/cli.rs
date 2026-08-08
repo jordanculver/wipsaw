@@ -204,6 +204,17 @@ pub enum ThreadCommand {
     },
     /// Read current metadata from the owning Codex home by exact native ID.
     Inspect { thread: String },
+    /// Replace a tab's shell with the mapped Codex TUI, then return to the shell on exit.
+    Resume {
+        thread: String,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        tab: String,
+        /// Attach to the workspace after launching Codex.
+        #[arg(long)]
+        attach: bool,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -485,6 +496,23 @@ pub fn run(cli: Cli) -> Result<()> {
                     if let Some(path) = inspection.native.rollout_path {
                         println!("  rollout={}", path.display());
                     }
+                }
+            }
+            ThreadCommand::Resume {
+                thread,
+                workspace,
+                tab,
+                attach,
+            } => {
+                let launch = app.resume_codex_thread(&thread, &workspace, &tab)?;
+                output(cli.json, &launch, || {
+                    format!(
+                        "resumed Codex thread '{}' in tab '{}'",
+                        launch.thread_id, launch.tab_id
+                    )
+                })?;
+                if attach {
+                    app.attach_workspace(&launch.workspace_id)?;
                 }
             }
         },

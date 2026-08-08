@@ -64,6 +64,14 @@ does not include this turnless thread, although `thread/read` by exact ID does;
 Wipsaw therefore treats its own registry as the table of contents and never
 uses native list visibility as proof that a known thread disappeared.
 
+Launcher update, 2026-08-08: `wipsaw thread resume` now validates the target
+tab's account, home, and model-profile binding, then starts `codex resume` by
+exact native ID in that tab's tmux pane. It exports only non-secret Wipsaw and
+thread identifiers plus `CODEX_HOME`; the credential remains inside that home.
+A detached live smoke reached the Codex TUI login screen in a disposable,
+unauthenticated home. The launch command restores the configured login shell
+when Codex exits.
+
 ### SPIKE-003: Wiphand runtime and Docker executor inventory
 
 Status: Passed

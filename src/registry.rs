@@ -376,6 +376,32 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    pub fn bind_tab_to_codex_thread(&self, tab_id: &str, thread: &CodexThread) -> Result<Tab> {
+        let changed = self.connection.execute(
+            "UPDATE tabs SET account_id = ?2, codex_home_id = ?3, model_profile_id = ?4, codex_thread_id = ?5, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![
+                tab_id,
+                thread.account_id,
+                thread.codex_home_id,
+                thread.model_profile_id,
+                thread.id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "tab",
+                value: tab_id.to_string(),
+            });
+        }
+        self.connection
+            .query_row(
+                &format!("{TAB_SELECT} WHERE id = ?1"),
+                [tab_id],
+                tab_from_row,
+            )
+            .map_err(Into::into)
+    }
+
     pub fn insert_codex_thread(&mut self, input: NewCodexThread<'_>) -> Result<CodexThread> {
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -1021,5 +1047,31 @@ mod tests {
         assert_eq!(rebound.account_id.as_deref(), Some(account.id.as_str()));
         assert_eq!(rebound.codex_home_id.as_deref(), Some(home.id.as_str()));
         assert_eq!(rebound.codex_thread_id.as_deref(), Some(thread.id.as_str()));
+
+        let second_tab = registry
+            .insert_tab(NewTab {
+                id: "tab_01900000000070008000000000000002",
+                workspace_id: &workspace.id,
+                name: "review",
+                tmux_window_id: "@3",
+                tmux_window_index: 2,
+                cwd: Path::new("/tmp"),
+                account_id: None,
+                codex_home_id: None,
+                model_profile_id: None,
+                codex_thread_id: None,
+            })
+            .unwrap();
+        let second_binding = registry
+            .bind_tab_to_codex_thread(&second_tab.id, &thread)
+            .unwrap();
+        assert_eq!(
+            second_binding.codex_thread_id.as_deref(),
+            Some(thread.id.as_str())
+        );
+        assert_eq!(
+            second_binding.model_profile_id.as_deref(),
+            Some(profile.id.as_str())
+        );
     }
 }

@@ -21,7 +21,7 @@ use crate::registry::{
     NewAccount, NewCodexHome, NewCodexThread, NewCurrentCodex, NewModelProfile, NewTab,
     NewWorkspace, Registry,
 };
-use crate::tmux::{TmuxBackend, TmuxWindow};
+use crate::tmux::{CodexTabLaunch, TmuxBackend, TmuxWindow};
 
 pub struct WipsawApp {
     pub paths: AppPaths,
@@ -33,6 +33,19 @@ pub struct WipsawApp {
 pub struct CodexThreadInspection {
     pub managed: CodexThread,
     pub native: NativeCodexThreadInspection,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexThreadLaunch {
+    pub thread_id: String,
+    pub native_thread_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub tmux_session: String,
+    pub tmux_window_id: String,
+    pub codex_home_id: String,
+    pub cwd: PathBuf,
+    pub return_shell: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -463,6 +476,129 @@ impl WipsawApp {
         Ok(CodexThreadInspection { managed, native })
     }
 
+    pub fn resume_codex_thread(
+        &self,
+        thread_ref: &str,
+        workspace_ref: &str,
+        tab_ref: &str,
+    ) -> Result<CodexThreadLaunch> {
+        let thread = self
+            .registry
+            .codex_thread_by_ref(thread_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex thread",
+                value: thread_ref.to_string(),
+            })?;
+        let home = self
+            .registry
+            .codex_home_by_ref(&thread.codex_home_id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex home",
+                value: thread.codex_home_id.clone(),
+            })?;
+        let workspace = self.workspace(workspace_ref)?;
+        let tab = self
+            .registry
+            .tab_by_ref(&workspace.id, tab_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab_ref.to_string(),
+            })?;
+
+        if let Some(bound_thread_id) = &tab.codex_thread_id
+            && bound_thread_id != &thread.id
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "tab binding",
+                message: format!(
+                    "tab '{}' is already bound to Codex thread '{}'",
+                    tab.name, bound_thread_id
+                ),
+            });
+        }
+        if let Some(home_id) = &tab.codex_home_id
+            && home_id != &thread.codex_home_id
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "tab binding",
+                message: format!(
+                    "tab '{}' uses Codex home '{}', while thread '{}' uses '{}'",
+                    tab.name, home_id, thread.name, thread.codex_home_id
+                ),
+            });
+        }
+        if let Some(account_id) = &tab.account_id
+            && account_id != &thread.account_id
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "tab binding",
+                message: format!(
+                    "tab '{}' uses a different account than thread '{}'",
+                    tab.name, thread.name
+                ),
+            });
+        }
+        if let Some(profile_id) = &tab.model_profile_id
+            && Some(profile_id.as_str()) != thread.model_profile_id.as_deref()
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "tab binding",
+                message: format!(
+                    "tab '{}' uses model profile '{}', while thread '{}' uses '{}'",
+                    tab.name,
+                    profile_id,
+                    thread.name,
+                    thread.model_profile_id.as_deref().unwrap_or("no profile")
+                ),
+            });
+        }
+        if !thread.cwd.is_dir() {
+            return Err(WipsawError::InvalidInput {
+                field: "thread working directory",
+                message: format!("'{}' is no longer a directory", thread.cwd.display()),
+            });
+        }
+        if !home.path.is_dir() {
+            return Err(WipsawError::InvalidInput {
+                field: "Codex home path",
+                message: format!("'{}' is no longer a directory", home.path.display()),
+            });
+        }
+        if !self.tmux.session_exists(&workspace.tmux_session)? {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace",
+                message: format!(
+                    "workspace '{}' is registered but its tmux session is not running",
+                    workspace.name
+                ),
+            });
+        }
+
+        self.registry.bind_tab_to_codex_thread(&tab.id, &thread)?;
+        let return_shell = return_shell_path();
+        self.tmux.launch_codex_in_tab(CodexTabLaunch {
+            session: &workspace.tmux_session,
+            window_id: &tab.tmux_window_id,
+            cwd: &thread.cwd,
+            codex_home: &home.path,
+            codex_binary: &home.codex_binary,
+            managed_thread_id: &thread.id,
+            native_thread_id: &thread.native_thread_id,
+            return_shell: &return_shell,
+        })?;
+        Ok(CodexThreadLaunch {
+            thread_id: thread.id,
+            native_thread_id: thread.native_thread_id,
+            workspace_id: workspace.id,
+            tab_id: tab.id,
+            tmux_session: workspace.tmux_session,
+            tmux_window_id: tab.tmux_window_id,
+            codex_home_id: home.id,
+            cwd: thread.cwd,
+            return_shell,
+        })
+    }
+
     fn resolve_tab_settings(
         &self,
         settings: TabLaunchSettings<'_>,
@@ -578,4 +714,12 @@ fn auto_adopt_disabled() -> bool {
             "0" | "false" | "no"
         )
     })
+}
+
+fn return_shell_path() -> PathBuf {
+    env::var_os("WIPSAW_SHELL")
+        .filter(|value| !value.is_empty())
+        .or_else(|| env::var_os("SHELL").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
