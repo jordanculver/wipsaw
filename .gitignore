@@ -1,0 +1,9 @@
+/target/
+/.wipsaw-test/
+.env
+.env.*
+!.env.example
+*.db
+*.log
+*.sqlite
+*.sqlite-*
