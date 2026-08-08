@@ -28,6 +28,10 @@ set-option -g pane-border-style 'fg=#334155'
 set-option -g pane-active-border-style 'fg=#5eead4'
 set-option -g message-style 'bg=#1f2937,fg=#e2e8f0'
 set-option -g mode-style 'bg=#0f766e,fg=#f8fafc'
+bind-key w display-popup -E -w 92% -h 88% 'env WIPSAW_PARENT_SESSION=#{session_name} WIPSAW_PARENT_WINDOW=#{window_id} wipsaw'
+bind-key c display-popup -E -w 92% -h 88% 'env WIPSAW_PARENT_SESSION=#{session_name} WIPSAW_PARENT_WINDOW=#{window_id} WIPSAW_TUI_START=new-tab wipsaw'
+bind-key , display-popup -E -w 92% -h 88% 'env WIPSAW_PARENT_SESSION=#{session_name} WIPSAW_PARENT_WINDOW=#{window_id} WIPSAW_TUI_START=rename-tab wipsaw'
+bind-key m run-shell 'manager'
 "#;
 
 #[derive(Debug, Clone)]
@@ -35,6 +39,8 @@ pub struct TmuxBackend {
     binary: PathBuf,
     socket_name: String,
     config_path: PathBuf,
+    path_env: OsString,
+    shell_launcher: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +50,14 @@ pub struct TmuxWindow {
     pub name: String,
     pub active: bool,
     pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmuxPaneContext {
+    pub session: String,
+    pub window_id: String,
+    pub window_name: String,
+    pub pane_id: String,
 }
 
 pub struct CodexTabLaunch<'a> {
@@ -76,6 +90,8 @@ impl TmuxBackend {
             binary,
             socket_name,
             config_path: paths.tmux_config_path(),
+            path_env: augmented_path(&paths.shortcut_bin_dir()),
+            shell_launcher: paths.shell_launcher_path(),
         }
     }
 
@@ -100,6 +116,7 @@ impl TmuxBackend {
     pub fn version(&self) -> Result<String> {
         let output = Command::new(&self.binary)
             .arg("-V")
+            .env("PATH", &self.path_env)
             .output()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -112,6 +129,7 @@ impl TmuxBackend {
         let args = self.base_args(["has-session", "-t", session]);
         let output = Command::new(&self.binary)
             .args(&args)
+            .env("PATH", &self.path_env)
             .output()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -134,10 +152,19 @@ impl TmuxBackend {
             OsString::from("manager"),
             OsString::from("-c"),
             path_arg(cwd),
+            OsString::from("-e"),
+            OsString::from("WIPSAW_MANAGED=1"),
+            OsString::from("-e"),
+            OsString::from(format!("WIPSAW_TMUX_SOCKET={}", self.socket_name)),
+            OsString::from("-e"),
+            environment_assignment("PATH", &self.path_env),
+            OsString::from(shell_quote(self.shell_launcher.as_os_str())),
         ]);
         let output = self.run(&args)?;
         let window = parse_window(output.trim())?;
         self.set_environment(session, "WIPSAW_MANAGED", "1")?;
+        self.set_environment(session, "WIPSAW_TMUX_SOCKET", &self.socket_name)?;
+        self.set_environment(session, "PATH", &self.path_env.to_string_lossy())?;
         Ok(window)
     }
 
@@ -159,6 +186,7 @@ impl TmuxBackend {
             OsString::from(name),
             OsString::from("-c"),
             path_arg(cwd),
+            OsString::from(shell_quote(self.shell_launcher.as_os_str())),
         ]);
         parse_window(self.run(&args)?.trim())
     }
@@ -175,6 +203,58 @@ impl TmuxBackend {
         self.run(&args).map(|_| ())
     }
 
+    pub fn select_tab(&self, session: &str, window_id: &str) -> Result<()> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args(["select-window", "-t", target.as_str()]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn switch_client(&self, session: &str) -> Result<()> {
+        let args = self.base_args(["switch-client", "-t", session]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn window_command(&self, session: &str, window_id: &str) -> Result<String> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args([
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "#{pane_current_command}",
+        ]);
+        self.run(&args)
+    }
+
+    pub fn current_context(&self) -> Result<TmuxPaneContext> {
+        let pane_id = env::var("TMUX_PANE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "terminal context",
+                message: "this shortcut must run inside a Wipsaw tmux tab".to_string(),
+            })?;
+        let args = self.base_args([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id.as_str(),
+            "-F",
+            "#{session_name}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_id}",
+        ]);
+        let output = self.run(&args)?;
+        let fields = tmux_fields(output.trim());
+        if fields.len() != 4 {
+            return Err(WipsawError::MalformedTmuxOutput(output));
+        }
+        Ok(TmuxPaneContext {
+            session: fields[0].to_string(),
+            window_id: fields[1].to_string(),
+            window_name: fields[2].to_string(),
+            pane_id: fields[3].to_string(),
+        })
+    }
+
     pub fn launch_codex_in_tab(&self, launch: CodexTabLaunch<'_>) -> Result<()> {
         let target = format!("{}:{}", launch.session, launch.window_id);
         let command = codex_launch_command(
@@ -183,7 +263,7 @@ impl TmuxBackend {
             launch.codex_binary,
             launch.managed_thread_id,
             launch.native_thread_id,
-            launch.return_shell,
+            &self.shell_launcher,
         );
         let args = self.base_args(vec![
             OsString::from("respawn-pane"),
@@ -214,6 +294,9 @@ impl TmuxBackend {
         let args = self.base_args(["attach-session", "-t", session]);
         let status = Command::new(&self.binary)
             .args(&args)
+            .env("PATH", &self.path_env)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .status()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -254,6 +337,7 @@ impl TmuxBackend {
     fn run(&self, args: &[OsString]) -> Result<String> {
         let output = Command::new(&self.binary)
             .args(args)
+            .env("PATH", &self.path_env)
             .output()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -261,6 +345,20 @@ impl TmuxBackend {
             })?;
         successful_output(&self.binary, args, output)
     }
+}
+
+fn augmented_path(shortcut_bin_dir: &Path) -> OsString {
+    let existing = env::var_os("PATH").unwrap_or_default();
+    let entries =
+        std::iter::once(shortcut_bin_dir.to_path_buf()).chain(env::split_paths(&existing));
+    env::join_paths(entries).unwrap_or(existing)
+}
+
+fn environment_assignment(name: &str, value: &OsStr) -> OsString {
+    let mut assignment = OsString::from(name);
+    assignment.push("=");
+    assignment.push(value);
+    assignment
 }
 
 fn successful_output(program: &Path, args: &[OsString], output: Output) -> Result<String> {
@@ -292,17 +390,17 @@ fn codex_launch_command(
     codex_binary: &Path,
     managed_thread_id: &str,
     native_thread_id: &str,
-    return_shell: &Path,
+    return_command: &Path,
 ) -> String {
     format!(
-        "cd {} && env CODEX_HOME={} WIPSAW_THREAD_ID={} WIPSAW_NATIVE_THREAD_ID={} {} resume {}; exec {} -l",
+        "cd {} && env CODEX_HOME={} WIPSAW_THREAD_ID={} WIPSAW_NATIVE_THREAD_ID={} {} resume {}; exec {}",
         shell_quote(cwd.as_os_str()),
         shell_quote(codex_home.as_os_str()),
         shell_quote(OsStr::new(managed_thread_id)),
         shell_quote(OsStr::new(native_thread_id)),
         shell_quote(codex_binary.as_os_str()),
         shell_quote(OsStr::new(native_thread_id)),
-        shell_quote(return_shell.as_os_str()),
+        shell_quote(return_command.as_os_str()),
     )
 }
 
@@ -315,11 +413,7 @@ fn parse_window(line: &str) -> Result<TmuxWindow> {
     // serializes formatted output (US, 0x1f, becomes the four bytes `\\037`).
     // Keep accepting the raw separator as well for compatibility with tmux
     // versions or control-mode transports that preserve it.
-    let fields = if line.contains("\\037") {
-        line.split("\\037").collect::<Vec<_>>()
-    } else {
-        line.split('\x1f').collect::<Vec<_>>()
-    };
+    let fields = tmux_fields(line);
     if fields.len() != 5 {
         return Err(WipsawError::MalformedTmuxOutput(line.to_string()));
     }
@@ -332,6 +426,14 @@ fn parse_window(line: &str) -> Result<TmuxWindow> {
         active: fields[3] == "1",
         cwd: PathBuf::from(fields[4]),
     })
+}
+
+fn tmux_fields(line: &str) -> Vec<&str> {
+    if line.contains("\\037") {
+        line.split("\\037").collect::<Vec<_>>()
+    } else {
+        line.split('\x1f').collect::<Vec<_>>()
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +472,6 @@ mod tests {
         assert!(command.contains("cd '/tmp/Jordan'\"'\"'s project'"));
         assert!(command.contains("CODEX_HOME='/tmp/codex home'"));
         assert!(command.contains("'/opt/Codex CLI/codex' resume 'native-123'"));
-        assert!(command.ends_with("exec '/bin/zsh' -l"));
+        assert!(command.ends_with("exec '/bin/zsh'"));
     }
 }

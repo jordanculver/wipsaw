@@ -307,6 +307,17 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    pub fn workspace_by_tmux_session(&self, session: &str) -> Result<Option<Workspace>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, host_id, tmux_session, cwd, status, created_at, updated_at FROM workspaces WHERE tmux_session = ?1 LIMIT 1",
+                [session],
+                workspace_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn insert_tab(&self, input: NewTab<'_>) -> Result<Tab> {
         if self.tab_by_ref(input.workspace_id, input.name)?.is_some() {
             return Err(WipsawError::AlreadyExists {
@@ -350,6 +361,28 @@ impl Registry {
             .query_row(
                 &format!("{TAB_SELECT} WHERE workspace_id = ?1 AND (id = ?2 OR name = ?2 COLLATE NOCASE) LIMIT 1"),
                 params![workspace_id, value],
+                tab_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn tab_by_tmux_window(&self, workspace_id: &str, window_id: &str) -> Result<Option<Tab>> {
+        self.connection
+            .query_row(
+                &format!("{TAB_SELECT} WHERE workspace_id = ?1 AND tmux_window_id = ?2 LIMIT 1"),
+                params![workspace_id, window_id],
+                tab_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn tab_by_codex_thread(&self, thread_id: &str) -> Result<Option<Tab>> {
+        self.connection
+            .query_row(
+                &format!("{TAB_SELECT} WHERE codex_thread_id = ?1 LIMIT 1"),
+                [thread_id],
                 tab_from_row,
             )
             .optional()
@@ -649,6 +682,28 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    pub fn preferred_codex_home(&self, account_id: Option<&str>) -> Result<Option<CodexHome>> {
+        let account_clause = if account_id.is_some() {
+            "WHERE h.account_id = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "{CODEX_HOME_SELECT} {account_clause} ORDER BY CASE WHEN h.name = 'current' COLLATE NOCASE THEN 0 ELSE 1 END, h.created_at LIMIT 1"
+        );
+        if let Some(account_id) = account_id {
+            self.connection
+                .query_row(&sql, [account_id], codex_home_from_row)
+                .optional()
+                .map_err(Into::into)
+        } else {
+            self.connection
+                .query_row(&sql, [], codex_home_from_row)
+                .optional()
+                .map_err(Into::into)
+        }
+    }
+
     fn codex_home_by_path(&self, path: &Path) -> Result<Option<CodexHome>> {
         self.connection
             .query_row(
@@ -804,6 +859,22 @@ mod tests {
         let tabs = registry.list_tabs(&workspace.id).unwrap();
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].name, "manager");
+        assert_eq!(
+            registry
+                .workspace_by_tmux_session("wipsaw-01900000")
+                .unwrap()
+                .unwrap()
+                .id,
+            workspace.id
+        );
+        assert_eq!(
+            registry
+                .tab_by_tmux_window(&workspace.id, "@1")
+                .unwrap()
+                .unwrap()
+                .name,
+            "manager"
+        );
     }
 
     #[test]
@@ -871,6 +942,10 @@ mod tests {
         let homes = registry.list_codex_homes().unwrap();
         assert_eq!(homes.len(), 1);
         assert_eq!(homes[0].name, "current");
+        assert_eq!(
+            registry.preferred_codex_home(None).unwrap().unwrap().id,
+            homes[0].id
+        );
 
         let adopted_again = registry
             .bootstrap_current_codex(NewCurrentCodex {

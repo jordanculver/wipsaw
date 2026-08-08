@@ -112,6 +112,29 @@ being assigned to two accounts. Unit and live CLI tests passed. Authentication
 and concurrent app-server proof remain outstanding, so this spike is still only
 partially passed.
 
+### SPIKE-012: Navigator and shell-shortcut viability
+
+Status: Passed for the local alpha
+Decision: Keep Ratatui as the control surface and tmux as the durable PTY owner
+
+Validated locally with Ratatui 0.30.2, Crossterm 0.29.0, tmux 3.4, Bash, and
+the user's Oh My Zsh setup:
+
+- rendered and exited both the wide test backend and a real 80-column
+  pseudo-terminal without leaving raw or alternate-screen state behind;
+- created a workspace and tab through the interactive prompts and confirmed
+  their SQLite and tmux records;
+- injected `codex`, `manager`, `lumberg`, and `lumbergh` only in Wipsaw shells;
+- detected that a pre-existing `.zshrc` `codex` function outranked a PATH-only
+  shim, then proved the managed rc loads the user's configuration first and
+  the Wipsaw function last;
+- confirmed the private tmux environment and managed `Ctrl-b w`, `Ctrl-b c`,
+  `Ctrl-b ,`, and `Ctrl-b m` bindings.
+
+Result: the initial TUI and shortcut architecture is usable without changing
+global shell files. Nested SSH, custom shell profiles beyond Bash/Zsh, and the
+bundled-tmux distribution matrix remain follow-up work.
+
 ## Priority spikes
 
 ### SPIKE-005: Multi-account and multi-home isolation

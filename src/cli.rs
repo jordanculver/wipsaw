@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -21,7 +22,7 @@ pub struct Cli {
     pub json: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -40,6 +41,26 @@ pub enum Command {
     Thread(ThreadArgs),
     /// Manage reusable model and Codex launch profiles.
     Profile(ProfileArgs),
+    /// Internal entry points used by Wipsaw-managed shell shortcuts.
+    #[command(hide = true)]
+    Shortcut(ShortcutArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ShortcutArgs {
+    #[command(subcommand)]
+    pub command: ShortcutCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShortcutCommand {
+    /// Resume or create the Codex thread assigned to the current tab.
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    /// Select or create this workspace's persistent manager thread.
+    Manager,
 }
 
 #[derive(Debug, Args)]
@@ -220,7 +241,8 @@ pub enum ThreadCommand {
 pub fn run(cli: Cli) -> Result<()> {
     let mut app = WipsawApp::from_env()?;
     match cli.command {
-        Command::Doctor => {
+        None => crate::tui::run(&mut app)?,
+        Some(Command::Doctor) => {
             let report = DoctorReport::collect(&app);
             if cli.json {
                 print_json(&report)?;
@@ -239,7 +261,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("  state: {}", report.paths.state);
             }
         }
-        Command::Workspace(args) => match args.command {
+        Some(Command::Workspace(args)) => match args.command {
             WorkspaceCommand::Create { name, cwd, attach } => {
                 let workspace = app.create_workspace(&name, &cwd)?;
                 if cli.json {
@@ -278,7 +300,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             WorkspaceCommand::Attach { workspace } => app.attach_workspace(&workspace)?,
         },
-        Command::Tab(args) => match args.command {
+        Some(Command::Tab(args)) => match args.command {
             TabCommand::Create {
                 workspace,
                 name,
@@ -342,7 +364,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 output(cli.json, &tab, || format!("renamed tab to '{}'", tab.name))?;
             }
         },
-        Command::Account(args) => match args.command {
+        Some(Command::Account(args)) => match args.command {
             AccountCommand::Add {
                 alias,
                 auth,
@@ -375,7 +397,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Command::Home(args) => match args.command {
+        Some(Command::Home(args)) => match args.command {
             HomeCommand::Add {
                 name,
                 account,
@@ -421,7 +443,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Command::Thread(args) => match args.command {
+        Some(Command::Thread(args)) => match args.command {
             ThreadCommand::Create {
                 name,
                 home,
@@ -516,7 +538,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Command::Profile(args) => match args.command {
+        Some(Command::Profile(args)) => match args.command {
             ProfileCommand::Add {
                 name,
                 model,
@@ -562,6 +584,10 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+        },
+        Some(Command::Shortcut(args)) => match args.command {
+            ShortcutCommand::Codex { args } => app.run_codex_shortcut(&args)?,
+            ShortcutCommand::Manager => app.run_manager_shortcut()?,
         },
     }
     Ok(())

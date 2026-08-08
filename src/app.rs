@@ -1,6 +1,10 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use directories::BaseDirs;
 use serde::Serialize;
@@ -21,6 +25,8 @@ use crate::registry::{
     NewAccount, NewCodexHome, NewCodexThread, NewCurrentCodex, NewModelProfile, NewTab,
     NewWorkspace, Registry,
 };
+use crate::shell;
+use crate::shortcuts;
 use crate::tmux::{CodexTabLaunch, TmuxBackend, TmuxWindow};
 
 pub struct WipsawApp {
@@ -63,6 +69,8 @@ impl WipsawApp {
 
     pub fn open(paths: AppPaths) -> Result<Self> {
         paths.ensure()?;
+        shortcuts::install(&paths, &env::current_exe()?)?;
+        shell::install(&paths)?;
         let registry = Registry::open(&paths.registry_path())?;
         let tmux = TmuxBackend::from_env(&paths);
         let mut app = Self {
@@ -128,8 +136,45 @@ impl WipsawApp {
     }
 
     pub fn attach_workspace(&self, reference: &str) -> Result<()> {
+        self.activate_workspace(reference).map(|_| ())
+    }
+
+    /// Attach from a standalone terminal or switch the current Wipsaw client.
+    /// Returns `true` when a navigator running inside Wipsaw should close.
+    pub fn activate_workspace(&self, reference: &str) -> Result<bool> {
         let workspace = self.workspace(reference)?;
-        self.tmux.attach(&workspace.tmux_session)
+        if let Some(current) = self.current_workspace()? {
+            if current.id != workspace.id {
+                self.tmux.switch_client(&workspace.tmux_session)?;
+            }
+            return Ok(true);
+        }
+        self.tmux.attach(&workspace.tmux_session)?;
+        Ok(false)
+    }
+
+    /// Select a tab and either switch the current Wipsaw client or attach a
+    /// standalone terminal. Returns `true` when the caller is already inside
+    /// Wipsaw and should close a navigator popup after switching.
+    pub fn activate_tab(&self, workspace_ref: &str, tab_ref: &str) -> Result<bool> {
+        let workspace = self.workspace(workspace_ref)?;
+        let tab = self
+            .registry
+            .tab_by_ref(&workspace.id, tab_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab_ref.to_string(),
+            })?;
+        self.tmux
+            .select_tab(&workspace.tmux_session, &tab.tmux_window_id)?;
+        if let Some(current) = self.current_workspace()? {
+            if current.id != workspace.id {
+                self.tmux.switch_client(&workspace.tmux_session)?;
+            }
+            return Ok(true);
+        }
+        self.tmux.attach(&workspace.tmux_session)?;
+        Ok(false)
     }
 
     pub fn create_tab(
@@ -283,7 +328,8 @@ impl WipsawApp {
             });
         }
         let path = fs::canonicalize(path)?;
-        let codex_binary = resolve_executable_path(codex_binary)?;
+        let codex_binary =
+            resolve_executable_path(codex_binary, Some(&self.paths.shortcut_bin_dir()))?;
         let id = WipsawId::new(EntityKind::CodexHome);
         self.registry.insert_codex_home(NewCodexHome {
             id: id.as_str(),
@@ -322,7 +368,9 @@ impl WipsawApp {
         let requested_binary = env::var_os("WIPSAW_CODEX_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("codex"));
-        let Ok(codex_binary) = resolve_executable_path(&requested_binary) else {
+        let Ok(codex_binary) =
+            resolve_executable_path(&requested_binary, Some(&self.paths.shortcut_bin_dir()))
+        else {
             return Ok(());
         };
         let account_id = WipsawId::new(EntityKind::Account);
@@ -599,6 +647,275 @@ impl WipsawApp {
         })
     }
 
+    /// Enter the Codex thread assigned to the shell's current managed tab,
+    /// creating and binding one on first use. Successful execution replaces
+    /// the shortcut process with the real Codex CLI.
+    pub fn run_codex_shortcut(&mut self, args: &[OsString]) -> Result<()> {
+        let (workspace, tab) = self.current_tab()?;
+        let thread_name = if tab.name.eq_ignore_ascii_case("manager") {
+            format!("Lumbergh - {}", workspace.name)
+        } else {
+            tab.name.clone()
+        };
+        let thread = self.ensure_tab_thread(&workspace, &tab, &thread_name)?;
+        self.exec_codex_thread(&thread, args)
+    }
+
+    /// Select the persistent manager tab. Its named Codex thread is created on
+    /// first use and resumed only when the tab is sitting at a shell prompt.
+    pub fn run_manager_shortcut(&mut self) -> Result<()> {
+        let (workspace, current_tab) = self.current_tab()?;
+        let manager_tab = self
+            .registry
+            .tab_by_ref(&workspace.id, "manager")?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "manager tab",
+                value: workspace.name.clone(),
+            })?;
+        let name = format!("Lumbergh - {}", workspace.name);
+        let thread = self.ensure_tab_thread(&workspace, &manager_tab, &name)?;
+
+        if current_tab.id == manager_tab.id {
+            return self.exec_codex_thread(&thread, &[]);
+        }
+
+        if self.tab_is_at_shell(&workspace, &manager_tab)? {
+            self.resume_codex_thread(&thread.id, &workspace.id, &manager_tab.id)?;
+        }
+        self.tmux
+            .select_tab(&workspace.tmux_session, &manager_tab.tmux_window_id)
+    }
+
+    /// Lazily create the named Codex thread for a tab and launch it when the
+    /// pane is currently at a shell prompt.
+    pub fn start_tab_codex(&mut self, workspace_ref: &str, tab_ref: &str) -> Result<CodexThread> {
+        let workspace = self.workspace(workspace_ref)?;
+        let tab = self
+            .registry
+            .tab_by_ref(&workspace.id, tab_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab_ref.to_string(),
+            })?;
+        let name = if tab.name.eq_ignore_ascii_case("manager") {
+            format!("Lumbergh - {}", workspace.name)
+        } else {
+            tab.name.clone()
+        };
+        let thread = self.ensure_tab_thread(&workspace, &tab, &name)?;
+        if self.tab_is_at_shell(&workspace, &tab)? {
+            self.resume_codex_thread(&thread.id, &workspace.id, &tab.id)?;
+        }
+        Ok(thread)
+    }
+
+    /// Open a managed thread from the navigator. An unbound thread receives a
+    /// new tab in the preferred workspace; an existing live Codex process is
+    /// selected without being killed and respawned.
+    pub fn open_codex_thread(
+        &self,
+        thread_ref: &str,
+        preferred_workspace_ref: Option<&str>,
+    ) -> Result<bool> {
+        let thread = self
+            .registry
+            .codex_thread_by_ref(thread_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex thread",
+                value: thread_ref.to_string(),
+            })?;
+
+        let (workspace, tab) = if let Some(tab) = self.registry.tab_by_codex_thread(&thread.id)? {
+            let workspace = self.workspace(&tab.workspace_id)?;
+            (workspace, tab)
+        } else {
+            let workspace = match preferred_workspace_ref {
+                Some(reference) => self.workspace(reference)?,
+                None => self
+                    .list_workspaces()?
+                    .into_iter()
+                    .find_map(|(workspace, live)| live.then_some(workspace))
+                    .ok_or_else(|| WipsawError::InvalidInput {
+                        field: "workspace",
+                        message: "create a live workspace before opening an unbound Codex thread"
+                            .to_string(),
+                    })?,
+            };
+            let tab_name = self.available_tab_name(&workspace.id, &thread.name)?;
+            let tab = self.create_tab(
+                &workspace.id,
+                &tab_name,
+                Some(&thread.cwd),
+                TabLaunchSettings {
+                    account: Some(&thread.account_id),
+                    codex_home: Some(&thread.codex_home_id),
+                    model_profile: thread.model_profile_id.as_deref(),
+                },
+            )?;
+            (workspace, tab)
+        };
+
+        if self.tab_is_at_shell(&workspace, &tab)? {
+            self.resume_codex_thread(&thread.id, &workspace.id, &tab.id)?;
+        }
+        self.activate_tab(&workspace.id, &tab.id)
+    }
+
+    pub fn current_managed_context(&self) -> Result<Option<(Workspace, Tab)>> {
+        if let (Ok(session), Ok(window_id)) = (
+            env::var("WIPSAW_PARENT_SESSION"),
+            env::var("WIPSAW_PARENT_WINDOW"),
+        ) && let Some(workspace) = self.registry.workspace_by_tmux_session(&session)?
+        {
+            let tab = self
+                .registry
+                .tab_by_tmux_window(&workspace.id, &window_id)?;
+            return Ok(tab.map(|tab| (workspace, tab)));
+        }
+
+        if env::var_os("TMUX_PANE").is_none() {
+            return Ok(None);
+        }
+        let context = match self.tmux.current_context() {
+            Ok(context) => context,
+            Err(_) => return Ok(None),
+        };
+        let Some(workspace) = self.registry.workspace_by_tmux_session(&context.session)? else {
+            return Ok(None);
+        };
+        let tab = self
+            .registry
+            .tab_by_tmux_window(&workspace.id, &context.window_id)?;
+        Ok(tab.map(|tab| (workspace, tab)))
+    }
+
+    fn current_workspace(&self) -> Result<Option<Workspace>> {
+        Ok(self
+            .current_managed_context()?
+            .map(|(workspace, _)| workspace))
+    }
+
+    fn current_tab(&self) -> Result<(Workspace, Tab)> {
+        if let Some(context) = self.current_managed_context()? {
+            return Ok(context);
+        }
+        let context = self.tmux.current_context()?;
+        let workspace = self
+            .registry
+            .workspace_by_tmux_session(&context.session)?
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "terminal context",
+                message: format!(
+                    "tmux session '{}' is not managed by Wipsaw",
+                    context.session
+                ),
+            })?;
+        let tab = self
+            .registry
+            .tab_by_tmux_window(&workspace.id, &context.window_id)?
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "terminal context",
+                message: format!(
+                    "tmux window '{}' is not registered in workspace '{}'",
+                    context.window_name, workspace.name
+                ),
+            })?;
+        Ok((workspace, tab))
+    }
+
+    fn ensure_tab_thread(
+        &mut self,
+        workspace: &Workspace,
+        tab: &Tab,
+        name: &str,
+    ) -> Result<CodexThread> {
+        if let Some(thread_id) = &tab.codex_thread_id {
+            return self
+                .registry
+                .codex_thread_by_ref(thread_id)?
+                .ok_or_else(|| WipsawError::NotFound {
+                    entity: "Codex thread",
+                    value: thread_id.clone(),
+                });
+        }
+
+        let home = if let Some(home_id) = &tab.codex_home_id {
+            self.registry.codex_home_by_ref(home_id)?
+        } else {
+            self.registry
+                .preferred_codex_home(tab.account_id.as_deref())?
+        }
+        .ok_or_else(|| WipsawError::InvalidInput {
+            field: "Codex home",
+            message: "no Codex home is available; run `wipsaw home add` first".to_string(),
+        })?;
+
+        self.create_codex_thread(
+            name,
+            &home.id,
+            Some(&tab.cwd),
+            tab.model_profile_id.as_deref(),
+            Some((&workspace.id, &tab.id)),
+        )
+    }
+
+    fn exec_codex_thread(&self, thread: &CodexThread, args: &[OsString]) -> Result<()> {
+        let home = self
+            .registry
+            .codex_home_by_ref(&thread.codex_home_id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex home",
+                value: thread.codex_home_id.clone(),
+            })?;
+        let error = Command::new(&home.codex_binary)
+            .arg("resume")
+            .arg(&thread.native_thread_id)
+            .args(args)
+            .current_dir(&thread.cwd)
+            .env("CODEX_HOME", &home.path)
+            .env("WIPSAW_THREAD_ID", &thread.id)
+            .env("WIPSAW_NATIVE_THREAD_ID", &thread.native_thread_id)
+            .exec();
+        Err(error.into())
+    }
+
+    fn tab_is_at_shell(&self, workspace: &Workspace, tab: &Tab) -> Result<bool> {
+        let command = self
+            .tmux
+            .window_command(&workspace.tmux_session, &tab.tmux_window_id)?;
+        let configured_shell_path = return_shell_path();
+        let configured_shell = configured_shell_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sh");
+        Ok(command == configured_shell
+            || matches!(
+                command.as_str(),
+                "bash" | "dash" | "fish" | "nu" | "sh" | "zsh"
+            ))
+    }
+
+    fn available_tab_name(&self, workspace_id: &str, requested: &str) -> Result<String> {
+        let base = truncate_display_name(requested, 88);
+        if self.registry.tab_by_ref(workspace_id, &base)?.is_none() {
+            return Ok(base);
+        }
+        for suffix in 2..=999 {
+            let candidate = format!("{} {suffix}", truncate_display_name(&base, 91));
+            if self
+                .registry
+                .tab_by_ref(workspace_id, &candidate)?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(WipsawError::InvalidInput {
+            field: "tab name",
+            message: "could not derive a unique tab name".to_string(),
+        })
+    }
+
     fn resolve_tab_settings(
         &self,
         settings: TabLaunchSettings<'_>,
@@ -676,28 +993,57 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(path))
 }
 
-fn resolve_executable_path(path: &Path) -> Result<PathBuf> {
-    if path.components().count() > 1 || path.is_absolute() {
-        if path.is_file() {
-            return Ok(path.to_path_buf());
+fn resolve_executable_path(path: &Path, excluded_dir: Option<&Path>) -> Result<PathBuf> {
+    let resolved = if path.components().count() > 1 || path.is_absolute() {
+        if !path.is_file() {
+            return Err(WipsawError::ExecutableUnavailable {
+                program: path.display().to_string(),
+                detail: "path is not a file".to_string(),
+            });
         }
-        return Err(WipsawError::ExecutableUnavailable {
+        fs::canonicalize(path)?
+    } else {
+        find_executable(path, excluded_dir).ok_or_else(|| WipsawError::ExecutableUnavailable {
             program: path.display().to_string(),
-            detail: "path is not a file".to_string(),
-        });
-    }
-    let candidate = std::process::Command::new(path).arg("--version").output();
+            detail: "executable was not found on PATH".to_string(),
+        })?
+    };
+    let candidate = std::process::Command::new(&resolved)
+        .arg("--version")
+        .output();
     match candidate {
-        Ok(output) if output.status.success() => Ok(path.to_path_buf()),
+        Ok(output) if output.status.success() => Ok(resolved),
         Ok(output) => Err(WipsawError::ExecutableUnavailable {
-            program: path.display().to_string(),
+            program: resolved.display().to_string(),
             detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         }),
         Err(error) => Err(WipsawError::ExecutableUnavailable {
-            program: path.display().to_string(),
+            program: resolved.display().to_string(),
             detail: error.to_string(),
         }),
     }
+}
+
+fn find_executable(name: &Path, excluded_dir: Option<&Path>) -> Option<PathBuf> {
+    let excluded = excluded_dir.and_then(|path| fs::canonicalize(path).ok());
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            candidate.is_file()
+                && candidate
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                && excluded.as_ref().is_none_or(|excluded| {
+                    candidate
+                        .parent()
+                        .and_then(|parent| fs::canonicalize(parent).ok())
+                        .as_ref()
+                        != Some(excluded)
+                })
+        })
+        .and_then(|candidate| fs::canonicalize(candidate).ok())
 }
 
 fn active_codex_home() -> Option<PathBuf> {
@@ -722,4 +1068,16 @@ fn return_shell_path() -> PathBuf {
         .or_else(|| env::var_os("SHELL").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+fn truncate_display_name(value: &str, max_chars: usize) -> String {
+    let mut result = value.chars().take(max_chars).collect::<String>();
+    while result.ends_with(char::is_whitespace) {
+        result.pop();
+    }
+    if result.is_empty() {
+        "codex".to_string()
+    } else {
+        result
+    }
 }

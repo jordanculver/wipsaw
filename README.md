@@ -4,11 +4,12 @@ Wipsaw is a Linux-first, tmux-style workspace for managing Codex terminals,
 multiple Codex and ChatGPT accounts, remote hosts, and scheduled WIPs inherited
 from Wiphand.
 
-The project is currently in its first executable alpha slice. The Rust CLI can
-create and inspect private tmux workspaces/tabs, register isolated account and
-Codex-home metadata, and create, inspect, and resume named native Codex threads
-with Wipsaw-managed IDs. The Ratatui navigator, WIP runtime transplant,
-secret-provider integration, and MCP server are not implemented yet.
+The project is currently in its first usable alpha slice. The Rust CLI and
+Ratatui navigator can create and inspect private tmux workspaces/tabs, register
+isolated account and Codex-home metadata, and create, inspect, and resume named
+native Codex threads with Wipsaw-managed IDs. The WIP runtime transplant,
+settings editor, secret-provider integration, and MCP server are not
+implemented yet.
 
 ## Quick start
 
@@ -21,9 +22,15 @@ cd wipsaw
 cargo install --path .
 wipsaw doctor
 wipsaw home list
-wipsaw workspace create development --cwd "$PWD"
-wipsaw workspace attach development
+wipsaw
 ```
+
+In the navigator, press `c` to create a workspace in the current directory,
+`l` to move to its tabs, and `c` again to create a shell tab. Move to Codex
+threads with `3`; `c` there creates a tab and starts its named Codex thread.
+Press `Enter` to attach or open the selected item and `?` for the complete key
+map. The narrow layout shows one table at a time; terminals 100 columns or
+wider show workspaces, tabs, and Codex threads together.
 
 On a new Wipsaw registry, the first command automatically adopts the active
 `CODEX_HOME`, or `~/.codex` when that variable is unset, as the `current`
@@ -74,7 +81,24 @@ wipsaw thread resume thread_... \
 
 `thread resume` replaces the target tab's shell process with the Codex TUI,
 using the thread's owning Codex home and existing authentication. When Codex
-exits, Wipsaw starts the user's login shell again in that tab.
+exits, Wipsaw starts the managed shell again in that tab.
+
+Every Wipsaw shell preserves the user's Bash or Zsh configuration, including
+Oh My Zsh, and then installs tab-aware commands without changing global shell
+files:
+
+- `codex [resume options]` resumes the tab's mapped thread, creating and naming
+  it on first use with the tab's home/account/model settings;
+- `manager`, `lumberg`, and `lumbergh` select the workspace's persistent
+  Lumbergh thread, creating it on first use;
+- `Ctrl-b w` opens the navigator as a tmux popup, `Ctrl-b c` opens its managed
+  tab-creation prompt, `Ctrl-b ,` renames the current managed tab, and
+  `Ctrl-b m` selects Lumbergh.
+
+Common navigator controls are `h/j/k/l`, arrow keys, `1`/`2`/`3`, `g`/`G`,
+`Enter`, `c` or `n` to create, `,` to rename a tab, `r` to refresh, and `q` to
+close. Its prefix mode accepts `Ctrl-b` followed by `w`, `t`, `s`, `n`, `p`,
+`c`, `?`, or `q`.
 
 API-key and access-token accounts require a reference such as
 `secret://account/company-openai`; the CLI rejects raw credential-looking
@@ -93,6 +117,7 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 
 - Linux only.
 - Rust host application with Ratatui and Clap.
+- MIT license.
 - A private tmux server provides durable terminal windows and panes.
 - A tested tmux build will be bundled as a fallback when the host has no
   compatible tmux installation.
@@ -126,4 +151,14 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   with an optional tab binding.
 - Exact-ID Codex TUI resume inside a mapped tmux tab, with account/home
   compatibility checks and shell restoration after exit.
+- A responsive keyboard-first navigator for workspaces, tabs, and managed
+  Codex threads, including create and rename prompts.
+- Wipsaw-only `codex`, `manager`, `lumberg`, and `lumbergh` overrides that are
+  loaded after the user's Bash/Zsh/Oh My Zsh configuration without editing it.
+- `Ctrl-b w` navigator popup plus managed `Ctrl-b c`, `Ctrl-b ,`, and
+  `Ctrl-b m` bindings in the private tmux server.
 - Human-readable and JSON output suitable for the future MCP/manager layer.
+
+## License
+
+Wipsaw is released under the [MIT License](LICENSE).

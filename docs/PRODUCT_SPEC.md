@@ -117,7 +117,8 @@ policy checks even when invoked by Lumbergh.
 - Support bash and zsh initially, including user-selected rc files and
   Oh My Zsh configuration.
 - Inject Wipsaw shortcuts without editing the user's global shell files.
-- Provide `codex`, `manager`, and `lumberg` commands inside managed shells.
+- Provide `codex`, `manager`, `lumberg`, and `lumbergh` commands inside managed
+  shells.
 - Resolve and validate a working directory on the selected host.
 - Allow custom status-line themes, navigator themes, and key maps.
 
