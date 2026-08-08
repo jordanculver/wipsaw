@@ -72,12 +72,18 @@ remote session persistence, path-aware profiles, and one local navigator.
 
 ## Core experience
 
-Launching `wipsaw` opens or reattaches the selected workspace. A branded tmux
-status line shows tabs. The current tab is an ordinary shell or Codex TUI. A
-Wipsaw navigator can be opened as a popup or pinned drawer.
+Launching `wipsaw` opens a manager-first Home dashboard. Its dominant action
+opens Lumbergh, the persistent Codex manager, so a new user can describe what
+they want without first learning Wipsaw's information architecture. On an
+empty registry, the same action creates a workspace in the current directory
+with the active machine's Codex home/auth and then opens Lumbergh. A branded
+tmux status line shows tabs, and the navigator can also be opened as a popup or
+pinned drawer from an ordinary shell or Codex TUI.
 
 Navigator modes:
 
+- Home: manager entry point, quick actions, active workspace, live system and
+  identity summary, onboarding, and honest notices for unavailable runtimes.
 - Sessions: workspaces, tabs, panes, Codex threads, activity, account, model.
 - WIPs: schedules, next run, current run, health, last result.
 - Runs: queued/running/completed/failed executions and artifacts.

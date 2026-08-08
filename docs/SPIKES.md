@@ -140,6 +140,15 @@ session guard, making `Ctrl-b w` a close/toggle while the popup is active
 instead of allowing recursively nested popups. Wipsaw also reloads its private
 tmux config for live registered workspaces after upgrades.
 
+Dashboard update, 2026-08-08: replaced the equal-weight three-table landing
+screen with a manager-first Home view and separate Sessions, Threads, and WIPs
+views. Live 144×42 and 80×24 pseudo-terminal checks confirmed that Lumbergh,
+the primary action, navigation, selected workspace, and key guidance remain
+visible across both layout tiers. The wide layout uses the source W logo's
+center notch and saw cutout as Unicode full/half-block art; the compact layout
+uses a one-cell badge. Ratatui backend tests cover both sizes and the first-run
+Home-to-manager prompt flow.
+
 ### SPIKE-013: First-run Codex app-server recovery
 
 Status: Passed for the local alpha

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/brand/wipsaw-icon.png" alt="Wipsaw W and saw-tooth logo" width="220">
+  <img src="assets/brand/wipsaw-logo.png" alt="Wipsaw angular W with a saw-tooth cutout" width="420">
 </p>
 
 <h1 align="center">Wipsaw</h1>
@@ -34,12 +34,18 @@ verifies the exact Codex binary and app-server handshake, installs the managed
 shell shortcuts, and prints the selected account/home before anything is
 launched. It is safe to rerun as a setup or repair check.
 
-In the navigator, press `c` to create a workspace in the current directory,
-`l` to move to its tabs, and `c` again to create a shell tab. Move to Codex
-threads with `3`; `c` there creates a tab and starts its named Codex thread.
-Press `Enter` to attach or open the selected item and `?` for the complete key
-map. The narrow layout shows one table at a time; terminals 100 columns or
-wider show workspaces, tabs, and Codex threads together.
+The navigator opens on a dashboard instead of dropping a new user into several
+empty tables. Press `Enter` on Home to create the first workspace in the current
+directory and immediately open Lumbergh, the persistent Codex manager. Tell it
+what you want to set up, run, or inspect. Existing users can press `m` from any
+view to open the same manager.
+
+Use `1` through `4` for Home, Sessions, Threads, and WIPs; `Tab` cycles between
+those views. `c` creates a workspace, `n` creates and starts a named Codex
+session, and `t` creates a shell tab. Press `Enter` for the current view's
+primary action and `?` for the complete guide. The layout collapses from a
+dashboard with navigation and live system status to a compact header at narrow
+terminal widths.
 
 On a new Wipsaw registry, the first command automatically adopts the active
 `CODEX_HOME`, or `~/.codex` when that variable is unset, as the `current`
@@ -109,10 +115,21 @@ files:
   tab-creation prompt, `Ctrl-b ,` renames the current managed tab, and
   `Ctrl-b m` selects Lumbergh.
 
-Common navigator controls are `h/j/k/l`, arrow keys, `1`/`2`/`3`, `g`/`G`,
-`Enter`, `c` or `n` to create, `,` to rename a tab, `r` to refresh, and `q` to
-close. Its prefix mode accepts `Ctrl-b` followed by `w`, `t`, `s`, `n`, `p`,
-`c`, `?`, or `q`.
+Common navigator controls are `h/j/k/l`, arrow keys, `1`/`2`/`3`/`4`, `Tab`,
+`Enter`, `c`, `n`, `t`, `m`, `,` to rename a focused tab, `r` to refresh, and
+`q` to close. Its prefix mode accepts `Ctrl-b` followed by `w`, `s`, `t`, `g`,
+`m`, `n`, `p`, `c`, `?`, or `q`.
+
+## Navigator design
+
+<p align="center">
+  <img src="docs/images/wipsaw-dashboard-concept.png" alt="Wipsaw manager-first terminal dashboard design reference" width="960">
+</p>
+
+The image above is the implementation reference. The live TUI uses real
+registry, tmux, Codex, account, model-profile, and dependency state; it does
+not invent sample sessions. WIPs are visibly marked as the next runtime slice
+until the Wiphand scheduler transplant is connected.
 
 API-key and access-token accounts require a reference such as
 `secret://account/company-openai`; the CLI rejects raw credential-looking
@@ -165,10 +182,11 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   with an optional tab binding.
 - Exact-ID Codex TUI resume inside a mapped tmux tab, with account/home
   compatibility checks and shell restoration after exit.
-- A responsive keyboard-first navigator for workspaces, tabs, and managed
-  Codex threads, including create and rename prompts.
-- A Wipsaw logo asset for GitHub/Linux packaging and a compact saw-tooth mark
-  in the portable terminal header.
+- A responsive, manager-first dashboard with separate Home, Sessions, Threads,
+  and WIPs views, onboarding guidance, live dependency/account summaries, and
+  create/rename prompts.
+- The exact Wipsaw source logo for GitHub plus a faithful Unicode block-cell W
+  and saw-tooth mark in the wide terminal navigation rail.
 - Wipsaw-only `codex`, `manager`, `lumberg`, and `lumbergh` overrides that are
   loaded after the user's Bash/Zsh/Oh My Zsh configuration without editing it.
 - `Ctrl-b w` navigator popup plus managed `Ctrl-b c`, `Ctrl-b ,`, and

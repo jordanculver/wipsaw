@@ -117,11 +117,18 @@ daemon port is required.
 | `ui` | Ratatui navigator, forms, settings, viewers | UI state only | Terminal UI |
 | `mcp` | Structured tools for Lumbergh | No independent state | MCP stdio server |
 
-The local alpha implements `ui` as a responsive three-table navigator. A
-generated shell launcher sits between tmux and Bash/Zsh: it sources the user's
-normal rc files, then defines Wipsaw's tab-aware shortcuts. This keeps tmux's
-PTY durability and the user's Oh My Zsh environment while avoiding global rc
-file mutation or shortcut shadowing.
+The local alpha implements `ui` as a responsive manager-first dashboard with
+Home, Sessions, Threads, and WIPs views. Home combines a prominent Lumbergh
+entry point, compact quick actions, selected-workspace activity, dependency
+health, and account/profile summaries. Wide terminals add navigation and
+status rails; compact terminals preserve the same primary manager action under
+a short header. Unimplemented runtime views are labeled rather than populated
+with simulated data.
+
+A generated shell launcher sits between tmux and Bash/Zsh: it sources the
+user's normal rc files, then defines Wipsaw's tab-aware shortcuts. This keeps
+tmux's PTY durability and the user's Oh My Zsh environment while avoiding
+global rc file mutation or shortcut shadowing.
 
 ## Runtime module boundaries
 

@@ -1,10 +1,10 @@
 # Wipsaw brand assets
 
-`wipsaw-icon.png` is the transparent master icon for the README and future
-Linux desktop/package metadata. It is a square RGBA PNG derived from Jordan
-Culver's original ChatGPT-generated W/saw concept. The graphite W, teal cut
-edge, and amber saw teeth correspond to the TUI palette.
+`wipsaw-logo.png` is Jordan Culver's exact original ChatGPT-generated W/saw
+image and the source of truth used by the README. Do not recolor, reshape, or
+replace it with the earlier teal-and-amber derivative.
 
-Keep the W silhouette and saw-tooth cutout intact when producing size or
-format variants. Generate packaging-specific sizes from this master rather
-than repeatedly editing lossy derivatives.
+`wipsaw-mark.txt` is the terminal-native interpretation used by the TUI. It
+uses Unicode full- and half-block cells so the center notch and lower saw-tooth
+cutout survive in a monochrome terminal. Keep those two identifying features
+intact when producing future small icons or theme variants.
