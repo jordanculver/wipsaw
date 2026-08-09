@@ -255,6 +255,12 @@ nonexistent implementation.
 - Manager sessions expose only the Wipsaw manager skill and private validated
   Wipsaw MCP tools. They do not inherit personal MCPs, plugins, apps, unrelated
   skills, shell execution, image tools, or multi-agent tools.
+- The embedded composer supports multiline editing and paste, scoped `@` file
+  completion, and `$` completion over the skills allowed in that manager home.
+  Referenced file contents are bounded, credential-filtered, and confined to
+  the manager's context root.
+- Copy actions target the latest manager response or its transcript without
+  requiring selection of the surrounding dashboard.
 - Human TUI, CLI, and MCP actions call the same application services.
 - The manager can organize tabs, create WIPs, inspect runs, change safe
   settings, and report health.

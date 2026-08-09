@@ -11,14 +11,14 @@ use directories::BaseDirs;
 use serde::Serialize;
 
 use crate::codex::{
-    CodexHomeProbe, NativeCodexThreadInspection, archive_thread,
+    CodexHomeProbe, NativeCodexThreadInspection, archive_thread, codex_launch_path,
     inspect_thread as inspect_native_thread, probe_home, start_named_thread,
 };
 use crate::error::{Result, WipsawError};
 use crate::id::{EntityKind, WipsawId};
 use crate::manager::{
     MANAGER_MODEL, MANAGER_REASONING_EFFORT, ManagerEvent, ManagerTurnRequest, ManagerTurnResult,
-    prepare_runtime, spawn_turn,
+    expand_prompt_references, prepare_runtime, spawn_turn,
 };
 use crate::model::{
     Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ManagerKind,
@@ -760,6 +760,7 @@ impl WipsawApp {
                 message: "could not resolve the Codex launcher home".to_string(),
             })?;
         let runtime = prepare_runtime(&self.paths, &source_home, &session, &launcher_home)?;
+        let model_prompt = expand_prompt_references(prompt, &session.cwd)?;
         let executable = env::current_exe()?;
         let environment = vec![
             (
@@ -799,7 +800,7 @@ impl WipsawApp {
             native_thread_id: session.native_thread_id.clone(),
             codex_binary: source_home.codex_binary,
             runtime,
-            prompt: prompt.to_string(),
+            prompt: model_prompt,
             environment,
         });
         Ok(ManagerTurnHandle { session, receiver })
@@ -1384,8 +1385,12 @@ fn resolve_executable_path(path: &Path, excluded_dir: Option<&Path>) -> Result<P
             detail: "executable was not found on PATH".to_string(),
         })?
     };
+    let launcher_home = BaseDirs::new()
+        .map(|base| base.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
     let candidate = std::process::Command::new(&resolved)
         .arg("--version")
+        .env("PATH", codex_launch_path(&resolved, &launcher_home))
         .output();
     match candidate {
         Ok(output) if output.status.success() => Ok(resolved),

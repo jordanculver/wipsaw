@@ -49,6 +49,14 @@ Codex configuration, and expose only the Wipsaw manager skill plus two private
 Wipsaw MCP tools. Personal MCPs, plugins, apps, skills, shell execution, image
 tools, and multi-agent tools are not loaded into manager sessions.
 
+The manager composer accepts multiline paste. `Enter` sends; `Shift+Enter` or
+`Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker scoped to that
+manager's workspace and `$` for its allowed skills. Selected text files are
+attached to the model prompt without broadening the manager's tool access;
+credential-like and out-of-scope paths are rejected. Outside the composer,
+`y` copies the latest manager response and `Y` copies the manager transcript;
+`Ctrl-Y` copies the latest response while composing.
+
 Use `1` through `4` for Home, Sessions, Threads, and WIPs; `Tab` cycles between
 those views. `c` creates a workspace, `n` creates and starts a named Codex
 session, and `t` creates a shell tab. Press `Enter` for the current view's
@@ -208,6 +216,11 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - Resumable manager turns through `codex exec --json`, fixed to Terra/medium,
   with async progress, token usage, persistent transcript history, and exact
   native thread IDs.
+- A multiline manager composer with bracketed paste, scoped `@` file and `$`
+  skill completion, plus response-only and transcript clipboard actions.
+- Codex launch and health-check PATH repair that selects the Node runtime
+  belonging to a registered npm Codex installation instead of inheriting stale
+  tmux state.
 - Private manager Codex homes and a two-tool Wipsaw MCP server. Manager turns
   ignore inherited user configuration and disable shell, personal MCPs,
   plugins, apps, unrelated skills, image generation, and multi-agent tools.

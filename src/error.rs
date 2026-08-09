@@ -43,6 +43,9 @@ pub enum WipsawError {
     #[error("Codex app-server protocol error: {0}")]
     CodexProtocol(String),
 
+    #[error("Codex manager error: {0}")]
+    Manager(String),
+
     #[error(
         "Codex app-server initialization failed for home '{home}' after {attempts} attempt(s): {detail}. Run `wipsaw init` to verify or repair first-run setup"
     )]
@@ -75,6 +78,7 @@ impl WipsawError {
             Self::CommandFailed { .. } => "command_failed",
             Self::MalformedTmuxOutput(_) => "malformed_tmux_output",
             Self::CodexProtocol(_) => "codex_protocol_error",
+            Self::Manager(_) => "manager_error",
             Self::CodexInitialization { .. } => "codex_initialization_error",
             Self::Timeout { .. } => "timeout",
         }

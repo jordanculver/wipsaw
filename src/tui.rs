@@ -1,9 +1,15 @@
-use std::io::{self, IsTerminal, Stdout};
+use std::collections::VecDeque;
+use std::fs;
+use std::io::{self, IsTerminal, Stdout, Write};
+use std::path::Path;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     Clear as ClearTerminal, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -21,7 +27,7 @@ use ratatui::{Frame, Terminal};
 use crate::app::{TabLaunchSettings, WipsawApp};
 use crate::doctor::DoctorReport;
 use crate::error::{Result, WipsawError};
-use crate::manager::{MANAGER_MODEL, ManagerEvent};
+use crate::manager::{MANAGER_MODEL, MANAGER_SKILL_NAME, ManagerEvent, sensitive_reference};
 use crate::model::{
     Account, CodexHome, CodexThread, ManagerMessage, ManagerSession, ModelProfile, Tab, Workspace,
 };
@@ -69,15 +75,16 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
+        let input = event::read()?;
         let old_workspace = navigator.selected_workspace().map(|item| item.id.clone());
-        let action = navigator.handle_key(key);
+        let action = match input {
+            Event::Key(key) if key.kind == KeyEventKind::Press => navigator.handle_key(key),
+            Event::Paste(value) => {
+                navigator.handle_paste(&value);
+                Action::None
+            }
+            _ => continue,
+        };
         let new_workspace = navigator.selected_workspace().map(|item| item.id.clone());
         if old_workspace != new_workspace
             && let Err(error) = navigator.refresh_tabs(app, None)
@@ -233,6 +240,15 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
                 navigator.manager.focused = true;
                 navigator.message = None;
             }
+            Action::CopyManager { text, description } => {
+                let tmux_copy = app.tmux.copy_to_clipboard(&text);
+                let terminal_copy = session.copy_to_clipboard(&text);
+                if tmux_copy.is_ok() || terminal_copy.is_ok() {
+                    navigator.notice(format!("copied {description} to the clipboard"));
+                } else if let Err(error) = tmux_copy {
+                    navigator.error(error);
+                }
+            }
         }
     }
 
@@ -273,6 +289,7 @@ impl TerminalSession {
         if let Err(error) = execute!(
             stdout,
             EnterAlternateScreen,
+            EnableBracketedPaste,
             Hide,
             ClearTerminal(ClearType::All)
         ) {
@@ -289,7 +306,12 @@ impl TerminalSession {
     fn suspend(&mut self) -> io::Result<()> {
         if self.active {
             disable_raw_mode()?;
-            execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen)?;
+            execute!(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                Show,
+                LeaveAlternateScreen
+            )?;
             self.active = false;
         }
         Ok(())
@@ -301,6 +323,7 @@ impl TerminalSession {
             if let Err(error) = execute!(
                 self.terminal.backend_mut(),
                 EnterAlternateScreen,
+                EnableBracketedPaste,
                 Hide,
                 ClearTerminal(ClearType::All)
             ) {
@@ -312,13 +335,26 @@ impl TerminalSession {
         }
         Ok(())
     }
+
+    fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        let payload = base64_encode(text.as_bytes());
+        self.terminal
+            .backend_mut()
+            .write_all(format!("\x1b]52;c;{payload}\x07").as_bytes())?;
+        self.terminal.backend_mut().flush()
+    }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.active {
             let _ = disable_raw_mode();
-            let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                Show,
+                LeaveAlternateScreen
+            );
         }
     }
 }
@@ -393,6 +429,21 @@ struct ManagerChat {
     activity: Option<String>,
     turn: Option<ActiveManagerTurn>,
     scroll: u16,
+    references: Vec<ManagerReference>,
+    reference_index: usize,
+    reference_dismissed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagerReferenceKind {
+    File,
+    Skill,
+}
+
+#[derive(Debug, Clone)]
+struct ManagerReference {
+    kind: ManagerReferenceKind,
+    label: String,
 }
 
 struct ActiveManagerTurn {
@@ -517,6 +568,7 @@ impl Navigator {
 
     fn load_manager(&mut self, app: &WipsawApp, workspace_ref: Option<&str>) -> Result<()> {
         let (session, messages) = app.manager_messages(workspace_ref)?;
+        let references = manager_reference_catalog(&session.cwd);
         if let Some(existing) = self
             .managers
             .iter_mut()
@@ -528,6 +580,9 @@ impl Navigator {
         }
         self.manager.session = Some(session);
         self.manager.messages = messages;
+        self.manager.references = references;
+        self.manager.reference_index = 0;
+        self.manager.reference_dismissed = false;
         self.manager.scroll = u16::MAX;
         self.manager.activity = None;
         Ok(())
@@ -802,6 +857,8 @@ impl Navigator {
             return match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Action::CloseManager,
                 KeyCode::Enter => Action::FocusManager,
+                KeyCode::Char('y') => self.copy_latest_manager_message(),
+                KeyCode::Char('Y') => self.copy_manager_transcript(),
                 KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
                     self.manager.scroll = self.manager.scroll.saturating_sub(3);
                     Action::None
@@ -891,6 +948,8 @@ impl Navigator {
                 Action::None
             }
             KeyCode::Char('m') => Action::OpenLumbergh,
+            KeyCode::Char('y') => self.copy_latest_manager_message(),
+            KeyCode::Char('Y') => self.copy_manager_transcript(),
             KeyCode::Char(',') => {
                 self.begin_rename();
                 Action::None
@@ -919,6 +978,29 @@ impl Navigator {
     }
 
     fn handle_manager_key(&mut self, key: KeyEvent) -> Action {
+        let matches = self.manager_reference_matches();
+        if !matches.is_empty() && !self.manager.reference_dismissed {
+            match key.code {
+                KeyCode::Up => {
+                    self.manager.reference_index = self.manager.reference_index.saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.manager.reference_index =
+                        (self.manager.reference_index + 1).min(matches.len() - 1);
+                    return Action::None;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.insert_manager_reference();
+                    return Action::None;
+                }
+                KeyCode::Esc => {
+                    self.manager.reference_dismissed = true;
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 self.manager.focused = false;
@@ -926,11 +1008,18 @@ impl Navigator {
             }
             KeyCode::Backspace => {
                 self.manager.composer.pop();
+                self.manager.reference_index = 0;
+                self.manager.reference_dismissed = false;
                 Action::None
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.manager.composer.clear();
+                self.manager.reference_index = 0;
+                self.manager.reference_dismissed = false;
                 Action::None
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.copy_latest_manager_message()
             }
             KeyCode::PageUp | KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.manager.scroll = self.manager.scroll.saturating_sub(3);
@@ -938,6 +1027,18 @@ impl Navigator {
             }
             KeyCode::PageDown | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.manager.scroll = self.manager.scroll.saturating_add(3);
+                Action::None
+            }
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.insert_manager_text("\n");
+                Action::None
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_manager_text("\n");
                 Action::None
             }
             KeyCode::Enter => {
@@ -951,6 +1052,8 @@ impl Navigator {
                     return Action::None;
                 }
                 self.manager.composer.clear();
+                self.manager.reference_index = 0;
+                self.manager.reference_dismissed = false;
                 let workspace_id = self
                     .manager
                     .session
@@ -966,12 +1069,116 @@ impl Navigator {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if self.manager.composer.chars().count() < 12_000 {
-                    self.manager.composer.push(character);
-                }
+                self.insert_manager_text(&character.to_string());
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    fn handle_paste(&mut self, value: &str) {
+        if !self.manager.focused || self.manager.turn.is_some() {
+            return;
+        }
+        let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+        self.insert_manager_text(&normalized);
+    }
+
+    fn insert_manager_text(&mut self, value: &str) {
+        const LIMIT: usize = 12_000;
+        let remaining = LIMIT.saturating_sub(self.manager.composer.chars().count());
+        if remaining == 0 {
+            return;
+        }
+        self.manager.composer.extend(value.chars().take(remaining));
+        self.manager.reference_index = 0;
+        self.manager.reference_dismissed = false;
+    }
+
+    fn manager_reference_matches(&self) -> Vec<&ManagerReference> {
+        let Some((kind, _, query)) = active_manager_reference(&self.manager.composer) else {
+            return Vec::new();
+        };
+        let query = query.to_ascii_lowercase();
+        let mut matches = self
+            .manager
+            .references
+            .iter()
+            .filter(|reference| {
+                reference.kind == kind && reference.label.to_ascii_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|reference| {
+            let label = reference.label.to_ascii_lowercase();
+            (!label.starts_with(&query), label.len(), label)
+        });
+        matches.truncate(8);
+        matches
+    }
+
+    fn insert_manager_reference(&mut self) {
+        let Some((kind, start, _)) = active_manager_reference(&self.manager.composer) else {
+            return;
+        };
+        let matches = self.manager_reference_matches();
+        let Some(reference) = matches.get(
+            self.manager
+                .reference_index
+                .min(matches.len().saturating_sub(1)),
+        ) else {
+            return;
+        };
+        let label = reference.label.clone();
+        let sigil = match kind {
+            ManagerReferenceKind::File => '@',
+            ManagerReferenceKind::Skill => '$',
+        };
+        let replacement =
+            if kind == ManagerReferenceKind::File && label.contains(char::is_whitespace) {
+                format!("{sigil}{{{label}}} ")
+            } else {
+                format!("{sigil}{label} ")
+            };
+        self.manager.composer.replace_range(start.., &replacement);
+        self.manager.reference_index = 0;
+        self.manager.reference_dismissed = false;
+    }
+
+    fn copy_latest_manager_message(&self) -> Action {
+        self.manager
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| Action::CopyManager {
+                text: message.content.clone(),
+                description: "the latest manager response",
+            })
+            .unwrap_or(Action::None)
+    }
+
+    fn copy_manager_transcript(&self) -> Action {
+        if self.manager.messages.is_empty() {
+            return Action::None;
+        }
+        let label = self.manager_label();
+        let text = self
+            .manager
+            .messages
+            .iter()
+            .map(|message| {
+                let speaker = match message.role.as_str() {
+                    "user" => "YOU",
+                    "assistant" => label,
+                    _ => "WIPSAW",
+                };
+                format!("{speaker}\n{}", message.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Action::CopyManager {
+            text,
+            description: "the manager transcript",
         }
     }
 
@@ -1461,7 +1668,7 @@ impl Navigator {
                 [
                     Constraint::Length(3),
                     Constraint::Min(5),
-                    Constraint::Length(3),
+                    Constraint::Length(5),
                     Constraint::Length(3),
                     Constraint::Length(5),
                 ]
@@ -1469,7 +1676,7 @@ impl Navigator {
                 [
                     Constraint::Length(4),
                     Constraint::Min(10),
-                    Constraint::Length(3),
+                    Constraint::Length(5),
                     Constraint::Length(3),
                     Constraint::Length(8),
                 ]
@@ -1491,6 +1698,7 @@ impl Navigator {
         );
         self.render_manager_transcript(frame, rows[1]);
         self.render_manager_composer(frame, rows[2]);
+        self.render_manager_reference_menu(frame, rows[2]);
         self.render_quick_actions(frame, rows[3]);
         self.render_home_activity(frame, rows[4]);
     }
@@ -1537,48 +1745,94 @@ impl Navigator {
 
     fn render_manager_composer(&self, frame: &mut Frame<'_>, area: Rect) {
         let label = self.manager_label();
-        let prompt = if self.manager.turn.is_some() {
+        let working = self.manager.turn.is_some();
+        let prompt = if working {
             self.manager
                 .activity
                 .as_deref()
                 .unwrap_or("working…")
                 .to_string()
         } else if self.manager.composer.is_empty() {
-            format!("Ask {label} to set up, run, or inspect something…")
+            format!("Ask {label} anything…  @ files  ·  $ skills")
         } else {
-            tail_text(
-                &self.manager.composer,
-                area.width.saturating_sub(7) as usize,
-            )
+            self.manager.composer.clone()
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("› ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    prompt,
-                    Style::default().fg(if self.manager.composer.is_empty() {
-                        MUTED
+        let block = Block::default()
+            .title(if area.width >= 76 {
+                " COMPOSER · Enter send · Shift+Enter/Ctrl+J newline · @ files · $ skills "
+            } else {
+                " COMPOSER · Enter send · Ctrl+J newline "
+            })
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if self.manager.focused { CYAN } else { BORDER }))
+            .style(Style::default().bg(DEEP));
+        let inner = block.inner(area);
+        let mut lines = manager_editor_lines(
+            &prompt,
+            inner.width.max(4) as usize,
+            self.manager.focused && !working,
+            self.manager.composer.is_empty() || working,
+        );
+        let visible = inner.height as usize;
+        if lines.len() > visible {
+            lines = lines.split_off(lines.len() - visible);
+        }
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_manager_reference_menu(&self, frame: &mut Frame<'_>, composer: Rect) {
+        if !self.manager.focused || self.manager.reference_dismissed {
+            return;
+        }
+        let matches = self.manager_reference_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let kind = matches[0].kind;
+        let height = (matches.len() as u16 + 2).min(10);
+        let width = composer.width.saturating_sub(2).min(76);
+        if width < 24 {
+            return;
+        }
+        let area = Rect {
+            x: composer.x.saturating_add(1),
+            y: composer.y.saturating_sub(height),
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let selected = self.manager.reference_index.min(matches.len() - 1);
+        let items = matches
+            .iter()
+            .enumerate()
+            .map(|(index, reference)| {
+                let sigil = if reference.kind == ManagerReferenceKind::File {
+                    '@'
+                } else {
+                    '$'
+                };
+                ListItem::new(Line::from(format!(" {sigil}{}", reference.label))).style(
+                    if index == selected {
+                        Style::default()
+                            .bg(PANEL)
+                            .fg(CYAN)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        INK
-                    }),
-                ),
-                Span::styled(
-                    if self.manager.focused && self.manager.turn.is_none() {
-                        "█"
-                    } else {
-                        ""
+                        Style::default().fg(INK)
                     },
-                    Style::default().fg(CYAN),
-                ),
-            ]))
-            .block(
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(
                 Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if self.manager.focused {
-                        CYAN
+                    .title(if kind == ManagerReferenceKind::File {
+                        " @ FILES · ↑↓ choose · Enter/Tab insert "
                     } else {
-                        BORDER
-                    }))
+                        " $ SKILLS · ↑↓ choose · Enter/Tab insert "
+                    })
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CYAN))
                     .style(Style::default().bg(DEEP)),
             ),
             area,
@@ -1594,7 +1848,7 @@ impl Navigator {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(6),
-                Constraint::Length(3),
+                Constraint::Length(6),
                 Constraint::Length(2),
             ])
             .split(inset(popup, 1, 1));
@@ -1622,10 +1876,11 @@ impl Navigator {
         );
         self.render_manager_transcript(frame, rows[1]);
         self.render_manager_composer(frame, rows[2]);
+        self.render_manager_reference_menu(frame, rows[2]);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("Enter", Style::default().fg(CYAN)),
-                Span::styled(" send  ·  ", Style::default().fg(MUTED)),
+                Span::styled(" send  ·  Ctrl+J newline  ·  ", Style::default().fg(MUTED)),
                 Span::styled("Esc", Style::default().fg(CYAN)),
                 Span::styled(
                     if self.manager.focused {
@@ -1635,6 +1890,7 @@ impl Navigator {
                     },
                     Style::default().fg(MUTED),
                 ),
+                Span::styled("  ·  y latest / Y transcript", Style::default().fg(MUTED)),
             ])),
             rows[3],
         );
@@ -2227,7 +2483,11 @@ impl Navigator {
             };
             (text, false)
         });
-        let keys = if self.prefix_pending {
+        let keys = if self.manager.focused {
+            "Enter send   Shift+Enter/Ctrl+J newline   @ files   $ skills   Ctrl+Y copy latest"
+        } else if self.manager.overlay || self.view == View::Home {
+            "Enter compose   y copy latest   Y copy transcript   ↑↓ scroll   ? guide"
+        } else if self.prefix_pending {
             "PREFIX C-b · w home  s sessions  t threads  g WIPs  m Lumbergh  n/p views"
         } else if area.width < 92 {
             "↑↓ move  Enter open  c workspace  n Codex  m Lumbergh  ? guide"
@@ -2283,7 +2543,13 @@ impl Navigator {
             Line::from("  c              new workspace (or create in focused Sessions list)"),
             Line::from("  n / t          new Codex session / shell tab"),
             Line::from("  m              talk to Lumbergh from anywhere"),
+            Line::from("  y / Y          copy latest manager response / full transcript"),
             Line::from("  ,              rename a focused tab · r refreshes live state"),
+            Line::raw(""),
+            Line::styled("MANAGER COMPOSER", Style::default().fg(AMBER)),
+            Line::from("  Enter          send · Shift+Enter or Ctrl+J inserts a newline"),
+            Line::from("  @ / $          find a scoped file / available manager skill"),
+            Line::from("  paste          preserves multiple lines · Ctrl+Y copies latest response"),
             Line::raw(""),
             Line::styled("TMUX-FAMILIAR PREFIX", Style::default().fg(AMBER)),
             Line::from("  C-b w          toggle this navigator"),
@@ -2417,10 +2683,133 @@ enum Action {
         workspace_id: Option<String>,
         prompt: String,
     },
+    CopyManager {
+        text: String,
+        description: &'static str,
+    },
 }
 
 fn is_manager_tab(tab: &Tab) -> bool {
     tab.name.eq_ignore_ascii_case("middle-manager") || tab.name.eq_ignore_ascii_case("manager")
+}
+
+fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
+    const MAX_FILES: usize = 20_000;
+    const MAX_DEPTH: usize = 8;
+    const SKIPPED_DIRECTORIES: &[&str] = &[
+        ".git",
+        ".cache",
+        ".aws",
+        ".docker",
+        ".gnupg",
+        ".next",
+        ".ssh",
+        ".venv",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+        "target",
+        "venv",
+    ];
+
+    let mut references = vec![ManagerReference {
+        kind: ManagerReferenceKind::Skill,
+        label: MANAGER_SKILL_NAME.to_string(),
+    }];
+    let mut files = Vec::new();
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0_usize)]);
+    while let Some((directory, depth)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if depth < MAX_DEPTH && !SKIPPED_DIRECTORIES.contains(&name.as_ref()) {
+                    queue.push_back((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file() || sensitive_reference(&name) {
+                continue;
+            }
+            let Ok(relative) = entry.path().strip_prefix(root).map(Path::to_path_buf) else {
+                continue;
+            };
+            files.push(relative.to_string_lossy().into_owned());
+            if files.len() >= MAX_FILES {
+                queue.clear();
+                break;
+            }
+        }
+    }
+    files.sort_by_key(|path| path.to_ascii_lowercase());
+    references.extend(files.into_iter().map(|label| ManagerReference {
+        kind: ManagerReferenceKind::File,
+        label,
+    }));
+    references
+}
+
+fn active_manager_reference(value: &str) -> Option<(ManagerReferenceKind, usize, &str)> {
+    let start = value
+        .rfind(char::is_whitespace)
+        .map(|index| {
+            index
+                + value[index..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let token = &value[start..];
+    let (kind, query) = if let Some(query) = token.strip_prefix('@') {
+        (ManagerReferenceKind::File, query)
+    } else if let Some(query) = token.strip_prefix('$') {
+        (ManagerReferenceKind::Skill, query)
+    } else {
+        return None;
+    };
+    if query.contains(['{', '}']) {
+        return None;
+    }
+    Some((kind, start, query))
+}
+
+fn base64_encode(value: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(value.len().div_ceil(3) * 4);
+    for chunk in value.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 fn manager_transcript_lines(
@@ -2469,6 +2858,55 @@ fn manager_transcript_lines(
     lines
 }
 
+fn manager_editor_lines(
+    value: &str,
+    width: usize,
+    show_cursor: bool,
+    muted: bool,
+) -> Vec<Line<'static>> {
+    let segments = wrap_editor_text(value, width.saturating_sub(2).max(1));
+    let last = segments.len().saturating_sub(1);
+    segments
+        .into_iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let mut spans = vec![Span::styled(
+                if index == 0 { "› " } else { "│ " },
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            )];
+            spans.push(Span::styled(
+                segment,
+                Style::default().fg(if muted { MUTED } else { INK }),
+            ));
+            if show_cursor && index == last {
+                spans.push(Span::styled("█", Style::default().fg(CYAN)));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn wrap_editor_text(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for source in value.split('\n') {
+        if source.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let characters = source.chars().collect::<Vec<_>>();
+        wrapped.extend(
+            characters
+                .chunks(width)
+                .map(|chunk| chunk.iter().collect::<String>()),
+        );
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
 fn wrap_text(value: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -2511,17 +2949,6 @@ fn wrap_text(value: &str, width: usize) -> Vec<String> {
         lines.push(String::new());
     }
     lines
-}
-
-fn tail_text(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
-    }
-    value
-        .chars()
-        .skip(count.saturating_sub(max_chars))
-        .collect()
 }
 
 fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
@@ -2666,17 +3093,60 @@ fn centered_rect(area: Rect, requested_width: u16, requested_height: u16) -> Rec
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyCode;
+    use std::fs;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use tempfile::tempdir;
 
-    use super::{Action, Navigator, wrap_text};
+    use super::{
+        Action, Navigator, active_manager_reference, base64_encode, manager_reference_catalog,
+        wrap_editor_text, wrap_text,
+    };
 
     #[test]
     fn transcript_wraps_unbroken_ids_without_overflowing() {
         let lines = wrap_text("manager_019fe42934a67d13b2dd6e8cb949d034 ready", 12);
         assert!(lines.iter().all(|line| line.chars().count() <= 12));
         assert!(lines.last().is_some_and(|line| line.ends_with("ready")));
+    }
+
+    #[test]
+    fn manager_composer_preserves_multiline_input_and_paste() {
+        let mut navigator = Navigator::empty();
+        navigator.manager.focused = true;
+        navigator.insert_manager_text("first");
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        navigator.handle_paste("second\r\nthird");
+        assert_eq!(navigator.manager.composer, "first\nsecond\nthird");
+        assert_eq!(
+            wrap_editor_text(&navigator.manager.composer, 20),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn at_and_dollar_references_offer_files_and_the_manager_skill() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("README.md"), "read me").unwrap();
+        fs::write(root.path().join("notes with spaces.md"), "notes").unwrap();
+        let mut navigator = Navigator::empty();
+        navigator.manager.focused = true;
+        navigator.manager.references = manager_reference_catalog(root.path());
+        navigator.manager.composer = "Review @READ".to_string();
+        navigator.insert_manager_reference();
+        assert_eq!(navigator.manager.composer, "Review @README.md ");
+        navigator.manager.composer.push('$');
+        navigator.insert_manager_reference();
+        assert!(navigator.manager.composer.ends_with("$wipsaw-manager "));
+        assert!(active_manager_reference("Use @notes").is_some());
+    }
+
+    #[test]
+    fn osc52_payload_uses_standard_base64() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode(b"Wipsaw"), "V2lwc2F3");
     }
 
     #[test]

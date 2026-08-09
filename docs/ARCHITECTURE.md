@@ -143,6 +143,16 @@ private MCP server exposing `manager_guide` and a validated `run_wipsaw`
 capability; shell, personal MCPs, plugins, apps, unrelated skills, image, and
 multi-agent capabilities are disabled.
 
+The composer preserves multiline bracketed paste and provides client-side
+completion for scoped `@` files and allowed `$` skills. Wipsaw resolves file
+references beneath the manager context root, rejects credential-like, binary,
+oversized, or escaping files, and appends bounded contents to the model prompt
+while persisting the original human message. Clipboard actions copy only the
+latest response or manager transcript through tmux and OSC 52. Codex startup,
+app-server, health checks, and manager turns also prepend the Node runtime
+belonging to the registered npm Codex installation, avoiding stale
+version-manager paths retained by long-lived tmux servers.
+
 Workspace and tab rows are durable; tmux session/window IDs are runtime
 handles. Every mutating or activation path first checks the private tmux
 server. When a session is missing, Wipsaw recreates the Middle Manager tab and

@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -59,6 +63,7 @@ pub fn probe_home(home: &CodexHome) -> Result<CodexHomeProbe> {
     let version_output = Command::new(&home.codex_binary)
         .arg("--version")
         .env("CODEX_HOME", &home.path)
+        .env("PATH", launch_path(home))
         .output()
         .map_err(|error| WipsawError::ExecutableUnavailable {
             program: home.codex_binary.display().to_string(),
@@ -309,6 +314,7 @@ impl AppServerClient {
         let mut child = Command::new(&home.codex_binary)
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", &home.path)
+            .env("PATH", launch_path(home))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -391,6 +397,59 @@ impl AppServerClient {
             WipsawError::CodexProtocol(with_diagnostics(error.to_string(), &self.diagnostics))
         })
     }
+}
+
+fn launch_path(home: &CodexHome) -> std::ffi::OsString {
+    let launcher_home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    codex_launch_path(&home.codex_binary, &launcher_home)
+}
+
+pub(crate) fn codex_launch_path(codex_binary: &Path, launcher_home: &Path) -> OsString {
+    let inherited = env::var_os("PATH").unwrap_or_default();
+    let mut entries = Vec::new();
+    if let Some(runtime) = codex_node_runtime(codex_binary, launcher_home) {
+        entries.push(runtime);
+    }
+    entries.extend(env::split_paths(&inherited));
+    let mut seen = HashSet::new();
+    entries.retain(|entry| seen.insert(entry.clone()));
+    env::join_paths(entries).unwrap_or(inherited)
+}
+
+/// npm's Codex entrypoint uses `#!/usr/bin/env node`. Long-lived tmux servers
+/// can retain an obsolete Node at the front of PATH, so locate the Node that
+/// belongs to the registered Codex installation and place it first.
+fn codex_node_runtime(codex_binary: &Path, launcher_home: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(codex_binary).ok();
+    for path in std::iter::once(codex_binary).chain(canonical.as_deref()) {
+        for ancestor in path.ancestors() {
+            let bin = ancestor.join("bin");
+            if bin.join("node").is_file() && bin.join("codex").exists() {
+                return Some(bin);
+            }
+        }
+    }
+
+    let script = fs::read_to_string(codex_binary).ok()?;
+    for marker in ["$HOME/", "${HOME}/"] {
+        let mut remainder = script.as_str();
+        while let Some(start) = remainder.find(marker) {
+            let after = &remainder[start + marker.len()..];
+            if let Some(end) = after.find("/bin/codex") {
+                let candidate = launcher_home.join(&after[..end + "/bin/codex".len()]);
+                if let Some(bin) = candidate.parent()
+                    && bin.join("node").is_file()
+                {
+                    return Some(bin.to_path_buf());
+                }
+            }
+            remainder = after;
+        }
+    }
+    None
 }
 
 fn send(stdin: &mut impl Write, value: &Value) -> Result<()> {

@@ -206,6 +206,15 @@ WIP CRUD, service operations, audit policy, cancellation, concurrent turns,
 and the public WIP/runtime MCP remain future work. This private manager MCP is
 not the public extension/runtime server planned for the WIP transplant.
 
+Composer/runtime follow-up, 2026-08-08: a live private tmux server retained
+Node 12 in `PATH` while the registered npm Codex 0.147 installation belonged to
+Node 20, causing its JavaScript launcher to fail on top-level `await`. Codex
+startup, app-server, health, and manager launches now find and prepend the
+runtime paired with the registered Codex binary. The embedded composer also
+gained multiline bracketed paste, scoped `@` file and `$` skill completion,
+bounded file attachment, and manager-only clipboard actions using tmux plus
+OSC 52.
+
 ## Priority spikes
 
 ### SPIKE-005: Multi-account and multi-home isolation

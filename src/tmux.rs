@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use serde::Serialize;
 
@@ -16,6 +17,7 @@ set-option -g base-index 0
 set-option -g renumber-windows on
 set-option -g allow-rename off
 set-option -g automatic-rename off
+set-option -g set-clipboard on
 set-option -g status on
 set-option -g status-position bottom
 set-option -g status-interval 2
@@ -361,6 +363,35 @@ impl TmuxBackend {
                 stderr: "tmux attach failed".to_string(),
             })
         }
+    }
+
+    /// Copy without placing transcript content in the process argument list.
+    /// `-w` asks tmux to forward the buffer through its clipboard integration.
+    pub fn copy_to_clipboard(&self, text: &str) -> Result<()> {
+        let args = self.base_args(["load-buffer", "-w", "-"]);
+        let mut child = Command::new(&self.binary)
+            .args(&args)
+            .env("PATH", &self.path_env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| WipsawError::ExecutableUnavailable {
+                program: self.binary.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| WipsawError::CommandFailed {
+                program: self.binary.display().to_string(),
+                args: args_text(&args),
+                code: None,
+                stderr: "tmux clipboard stdin was unavailable".to_string(),
+            })?
+            .write_all(text.as_bytes())?;
+        let output = child.wait_with_output()?;
+        successful_output(&self.binary, &args, output).map(|_| ())
     }
 
     fn set_environment(&self, session: &str, name: &str, value: &str) -> Result<()> {
