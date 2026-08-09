@@ -165,8 +165,10 @@ completion for scoped `@` files and allowed `$` skills. Lumbergh supports lazy
 absolute-path browsing from `/`; Middle Managers index and browse only their
 explicit roots. Wipsaw resolves file references through the same central scope
 policy used by MCP file tools, rejects credential-like, binary, oversized, or
-escaping files, and appends bounded contents to the model prompt while
-persisting the original human message. The composer renders an empty `λ`
+escaping files, and appends bounded file contents or an immediate directory
+listing to the model prompt while persisting the original human message.
+Directory context explicitly directs the manager to its scoped browse/search/read
+tools. The composer renders an empty `λ`
 input instead of placeholder or activity text. Clipboard actions copy only the
 latest response or manager transcript through tmux and OSC 52. A separate
 transcript-only view removes adjacent dashboard columns and pauses redraws so

@@ -57,7 +57,9 @@ and `$` for allowed skills. Lumbergh has machine-wide read access: type `@/` and
 continue through directories to browse from the filesystem root. Each Middle
 Manager is technically confined to an explicit file/directory allowlist seeded
 with the workspace's `--cwd`. Selected text files are attached to the model
-prompt; credential-like and out-of-scope paths are rejected. Codex
+prompt; directory references attach a bounded listing and become browse/search
+targets for the manager's private tools. Credential-like and out-of-scope paths
+are rejected. Codex
 reasoning, tool calls, completion state, failures, and token usage appear in
 the same response box as the final answer. Outside the composer, `v` opens a
 manager-only, redraw-stable selection view for native terminal copying, `y`
