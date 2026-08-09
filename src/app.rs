@@ -75,6 +75,12 @@ pub struct WorkspaceStart {
     pub native_manager_thread_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceDeletion {
+    pub workspace: Workspace,
+    pub tmux_session_stopped: bool,
+}
+
 pub struct ManagerTurnHandle {
     pub session: ManagerSession,
     pub receiver: std::sync::mpsc::Receiver<ManagerEvent>,
@@ -197,6 +203,39 @@ impl WipsawApp {
                 entity: "workspace",
                 value: reference.to_string(),
             })
+    }
+
+    pub fn delete_workspace(&mut self, reference: &str) -> Result<WorkspaceDeletion> {
+        let workspace = self.workspace(reference)?;
+        if env::var("WIPSAW_MANAGER_WORKSPACE_ID").as_deref() == Ok(workspace.id.as_str()) {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace delete",
+                message: "a Middle Manager cannot delete its own workspace; ask Lumbergh"
+                    .to_string(),
+            });
+        }
+        if self
+            .registry
+            .manager_session_for_workspace(Some(&workspace.id))?
+            .is_some_and(|manager| manager.status == "working")
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace delete",
+                message: format!(
+                    "workspace '{}' cannot be deleted while its Middle Manager is working",
+                    workspace.name
+                ),
+            });
+        }
+        let live = self.tmux.session_exists(&workspace.tmux_session)?;
+        if live {
+            self.tmux.kill_workspace(&workspace.tmux_session)?;
+        }
+        self.registry.delete_workspace(&workspace.id)?;
+        Ok(WorkspaceDeletion {
+            workspace,
+            tmux_session_stopped: live,
+        })
     }
 
     pub fn attach_workspace(&mut self, reference: &str) -> Result<()> {
@@ -762,7 +801,7 @@ impl WipsawApp {
         let runtime = prepare_runtime(&self.paths, &source_home, &session, &launcher_home)?;
         let model_prompt = expand_prompt_references(prompt, &session.cwd)?;
         let executable = env::current_exe()?;
-        let environment = vec![
+        let mut environment = vec![
             (
                 OsString::from("WIPSAW_MANAGER_EXECUTABLE"),
                 executable.as_os_str().to_owned(),
@@ -792,6 +831,12 @@ impl WipsawApp {
                 self.tmux.binary().as_os_str().to_owned(),
             ),
         ];
+        if let Some(workspace_id) = &session.workspace_id {
+            environment.push((
+                OsString::from("WIPSAW_MANAGER_WORKSPACE_ID"),
+                OsString::from(workspace_id),
+            ));
+        }
         self.registry
             .append_manager_message(&session.id, "user", prompt)?;
         self.registry.mark_manager_working(&session.id)?;

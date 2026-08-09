@@ -393,6 +393,19 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    pub fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM workspaces WHERE id = ?1", [workspace_id])?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "workspace",
+                value: workspace_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn insert_tab(&self, input: NewTab<'_>) -> Result<Tab> {
         if self.tab_by_ref(input.workspace_id, input.name)?.is_some() {
             return Err(WipsawError::AlreadyExists {
@@ -1236,6 +1249,9 @@ mod tests {
                 .name,
             "middle-manager"
         );
+        registry.delete_workspace(&workspace.id).unwrap();
+        assert!(registry.workspace_by_ref(&workspace.id).unwrap().is_none());
+        assert!(registry.list_tabs(&workspace.id).unwrap().is_empty());
     }
 
     #[test]
@@ -1322,6 +1338,19 @@ mod tests {
                 .list_manager_messages(&middle.id, 10)
                 .unwrap()
                 .is_empty()
+        );
+        registry.delete_workspace(&workspace.id).unwrap();
+        assert!(
+            registry
+                .manager_session_by_id(&middle.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .manager_session_by_id(&lumbergh.id)
+                .unwrap()
+                .is_some()
         );
     }
 

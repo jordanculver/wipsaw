@@ -91,6 +91,13 @@ pub enum WorkspaceCommand {
     List,
     /// Start or reconstruct a stopped workspace and its Middle Manager.
     Start { workspace: String },
+    /// Permanently remove a workspace and stop its private tmux session.
+    Delete {
+        workspace: String,
+        /// Confirm this destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Attach to a workspace by name or ID.
     Attach { workspace: String },
 }
@@ -343,6 +350,22 @@ pub fn run(cli: Cli) -> Result<()> {
                             started.workspace.name
                         )
                     }
+                })?;
+            }
+            WorkspaceCommand::Delete { workspace, yes } => {
+                if !yes {
+                    return Err(WipsawError::InvalidInput {
+                        field: "workspace delete",
+                        message: "requires --yes because this removes its tabs and manager history"
+                            .to_string(),
+                    });
+                }
+                let deleted = app.delete_workspace(&workspace)?;
+                output(cli.json, &deleted, || {
+                    format!(
+                        "deleted workspace '{}' ({})",
+                        deleted.workspace.name, deleted.workspace.id
+                    )
                 })?;
             }
             WorkspaceCommand::Attach { workspace } => app.attach_workspace(&workspace)?,

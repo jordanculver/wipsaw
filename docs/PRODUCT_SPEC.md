@@ -121,6 +121,9 @@ policy checks even when invoked by Lumbergh.
 ### Workspaces, tabs, and terminals
 
 - Create, rename, reorder, move, detach, reattach, archive, and delete tabs.
+- Delete a workspace only through an exact resolved target and explicit
+  confirmation; stop its private tmux session and cascade its tabs and scoped
+  Middle Manager history without touching Lumbergh.
 - Restore Wipsaw after its TUI or daemon restarts; tmux remains the durable PTY
   owner. If the private tmux session itself is gone, opening the workspace must
   reconstruct registered tabs, reconcile ephemeral window IDs, and restore the
@@ -252,15 +255,20 @@ nonexistent implementation.
   manager model/effort default, initially `gpt-5.6-terra` with medium effort.
 - Manager Codex homes reuse the selected account's authentication by reference
   while ignoring inherited user configuration.
-- Manager sessions expose only the Wipsaw manager skill and private validated
-  Wipsaw MCP tools. They do not inherit personal MCPs, plugins, apps, unrelated
-  skills, shell execution, image tools, or multi-agent tools.
+- Manager sessions expose only the Wipsaw manager, `skill-creator`, and
+  `skill-installer` skills plus private validated Wipsaw MCP tools. The latter
+  is presented as the built-in skill lookup/installer. Managers do not inherit
+  personal MCPs, plugins, apps, unrelated skills, shell execution, image tools,
+  or multi-agent tools.
 - The embedded composer supports multiline editing and paste, scoped `@` file
-  completion, and `$` completion over the skills allowed in that manager home.
-  Referenced file contents are bounded, credential-filtered, and confined to
-  the manager's context root.
-- Copy actions target the latest manager response or its transcript without
-  requiring selection of the surrounding dashboard.
+  completion, `$` completion over the skills allowed in that manager home, and
+  a blank `λ` prompt instead of placeholder content. Referenced file contents
+  are bounded, credential-filtered, and confined to the manager's context root.
+- Codex reasoning, tool calls, completion/failure state, and usage render in
+  order inside the manager response box before the final answer.
+- Copy actions target the latest manager response or its transcript. A
+  redraw-stable, manager-only selection view also supports native terminal copy
+  without selecting the surrounding dashboard.
 - Human TUI, CLI, and MCP actions call the same application services.
 - The manager can organize tabs, create WIPs, inspect runs, change safe
   settings, and report health.

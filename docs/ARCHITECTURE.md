@@ -134,24 +134,41 @@ rather than populated with simulated data.
 
 Manager turns do not attach an interactive Codex TUI. Wipsaw runs resumable
 `codex exec --json` threads asynchronously, persists each exact native thread
-ID and transcript, and renders activity back into the existing Ratatui view.
+ID and transcript, and upserts reasoning/tool JSONL items into the manager
+response box before the final answer. Completion, failure, and token usage are
+represented by the same progress stream rather than replacing the composer.
 Both manager kinds are fixed initially to `gpt-5.6-terra` with medium reasoning.
 Each generated manager home references the selected account's existing
 authentication but ignores inherited configuration and installs only the
-Wipsaw manager skill. A read-only manager process receives one required,
-private MCP server exposing `manager_guide` and a validated `run_wipsaw`
-capability; shell, personal MCPs, plugins, apps, unrelated skills, image, and
-multi-agent capabilities are disabled.
+Wipsaw manager, `skill-creator`, and `skill-installer` skill directories. The
+installer is the manager's default lookup surface. A read-only manager process
+receives one required, private MCP server exposing `manager_guide` and a
+validated `run_wipsaw` capability; shell, personal MCPs, plugins, apps,
+unrelated skills, image, and multi-agent capabilities are disabled. Codex's
+stdio MCP launcher receives an explicit map of Wipsaw config/state/data/runtime
+paths, tmux socket and binary, manager executable, and (for Middle Managers)
+workspace ID; its sanitized default environment therefore cannot silently fall
+back to another Wipsaw registry.
 
 The composer preserves multiline bracketed paste and provides client-side
 completion for scoped `@` files and allowed `$` skills. Wipsaw resolves file
 references beneath the manager context root, rejects credential-like, binary,
 oversized, or escaping files, and appends bounded contents to the model prompt
-while persisting the original human message. Clipboard actions copy only the
-latest response or manager transcript through tmux and OSC 52. Codex startup,
-app-server, health checks, and manager turns also prepend the Node runtime
-belonging to the registered npm Codex installation, avoiding stale
-version-manager paths retained by long-lived tmux servers.
+while persisting the original human message. The composer renders an empty `λ`
+input instead of placeholder or activity text. Clipboard actions copy only the
+latest response or manager transcript through tmux and OSC 52. A separate
+transcript-only view removes adjacent dashboard columns and pauses redraws so
+native terminal selection remains stable; idle dashboard rendering also blocks
+until input. Codex startup, app-server, health checks, and manager turns prepend
+the Node runtime belonging to the registered npm Codex installation, avoiding
+stale version-manager paths retained by long-lived tmux servers.
+
+Workspace deletion is a shared application operation exposed as
+`workspace delete <id> --yes`. It rejects ambiguous targets, refuses a
+workspace whose Middle Manager is working, prevents a Middle Manager from
+deleting its own scope, stops a live private tmux session, and then relies on
+SQLite foreign-key cascades for tabs and scoped manager history. The private
+manager allowlist requires the same explicit `--yes` argument.
 
 Workspace and tab rows are durable; tmux session/window IDs are runtime
 handles. Every mutating or activation path first checks the private tmux

@@ -45,17 +45,22 @@ Sessions.
 Lumbergh and every Middle Manager run as resumable `codex exec --json` threads
 with `gpt-5.6-terra` and medium reasoning. Their generated Codex homes link the
 selected account's existing `auth.json` without copying it, ignore personal
-Codex configuration, and expose only the Wipsaw manager skill plus two private
-Wipsaw MCP tools. Personal MCPs, plugins, apps, skills, shell execution, image
-tools, and multi-agent tools are not loaded into manager sessions.
+Codex configuration, and expose only `$wipsaw-manager`, `$skill-creator`, and
+`$skill-installer` (the built-in skill lookup/installer) plus two private Wipsaw
+MCP tools. Personal MCPs, plugins, apps, unrelated skills, shell execution,
+image tools, and multi-agent tools are not loaded into manager sessions.
 
-The manager composer accepts multiline paste. `Enter` sends; `Shift+Enter` or
-`Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker scoped to that
-manager's workspace and `$` for its allowed skills. Selected text files are
-attached to the model prompt without broadening the manager's tool access;
-credential-like and out-of-scope paths are rejected. Outside the composer,
-`y` copies the latest manager response and `Y` copies the manager transcript;
-`Ctrl-Y` copies the latest response while composing.
+The blank `λ` manager composer accepts multiline paste. `Enter` sends;
+`Shift+Enter` or `Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker
+scoped to that manager's workspace and `$` for its allowed skills. Selected
+text files are attached to the model prompt without broadening the manager's
+tool access; credential-like and out-of-scope paths are rejected. Codex
+reasoning, tool calls, completion state, failures, and token usage appear in
+the same response box as the final answer. Outside the composer, `v` opens a
+manager-only, redraw-stable selection view for native terminal copying, `y`
+copies the latest manager response, and `Y` copies the transcript; `Ctrl-O`
+opens the selection view and `Ctrl-Y` copies the latest response while
+composing.
 
 Use `1` through `4` for Home, Sessions, Threads, and WIPs; `Tab` cycles between
 those views. `c` creates a workspace, `n` creates and starts a named Codex
@@ -71,6 +76,14 @@ attaching, run:
 
 ```bash
 wipsaw workspace start "workspace name"
+```
+
+Lumbergh can also remove a workspace after resolving its exact ID and
+confirming the request. The equivalent explicit CLI command is destructive and
+requires `--yes`:
+
+```bash
+wipsaw workspace delete ws_... --yes
 ```
 
 On a new Wipsaw registry, the first command automatically adopts the active
@@ -143,9 +156,9 @@ files:
   `Ctrl-b m` opens the current workspace's Middle Manager.
 
 Common navigator controls are `h/j/k/l`, arrow keys, `1`/`2`/`3`/`4`, `Tab`,
-`Enter`, `c`, `n`, `t`, `m`, `,` to rename a focused tab, `r` to refresh, and
-`q` to close. Its prefix mode accepts `Ctrl-b` followed by `w`, `s`, `t`, `g`,
-`m`, `n`, `p`, `c`, `?`, or `q`.
+`Enter`, `c`, `n`, `t`, `m`, `v` for manager-only selection, `,` to rename a
+focused tab, `r` to refresh, and `q` to close. Its prefix mode accepts `Ctrl-b`
+followed by `w`, `s`, `t`, `g`, `m`, `n`, `p`, `c`, `?`, or `q`.
 
 ## Navigator design
 
@@ -196,7 +209,9 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - UUIDv7-backed typed IDs such as `ws_...`, `tab_...`, `acct_...`, and
   `thread_...`.
 - Generated Wipsaw-only tmux config and private socket.
-- Workspace create/list/start/attach and tab create/list/rename. Opening a
+- Workspace create/list/start/attach/delete and tab create/list/rename. Delete
+  requires `--yes`, stops the workspace's private tmux session, and removes its
+  tabs and Middle Manager history through database cascades. Opening a
   stopped workspace recreates its windows from durable metadata and updates
   reused tmux targets transactionally.
 - Dependency doctor for tmux, Codex, Docker, Compose, and SSH.
@@ -214,16 +229,19 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - One persistent Lumbergh on the dashboard and one separate Middle Manager per
   workspace, all embedded in Wipsaw instead of attaching a raw Codex TUI.
 - Resumable manager turns through `codex exec --json`, fixed to Terra/medium,
-  with async progress, token usage, persistent transcript history, and exact
-  native thread IDs.
-- A multiline manager composer with bracketed paste, scoped `@` file and `$`
-  skill completion, plus response-only and transcript clipboard actions.
+  with reasoning/tool progress and token usage rendered inline, persistent
+  transcript history, and exact native thread IDs.
+- A blank `λ` multiline manager composer with bracketed paste, scoped `@` file
+  and `$` skill completion, response/transcript clipboard actions, and a
+  manager-only native-selection view that freezes redraws while copying.
 - Codex launch and health-check PATH repair that selects the Node runtime
   belonging to a registered npm Codex installation instead of inheriting stale
   tmux state.
-- Private manager Codex homes and a two-tool Wipsaw MCP server. Manager turns
-  ignore inherited user configuration and disable shell, personal MCPs,
-  plugins, apps, unrelated skills, image generation, and multi-agent tools.
+- Private manager Codex homes containing only the Wipsaw manager,
+  `skill-creator`, and `skill-installer` skills, plus a two-tool Wipsaw MCP
+  server. Manager turns ignore inherited user configuration and disable shell,
+  personal MCPs, plugins, apps, unrelated skills, image generation, and
+  multi-agent tools.
 - A responsive, manager-first dashboard with separate Home, Sessions, Threads,
   and WIPs views, onboarding guidance, live dependency/account summaries, and
   create/rename prompts.

@@ -18,6 +18,8 @@ use crate::paths::AppPaths;
 pub const MANAGER_MODEL: &str = "gpt-5.6-terra";
 pub const MANAGER_REASONING_EFFORT: &str = "medium";
 pub const MANAGER_SKILL_NAME: &str = "wipsaw-manager";
+pub const MANAGER_SKILL_NAMES: [&str; 3] = [MANAGER_SKILL_NAME, "skill-creator", "skill-installer"];
+const SYSTEM_MANAGER_SKILLS: [&str; 2] = ["skill-creator", "skill-installer"];
 
 const MAX_REFERENCED_FILES: usize = 8;
 const MAX_REFERENCED_FILE_BYTES: u64 = 128 * 1024;
@@ -36,6 +38,7 @@ Use only the tools from the `wipsaw` MCP server for Wipsaw operations.
 - Call `run_wipsaw` with a structured `args` array. Always begin with `--json`.
 - Inspect current state before changing it.
 - Wipsaw nouns are singular CLI groups. For example, list workspaces with `args: ["--json", "workspace", "list"]`.
+- Delete a workspace only after confirming the exact ID and the user's intent, then call `args: ["--json", "workspace", "delete", "<id>", "--yes"]`.
 - Use Wipsaw workspace, tab, thread, account, home, and profile commands instead of invoking tmux or Codex directly.
 - Never print, copy, or request raw authentication tokens. Work with Wipsaw account and Codex-home references.
 - Do not attach to a tmux client or launch an interactive TUI from this non-interactive manager session.
@@ -81,8 +84,23 @@ pub struct ManagerTurnResult {
 #[derive(Debug, Clone)]
 pub enum ManagerEvent {
     Started,
-    Activity(String),
+    Progress(ManagerProgress),
     Finished(std::result::Result<ManagerTurnResult, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerProgressStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerProgress {
+    pub id: String,
+    pub label: String,
+    pub detail: Option<String>,
+    pub status: ManagerProgressStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +141,12 @@ pub fn prepare_runtime(
         &codex_home.join("skills/wipsaw-manager/SKILL.md"),
         MANAGER_SKILL,
     )?;
+    for skill in SYSTEM_MANAGER_SKILLS {
+        copy_private_tree(
+            &source_home.path.join("skills/.system").join(skill),
+            &codex_home.join("skills").join(skill),
+        )?;
+    }
     write_private_file(&work_dir.join("AGENTS.md"), &manager_instructions(session))?;
 
     Ok(ManagerRuntime {
@@ -434,6 +458,10 @@ fn manager_mcp_response(request: &Value) -> Option<Value> {
 }
 
 fn manager_mcp_tools() -> Value {
+    // `run_wipsaw` is a mixed command gateway. Marking the entire MCP tool as
+    // destructive makes non-interactive Codex cancel harmless reads before
+    // Wipsaw can validate them, so destructive subcommands carry their own
+    // explicit confirmation and application-level guards instead.
     json!([
         {
             "name": "manager_guide",
@@ -451,7 +479,7 @@ fn manager_mcp_tools() -> Value {
         },
         {
             "name": "run_wipsaw",
-            "description": "Run one validated Wipsaw JSON command. Use singular groups such as workspace, tab, account, home, thread, and profile.",
+            "description": "Run one validated Wipsaw JSON command. Use singular groups such as workspace, tab, account, home, thread, and profile. Workspace deletion requires an explicit --yes argument.",
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
@@ -567,7 +595,7 @@ fn validate_manager_command(args: &[String]) -> std::result::Result<(), String> 
     let action = args[2].as_str();
     let allowed = matches!(
         (group, action),
-        ("workspace", "create" | "list" | "start")
+        ("workspace", "create" | "delete" | "list" | "start")
             | ("tab", "create" | "list" | "rename")
             | ("account", "add" | "list")
             | ("home", "add" | "list")
@@ -578,6 +606,11 @@ fn validate_manager_command(args: &[String]) -> std::result::Result<(), String> 
         return Err(format!(
             "Wipsaw manager command '{group} {action}' is not allowed"
         ));
+    }
+    if (group, action) == ("workspace", "delete") && !args.iter().any(|arg| arg == "--yes") {
+        return Err(
+            "workspace delete requires --yes after confirming the exact target".to_string(),
+        );
     }
     Ok(())
 }
@@ -633,6 +666,27 @@ pub fn command_spec(request: &ManagerTurnRequest) -> ManagerCommandSpec {
     push_config(&mut args, "mcp_servers.wipsaw.enabled=true");
     push_config(&mut args, "mcp_servers.wipsaw.required=true");
     push_config(&mut args, "mcp_servers.wipsaw.startup_timeout_sec=10");
+    let mcp_environment = request
+        .environment
+        .iter()
+        .filter(|(name, _)| name.to_string_lossy().starts_with("WIPSAW_"))
+        .map(|(name, value)| {
+            format!(
+                "{} = {}",
+                serde_json::to_string(&name.to_string_lossy())
+                    .expect("environment name serializes"),
+                serde_json::to_string(&value.to_string_lossy())
+                    .expect("environment value serializes")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !mcp_environment.is_empty() {
+        push_config(
+            &mut args,
+            &format!("mcp_servers.wipsaw.env={{ {mcp_environment} }}"),
+        );
+    }
     push_config(&mut args, "shell_environment_policy.inherit=\"core\"");
     push_config(
         &mut args,
@@ -757,47 +811,13 @@ fn run_turn(
             }
             Some("item.started") | Some("item.updated") | Some("item.completed") => {
                 if let Some(item) = event.get("item") {
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("agent_message") if event["type"] == "item.completed" => {
-                            final_message =
-                                item.get("text").and_then(Value::as_str).map(str::to_string);
-                        }
-                        Some("command_execution") => {
-                            let command = item
-                                .get("command")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Wipsaw command");
-                            let summary = truncate_activity(command, 72);
-                            let _ = sender.send(ManagerEvent::Activity(format!(
-                                "{} {summary}",
-                                if event["type"] == "item.completed" {
-                                    "finished"
-                                } else {
-                                    "running"
-                                }
-                            )));
-                        }
-                        Some("file_change") => {
-                            let _ = sender.send(ManagerEvent::Activity(
-                                "applying a managed change".to_string(),
-                            ));
-                        }
-                        Some("mcp_tool_call") => {
-                            let tool = item
-                                .get("tool")
-                                .or_else(|| item.get("name"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("Wipsaw tool");
-                            let _ = sender.send(ManagerEvent::Activity(format!(
-                                "{} {tool}",
-                                if event["type"] == "item.completed" {
-                                    "finished"
-                                } else {
-                                    "running"
-                                }
-                            )));
-                        }
-                        _ => {}
+                    if item.get("type").and_then(Value::as_str) == Some("agent_message")
+                        && event["type"] == "item.completed"
+                    {
+                        final_message =
+                            item.get("text").and_then(Value::as_str).map(str::to_string);
+                    } else if let Some(progress) = manager_progress(&event, item) {
+                        let _ = sender.send(ManagerEvent::Progress(progress));
                     }
                 }
             }
@@ -854,6 +874,104 @@ fn run_turn(
     })
 }
 
+fn manager_progress(event: &Value, item: &Value) -> Option<ManagerProgress> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or(item_type);
+    let declared_status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    let status = if matches!(declared_status, "failed" | "declined" | "error")
+        || item.get("error").is_some_and(|error| !error.is_null())
+    {
+        ManagerProgressStatus::Failed
+    } else if event_type == "item.completed" {
+        ManagerProgressStatus::Completed
+    } else {
+        ManagerProgressStatus::Running
+    };
+    let (label, detail) = match item_type {
+        "reasoning" => (
+            "Reasoning".to_string(),
+            progress_item_text(item, &["text", "summary", "content"]),
+        ),
+        "mcp_tool_call" => {
+            let server = item
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("wipsaw");
+            let tool = item
+                .get("tool")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            (
+                format!("MCP · {server}/{tool}"),
+                progress_item_text(item, &["error"]),
+            )
+        }
+        "command_execution" => (
+            "Command".to_string(),
+            progress_item_text(item, &["command", "aggregated_output"]),
+        ),
+        "file_change" => (
+            "Managed file change".to_string(),
+            progress_item_text(item, &["changes"]),
+        ),
+        "web_search" => (
+            "Web search".to_string(),
+            progress_item_text(item, &["query"]),
+        ),
+        "context_compaction" => ("Context compacted".to_string(), None),
+        _ => return None,
+    };
+    Some(ManagerProgress {
+        id: item_id.to_string(),
+        label,
+        detail,
+        status,
+    })
+}
+
+fn progress_item_text(item: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| item.get(*key).and_then(flatten_progress_text))
+        .map(|text| truncate_progress_detail(&text, 1_200))
+        .filter(|text| !text.is_empty())
+}
+
+fn flatten_progress_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.trim().to_string()),
+        Value::Array(values) => {
+            let text = values
+                .iter()
+                .filter_map(flatten_progress_text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(value) => value
+            .get("message")
+            .or_else(|| value.get("text"))
+            .or_else(|| value.get("path"))
+            .and_then(flatten_progress_text),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
+}
+
+fn truncate_progress_detail(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    format!(
+        "{}…",
+        value
+            .chars()
+            .take(limit.saturating_sub(1))
+            .collect::<String>()
+    )
+}
+
 fn manager_instructions(session: &ManagerSession) -> String {
     let identity = match session.kind {
         ManagerKind::Lumbergh => {
@@ -867,7 +985,7 @@ fn manager_instructions(session: &ManagerSession) -> String {
         ),
     };
     format!(
-        "# Wipsaw manager context\n\n{identity}\n\nBefore acting, use the `wipsaw-manager` skill and call the private `wipsaw` MCP server's `manager_guide`. Operate only through its Wipsaw tools; no shell, personal MCP, plugin, app, or unrelated skill is available. Never invent state when a tool fails. Do not attach tmux or launch an interactive TUI. Be concise, confirm resulting IDs, and tell the user when a requested Wipsaw capability is not implemented yet.\n"
+        "# Wipsaw manager context\n\n{identity}\n\nBefore acting, use the `wipsaw-manager` skill and call the private `wipsaw` MCP server's `manager_guide`. The `skill-creator` and `skill-installer` skills are also available for skill creation and lookup. Operate only through the private Wipsaw tools; no shell, personal MCP, plugin, app, or unrelated skill is available. Never invent state when a tool fails. Do not attach tmux or launch an interactive TUI. Be concise, confirm resulting IDs, and tell the user when a requested Wipsaw capability is not implemented yet.\n"
     )
 }
 
@@ -905,6 +1023,32 @@ fn link_auth(source: &Path, destination: &Path) -> Result<()> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => symlink(source, destination)?,
         Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn copy_private_tree(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_dir() {
+        return Err(WipsawError::InvalidInput {
+            field: "manager default skill",
+            message: format!(
+                "'{}' is missing; update the selected Codex installation",
+                source.display()
+            ),
+        });
+    }
+    fs::create_dir_all(destination)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_private_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target)?;
+            fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
+        }
     }
     Ok(())
 }
@@ -960,20 +1104,6 @@ fn push_config(args: &mut Vec<OsString>, value: &str) {
     args.push(OsString::from(value));
 }
 
-fn truncate_activity(value: &str, limit: usize) -> String {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if value.chars().count() <= limit {
-        return value;
-    }
-    format!(
-        "{}…",
-        value
-            .chars()
-            .take(limit.saturating_sub(1))
-            .collect::<String>()
-    )
-}
-
 fn tail(value: &str, max_chars: usize) -> String {
     let chars = value.chars().collect::<Vec<_>>();
     chars[chars.len().saturating_sub(max_chars)..]
@@ -992,8 +1122,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MANAGER_MODEL, MANAGER_REASONING_EFFORT, ManagerTurnRequest, command_spec,
-        expand_prompt_references, manager_mcp_response, prepare_runtime, validate_manager_command,
+        MANAGER_MODEL, MANAGER_REASONING_EFFORT, MANAGER_SKILL_NAMES, ManagerProgressStatus,
+        ManagerTurnRequest, command_spec, expand_prompt_references, manager_mcp_response,
+        manager_progress, prepare_runtime, validate_manager_command,
     };
     use crate::codex::codex_launch_path;
     use crate::model::{CodexHome, ManagerKind, ManagerSession};
@@ -1018,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_links_auth_and_installs_only_the_manager_skill() {
+    fn runtime_links_auth_and_installs_only_the_three_manager_skills() {
         let root = tempdir().unwrap();
         let paths = AppPaths::for_test(root.path());
         paths.ensure().unwrap();
@@ -1026,6 +1157,16 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("auth.json"), "{}").unwrap();
         fs::set_permissions(source.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        for skill in ["skill-creator", "skill-installer"] {
+            let skill_dir = source.join("skills/.system").join(skill);
+            fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {skill}\ndescription: test\n---\n"),
+            )
+            .unwrap();
+            fs::write(skill_dir.join("scripts/helper.py"), "# helper").unwrap();
+        }
         let home = CodexHome {
             id: "home_01900000000070008000000000000000".to_string(),
             name: "current".to_string(),
@@ -1049,11 +1190,20 @@ mod tests {
             fs::read_link(runtime.codex_home.join("auth.json")).unwrap(),
             source.join("auth.json")
         );
-        let skills = fs::read_dir(runtime.codex_home.join("skills"))
+        let mut skills = fs::read_dir(runtime.codex_home.join("skills"))
             .unwrap()
-            .map(|entry| entry.unwrap().file_name())
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(skills, ["wipsaw-manager"]);
+        skills.sort();
+        let mut expected = MANAGER_SKILL_NAMES.map(str::to_string);
+        expected.sort();
+        assert_eq!(skills, expected);
+        assert!(
+            runtime
+                .codex_home
+                .join("skills/skill-creator/scripts/helper.py")
+                .is_file()
+        );
         assert!(!runtime.codex_home.join("plugins").exists());
         assert_eq!(
             runtime.disabled_user_skills,
@@ -1142,6 +1292,11 @@ mod tests {
                 .any(|argument| argument == "mcp_servers.wipsaw.args=[\"manager-mcp\"]")
         );
         assert!(args.iter().any(|argument| {
+            argument.starts_with("mcp_servers.wipsaw.env={")
+                && argument.contains("WIPSAW_MANAGER_EXECUTABLE")
+                && argument.contains("/opt/wipsaw")
+        }));
+        assert!(args.iter().any(|argument| {
             argument.starts_with("skills.config=[")
                 && argument.contains("/home/real-user/.agents/skills/git")
                 && argument.contains("enabled = false")
@@ -1173,6 +1328,50 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            validate_manager_command(
+                &["--json", "workspace", "delete", "workspace_1"].map(str::to_string)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_manager_command(
+                &["--json", "workspace", "delete", "workspace_1", "--yes"].map(str::to_string)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_items_become_upsertable_manager_progress() {
+        let started = serde_json::json!({
+            "type": "item.started",
+            "item": {
+                "id": "call_1",
+                "type": "mcp_tool_call",
+                "server": "wipsaw",
+                "tool": "run_wipsaw",
+                "status": "in_progress"
+            }
+        });
+        let progress = manager_progress(&started, &started["item"]).unwrap();
+        assert_eq!(progress.id, "call_1");
+        assert_eq!(progress.label, "MCP · wipsaw/run_wipsaw");
+        assert_eq!(progress.status, ManagerProgressStatus::Running);
+
+        let completed = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "call_1",
+                "type": "mcp_tool_call",
+                "server": "wipsaw",
+                "tool": "run_wipsaw",
+                "status": "completed"
+            }
+        });
+        let progress = manager_progress(&completed, &completed["item"]).unwrap();
+        assert_eq!(progress.id, "call_1");
+        assert_eq!(progress.status, ManagerProgressStatus::Completed);
     }
 
     #[test]
@@ -1191,6 +1390,13 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["manager_guide", "run_wipsaw"]);
+        let run_wipsaw = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "run_wipsaw")
+            .unwrap();
+        assert_eq!(run_wipsaw["annotations"]["destructiveHint"], false);
     }
 
     #[test]

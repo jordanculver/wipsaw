@@ -27,7 +27,10 @@ use ratatui::{Frame, Terminal};
 use crate::app::{TabLaunchSettings, WipsawApp};
 use crate::doctor::DoctorReport;
 use crate::error::{Result, WipsawError};
-use crate::manager::{MANAGER_MODEL, MANAGER_SKILL_NAME, ManagerEvent, sensitive_reference};
+use crate::manager::{
+    MANAGER_MODEL, MANAGER_SKILL_NAMES, ManagerEvent, ManagerProgress, ManagerProgressStatus,
+    sensitive_reference,
+};
 use crate::model::{
     Account, CodexHome, CodexThread, ManagerMessage, ManagerSession, ModelProfile, Tab, Workspace,
 };
@@ -72,10 +75,16 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
         navigator.poll_manager(app);
         session.terminal.draw(|frame| navigator.render(frame))?;
 
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
-        }
-        let input = event::read()?;
+        let input = if navigator.manager.turn.is_some() && !navigator.manager.copy_view {
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            event::read()?
+        } else {
+            // Avoid repainting an idle dashboard. Besides saving work, this keeps
+            // native terminal selections stable while the user copies text.
+            event::read()?
+        };
         let old_workspace = navigator.selected_workspace().map(|item| item.id.clone());
         let action = match input {
             Event::Key(key) if key.kind == KeyEventKind::Press => navigator.handle_key(key),
@@ -432,6 +441,8 @@ struct ManagerChat {
     references: Vec<ManagerReference>,
     reference_index: usize,
     reference_dismissed: bool,
+    progress: Vec<ManagerProgress>,
+    copy_view: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +455,7 @@ enum ManagerReferenceKind {
 struct ManagerReference {
     kind: ManagerReferenceKind,
     label: String,
+    hint: Option<String>,
 }
 
 struct ActiveManagerTurn {
@@ -585,6 +597,8 @@ impl Navigator {
         self.manager.reference_dismissed = false;
         self.manager.scroll = u16::MAX;
         self.manager.activity = None;
+        self.manager.progress.clear();
+        self.manager.copy_view = false;
         Ok(())
     }
 
@@ -645,7 +659,14 @@ impl Navigator {
             session_id,
             receiver: handle.receiver,
         });
-        self.manager.activity = Some("thinking with Terra · medium".to_string());
+        self.manager.activity = Some("working".to_string());
+        self.manager.progress.clear();
+        self.upsert_manager_progress(ManagerProgress {
+            id: "turn".to_string(),
+            label: "Thinking with Terra · medium".to_string(),
+            detail: None,
+            status: ManagerProgressStatus::Running,
+        });
         self.manager.scroll = u16::MAX;
         if let Some(session) = &self.manager.session {
             match app.registry.list_manager_messages(&session.id, 200) {
@@ -682,10 +703,16 @@ impl Navigator {
         for event in events {
             match event {
                 ManagerEvent::Started => {
-                    self.manager.activity = Some("thinking with Terra · medium".to_string());
+                    self.manager.activity = Some("working".to_string());
+                    self.upsert_manager_progress(ManagerProgress {
+                        id: "turn".to_string(),
+                        label: "Thinking with Terra · medium".to_string(),
+                        detail: None,
+                        status: ManagerProgressStatus::Running,
+                    });
                 }
-                ManagerEvent::Activity(activity) => {
-                    self.manager.activity = Some(activity);
+                ManagerEvent::Progress(progress) => {
+                    self.upsert_manager_progress(progress);
                 }
                 ManagerEvent::Finished(result) => {
                     let session_id = self
@@ -698,24 +725,55 @@ impl Navigator {
                     match result {
                         Ok(result) => {
                             if let Err(error) = app.complete_manager_turn(&result) {
+                                self.manager.progress.retain(|item| item.id != "turn");
+                                self.upsert_manager_progress(ManagerProgress {
+                                    id: "turn".to_string(),
+                                    label: "Turn failed".to_string(),
+                                    detail: Some(error.to_string()),
+                                    status: ManagerProgressStatus::Failed,
+                                });
+                                self.manager.activity = Some("turn failed".to_string());
                                 self.error(error);
                             } else {
-                                self.manager.activity = result.usage.as_ref().map(|usage| {
+                                let usage = result.usage.as_ref().map(|usage| {
                                     format!(
-                                        "complete · {} in / {} cached / {} out",
+                                        "{} input · {} cached · {} output tokens",
                                         usage.input_tokens,
                                         usage.cached_input_tokens,
                                         usage.output_tokens
                                     )
                                 });
+                                self.manager.progress.retain(|item| item.id != "turn");
+                                self.upsert_manager_progress(ManagerProgress {
+                                    id: "turn".to_string(),
+                                    label: "Turn complete".to_string(),
+                                    detail: usage,
+                                    status: ManagerProgressStatus::Completed,
+                                });
+                                self.manager.activity = Some("complete".to_string());
                                 self.notice("manager turn complete");
                             }
                         }
                         Err(error) => {
                             if let Err(registry_error) = app.fail_manager_turn(&session_id, &error)
                             {
+                                self.manager.progress.retain(|item| item.id != "turn");
+                                self.upsert_manager_progress(ManagerProgress {
+                                    id: "turn".to_string(),
+                                    label: "Turn failed".to_string(),
+                                    detail: Some(error.clone()),
+                                    status: ManagerProgressStatus::Failed,
+                                });
+                                self.manager.activity = Some("turn failed".to_string());
                                 self.error(registry_error);
                             } else {
+                                self.manager.progress.retain(|item| item.id != "turn");
+                                self.upsert_manager_progress(ManagerProgress {
+                                    id: "turn".to_string(),
+                                    label: "Turn failed".to_string(),
+                                    detail: Some(error.clone()),
+                                    status: ManagerProgressStatus::Failed,
+                                });
                                 self.manager.activity = Some("turn failed".to_string());
                                 self.error(error);
                             }
@@ -738,6 +796,29 @@ impl Navigator {
                 }
             }
         }
+    }
+
+    fn upsert_manager_progress(&mut self, progress: ManagerProgress) {
+        if let Some(existing) = self
+            .manager
+            .progress
+            .iter_mut()
+            .find(|existing| existing.id == progress.id)
+        {
+            *existing = progress;
+        } else {
+            self.manager.progress.push(progress);
+            if self.manager.progress.len() > 64 {
+                let removable = self
+                    .manager
+                    .progress
+                    .iter()
+                    .position(|progress| progress.id != "turn")
+                    .unwrap_or(0);
+                self.manager.progress.remove(removable);
+            }
+        }
+        self.manager.scroll = u16::MAX;
     }
 
     fn refresh(&mut self, app: &WipsawApp) -> Result<()> {
@@ -838,6 +919,9 @@ impl Navigator {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if self.manager.copy_view {
+            return self.handle_manager_copy_view_key(key);
+        }
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
         }
@@ -859,6 +943,10 @@ impl Navigator {
                 KeyCode::Enter => Action::FocusManager,
                 KeyCode::Char('y') => self.copy_latest_manager_message(),
                 KeyCode::Char('Y') => self.copy_manager_transcript(),
+                KeyCode::Char('v') => {
+                    self.open_manager_copy_view();
+                    Action::None
+                }
                 KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
                     self.manager.scroll = self.manager.scroll.saturating_sub(3);
                     Action::None
@@ -950,6 +1038,10 @@ impl Navigator {
             KeyCode::Char('m') => Action::OpenLumbergh,
             KeyCode::Char('y') => self.copy_latest_manager_message(),
             KeyCode::Char('Y') => self.copy_manager_transcript(),
+            KeyCode::Char('v') if self.view == View::Home => {
+                self.open_manager_copy_view();
+                Action::None
+            }
             KeyCode::Char(',') => {
                 self.begin_rename();
                 Action::None
@@ -1002,6 +1094,10 @@ impl Navigator {
             }
         }
         match key.code {
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_manager_copy_view();
+                Action::None
+            }
             KeyCode::Esc => {
                 self.manager.focused = false;
                 Action::None
@@ -1070,6 +1166,41 @@ impl Navigator {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.insert_manager_text(&character.to_string());
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn open_manager_copy_view(&mut self) {
+        self.manager.copy_view = true;
+        self.manager.focused = false;
+        self.manager.scroll = u16::MAX;
+        self.message = None;
+    }
+
+    fn handle_manager_copy_view_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => {
+                self.manager.copy_view = false;
+                Action::None
+            }
+            KeyCode::Char('y') => self.copy_latest_manager_message(),
+            KeyCode::Char('Y') => self.copy_manager_transcript(),
+            KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
+                self.manager.scroll = self.manager.scroll.saturating_sub(3);
+                Action::None
+            }
+            KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
+                self.manager.scroll = self.manager.scroll.saturating_add(3);
+                Action::None
+            }
+            KeyCode::Home => {
+                self.manager.scroll = 0;
+                Action::None
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.manager.scroll = u16::MAX;
                 Action::None
             }
             _ => Action::None,
@@ -1158,24 +1289,11 @@ impl Navigator {
     }
 
     fn copy_manager_transcript(&self) -> Action {
-        if self.manager.messages.is_empty() {
+        if self.manager.messages.is_empty() && self.manager.progress.is_empty() {
             return Action::None;
         }
         let label = self.manager_label();
-        let text = self
-            .manager
-            .messages
-            .iter()
-            .map(|message| {
-                let speaker = match message.role.as_str() {
-                    "user" => "YOU",
-                    "assistant" => label,
-                    _ => "WIPSAW",
-                };
-                format!("{speaker}\n{}", message.content)
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = manager_transcript_text(&self.manager.messages, &self.manager.progress, label);
         Action::CopyManager {
             text,
             description: "the manager transcript",
@@ -1383,6 +1501,10 @@ impl Navigator {
     fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         frame.render_widget(Block::default().style(Style::default().bg(DEEP)), area);
+        if self.manager.copy_view {
+            self.render_manager_copy_view(frame, area);
+            return;
+        }
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(8), Constraint::Length(2)])
@@ -1725,6 +1847,7 @@ impl Navigator {
         let inner = block.inner(area);
         let lines = manager_transcript_lines(
             &self.manager.messages,
+            &self.manager.progress,
             label,
             inner.width.saturating_sub(1).max(12) as usize,
         );
@@ -1744,19 +1867,7 @@ impl Navigator {
     }
 
     fn render_manager_composer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let label = self.manager_label();
         let working = self.manager.turn.is_some();
-        let prompt = if working {
-            self.manager
-                .activity
-                .as_deref()
-                .unwrap_or("working…")
-                .to_string()
-        } else if self.manager.composer.is_empty() {
-            format!("Ask {label} anything…  @ files  ·  $ skills")
-        } else {
-            self.manager.composer.clone()
-        };
         let block = Block::default()
             .title(if area.width >= 76 {
                 " COMPOSER · Enter send · Shift+Enter/Ctrl+J newline · @ files · $ skills "
@@ -1768,10 +1879,9 @@ impl Navigator {
             .style(Style::default().bg(DEEP));
         let inner = block.inner(area);
         let mut lines = manager_editor_lines(
-            &prompt,
+            &self.manager.composer,
             inner.width.max(4) as usize,
             self.manager.focused && !working,
-            self.manager.composer.is_empty() || working,
         );
         let visible = inner.height as usize;
         if lines.len() > visible {
@@ -1811,16 +1921,21 @@ impl Navigator {
                 } else {
                     '$'
                 };
-                ListItem::new(Line::from(format!(" {sigil}{}", reference.label))).style(
-                    if index == selected {
-                        Style::default()
-                            .bg(PANEL)
-                            .fg(CYAN)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(INK)
-                    },
-                )
+                let mut spans = vec![Span::raw(format!(" {sigil}{}", reference.label))];
+                if let Some(hint) = &reference.hint {
+                    spans.push(Span::styled(
+                        format!("  ·  {hint}"),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+                ListItem::new(Line::from(spans)).style(if index == selected {
+                    Style::default()
+                        .bg(PANEL)
+                        .fg(CYAN)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(INK)
+                })
             })
             .collect::<Vec<_>>();
         frame.render_widget(
@@ -1890,9 +2005,67 @@ impl Navigator {
                     },
                     Style::default().fg(MUTED),
                 ),
-                Span::styled("  ·  y latest / Y transcript", Style::default().fg(MUTED)),
+                Span::styled(
+                    "  ·  v select / y latest / Y transcript",
+                    Style::default().fg(MUTED),
+                ),
             ])),
             rows[3],
+        );
+    }
+
+    fn render_manager_copy_view(&self, frame: &mut Frame<'_>, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(2),
+            ])
+            .split(inset(area, 2, 1));
+        let label = self.manager_label();
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    format!("{label} OUTPUT"),
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    "Drag to select only this transcript, then use your terminal's copy shortcut.",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            rows[0],
+        );
+        let lines = manager_transcript_lines(
+            &self.manager.messages,
+            &self.manager.progress,
+            label,
+            rows[1].width.saturating_sub(1).max(12) as usize,
+        );
+        let max_scroll = lines.len().saturating_sub(rows[1].height as usize) as u16;
+        let scroll = if self.manager.scroll == u16::MAX {
+            max_scroll
+        } else {
+            self.manager.scroll.min(max_scroll)
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((scroll, 0))
+                .wrap(Wrap { trim: false }),
+            rows[1],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Esc/v return · ↑↓ scroll · y copy latest · Y copy transcript",
+                Style::default().fg(MUTED),
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(BORDER)),
+            ),
+            rows[2],
         );
     }
 
@@ -2484,9 +2657,9 @@ impl Navigator {
             (text, false)
         });
         let keys = if self.manager.focused {
-            "Enter send   Shift+Enter/Ctrl+J newline   @ files   $ skills   Ctrl+Y copy latest"
+            "Enter send   Ctrl+J newline   @ files   $ skills   Ctrl+O select output   Ctrl+Y copy"
         } else if self.manager.overlay || self.view == View::Home {
-            "Enter compose   y copy latest   Y copy transcript   ↑↓ scroll   ? guide"
+            "Enter compose   v select output   y latest   Y transcript   ↑↓ scroll   ? guide"
         } else if self.prefix_pending {
             "PREFIX C-b · w home  s sessions  t threads  g WIPs  m Lumbergh  n/p views"
         } else if area.width < 92 {
@@ -2519,7 +2692,7 @@ impl Navigator {
     }
 
     fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered_rect(area, 88, 27);
+        let popup = centered_rect(area, 88, 31);
         frame.render_widget(Clear, popup);
         let help = Text::from(vec![
             Line::styled(
@@ -2543,13 +2716,15 @@ impl Navigator {
             Line::from("  c              new workspace (or create in focused Sessions list)"),
             Line::from("  n / t          new Codex session / shell tab"),
             Line::from("  m              talk to Lumbergh from anywhere"),
+            Line::from("  v              manager-only selection view for native terminal copy"),
             Line::from("  y / Y          copy latest manager response / full transcript"),
             Line::from("  ,              rename a focused tab · r refreshes live state"),
             Line::raw(""),
             Line::styled("MANAGER COMPOSER", Style::default().fg(AMBER)),
             Line::from("  Enter          send · Shift+Enter or Ctrl+J inserts a newline"),
             Line::from("  @ / $          find a scoped file / available manager skill"),
-            Line::from("  paste          preserves multiple lines · Ctrl+Y copies latest response"),
+            Line::from("  Ctrl+O         open selection view · Ctrl+Y copies latest response"),
+            Line::from("  paste          preserves multiple lines"),
             Line::raw(""),
             Line::styled("TMUX-FAMILIAR PREFIX", Style::default().fg(AMBER)),
             Line::from("  C-b w          toggle this navigator"),
@@ -2713,10 +2888,22 @@ fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
         "venv",
     ];
 
-    let mut references = vec![ManagerReference {
-        kind: ManagerReferenceKind::Skill,
-        label: MANAGER_SKILL_NAME.to_string(),
-    }];
+    let mut references = MANAGER_SKILL_NAMES
+        .into_iter()
+        .map(|name| ManagerReference {
+            kind: ManagerReferenceKind::Skill,
+            label: name.to_string(),
+            hint: Some(
+                match name {
+                    "wipsaw-manager" => "manage Wipsaw",
+                    "skill-creator" => "create or revise a skill",
+                    "skill-installer" => "look up or install skills",
+                    _ => "manager skill",
+                }
+                .to_string(),
+            ),
+        })
+        .collect::<Vec<_>>();
     let mut files = Vec::new();
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_usize)]);
     while let Some((directory, depth)) = queue.pop_front() {
@@ -2759,6 +2946,7 @@ fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
     references.extend(files.into_iter().map(|label| ManagerReference {
         kind: ManagerReferenceKind::File,
         label,
+        hint: None,
     }));
     references
 }
@@ -2814,10 +3002,11 @@ fn base64_encode(value: &[u8]) -> String {
 
 fn manager_transcript_lines(
     messages: &[ManagerMessage],
+    progress: &[ManagerProgress],
     manager_label: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    if messages.is_empty() {
+    if messages.is_empty() && progress.is_empty() {
         return vec![
             Line::styled(
                 format!("{manager_label} IS READY"),
@@ -2834,13 +3023,14 @@ fn manager_transcript_lines(
             ),
             Line::raw(""),
             Line::styled(
-                "Only Wipsaw's manager skill and private MCP tools are loaded; shell, personal MCPs, plugins, apps, and other skills stay outside this session.",
+                "Loaded skills: $wipsaw-manager, $skill-creator, and $skill-installer (skill lookup/install). Private Wipsaw MCP tools are enabled; shell, personal MCPs, plugins, apps, and unrelated skills stay outside this session.",
                 Style::default().fg(MUTED),
             ),
         ];
     }
     let mut lines = Vec::new();
-    for message in messages {
+    let progress_after = messages.iter().rposition(|message| message.role == "user");
+    for (index, message) in messages.iter().enumerate() {
         let (label, color) = match message.role.as_str() {
             "user" => ("YOU", AMBER),
             "assistant" => (manager_label, CYAN),
@@ -2854,16 +3044,97 @@ fn manager_transcript_lines(
             lines.push(Line::styled(format!("  {line}"), Style::default().fg(INK)));
         }
         lines.push(Line::raw(""));
+        if progress_after == Some(index) {
+            append_manager_progress_lines(&mut lines, progress, width);
+        }
+    }
+    if progress_after.is_none() {
+        append_manager_progress_lines(&mut lines, progress, width);
     }
     lines
 }
 
-fn manager_editor_lines(
-    value: &str,
+fn append_manager_progress_lines(
+    lines: &mut Vec<Line<'static>>,
+    progress: &[ManagerProgress],
     width: usize,
-    show_cursor: bool,
-    muted: bool,
-) -> Vec<Line<'static>> {
+) {
+    if progress.is_empty() {
+        return;
+    }
+    lines.push(Line::styled(
+        "CODEX",
+        Style::default().fg(STEEL).add_modifier(Modifier::BOLD),
+    ));
+    for item in progress {
+        let (symbol, color) = match item.status {
+            ManagerProgressStatus::Running => ("•", AMBER),
+            ManagerProgressStatus::Completed => ("✓", GREEN),
+            ManagerProgressStatus::Failed => ("×", RED),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {symbol} "), Style::default().fg(color)),
+            Span::styled(item.label.clone(), Style::default().fg(INK)),
+        ]));
+        if let Some(detail) = &item.detail {
+            for detail_line in wrap_text(detail, width.saturating_sub(6).max(8)) {
+                lines.push(Line::styled(
+                    format!("      {detail_line}"),
+                    Style::default().fg(MUTED),
+                ));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+}
+
+fn manager_transcript_text(
+    messages: &[ManagerMessage],
+    progress: &[ManagerProgress],
+    manager_label: &str,
+) -> String {
+    let progress_after = messages.iter().rposition(|message| message.role == "user");
+    let progress_text = || {
+        let items = progress
+            .iter()
+            .map(|item| {
+                let symbol = match item.status {
+                    ManagerProgressStatus::Running => "•",
+                    ManagerProgressStatus::Completed => "✓",
+                    ManagerProgressStatus::Failed => "×",
+                };
+                item.detail.as_ref().map_or_else(
+                    || format!("{symbol} {}", item.label),
+                    |detail| format!("{symbol} {}\n  {detail}", item.label),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!items.is_empty()).then(|| format!("CODEX\n{items}"))
+    };
+    let mut blocks = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let speaker = match message.role.as_str() {
+            "user" => "YOU",
+            "assistant" => manager_label,
+            _ => "WIPSAW",
+        };
+        blocks.push(format!("{speaker}\n{}", message.content));
+        if progress_after == Some(index)
+            && let Some(progress) = progress_text()
+        {
+            blocks.push(progress);
+        }
+    }
+    if progress_after.is_none()
+        && let Some(progress) = progress_text()
+    {
+        blocks.push(progress);
+    }
+    blocks.join("\n\n")
+}
+
+fn manager_editor_lines(value: &str, width: usize, show_cursor: bool) -> Vec<Line<'static>> {
     let segments = wrap_editor_text(value, width.saturating_sub(2).max(1));
     let last = segments.len().saturating_sub(1);
     segments
@@ -2871,13 +3142,10 @@ fn manager_editor_lines(
         .enumerate()
         .map(|(index, segment)| {
             let mut spans = vec![Span::styled(
-                if index == 0 { "› " } else { "│ " },
+                if index == 0 { "λ " } else { "  " },
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             )];
-            spans.push(Span::styled(
-                segment,
-                Style::default().fg(if muted { MUTED } else { INK }),
-            ));
+            spans.push(Span::styled(segment, Style::default().fg(INK)));
             if show_cursor && index == last {
                 spans.push(Span::styled("█", Style::default().fg(CYAN)));
             }
@@ -3104,6 +3372,8 @@ mod tests {
         Action, Navigator, active_manager_reference, base64_encode, manager_reference_catalog,
         wrap_editor_text, wrap_text,
     };
+    use crate::manager::{ManagerProgress, ManagerProgressStatus};
+    use crate::model::ManagerMessage;
 
     #[test]
     fn transcript_wraps_unbroken_ids_without_overflowing() {
@@ -3127,19 +3397,30 @@ mod tests {
     }
 
     #[test]
-    fn at_and_dollar_references_offer_files_and_the_manager_skill() {
+    fn at_and_dollar_references_offer_files_and_all_manager_skills() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("README.md"), "read me").unwrap();
         fs::write(root.path().join("notes with spaces.md"), "notes").unwrap();
         let mut navigator = Navigator::empty();
         navigator.manager.focused = true;
         navigator.manager.references = manager_reference_catalog(root.path());
+        let skill_names = navigator
+            .manager
+            .references
+            .iter()
+            .filter(|reference| reference.kind == super::ManagerReferenceKind::Skill)
+            .map(|reference| reference.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            skill_names,
+            ["wipsaw-manager", "skill-creator", "skill-installer"]
+        );
         navigator.manager.composer = "Review @READ".to_string();
         navigator.insert_manager_reference();
         assert_eq!(navigator.manager.composer, "Review @README.md ");
-        navigator.manager.composer.push('$');
+        navigator.manager.composer.push_str("$skill-c");
         navigator.insert_manager_reference();
-        assert!(navigator.manager.composer.ends_with("$wipsaw-manager "));
+        assert!(navigator.manager.composer.ends_with("$skill-creator "));
         assert!(active_manager_reference("Use @notes").is_some());
     }
 
@@ -3168,6 +3449,8 @@ mod tests {
         assert!(content.contains("Ready to cut?"));
         assert!(content.contains("LUMBERGH"));
         assert!(content.contains("CODEX MANAGER"));
+        assert!(content.contains('λ'));
+        assert!(!content.contains("Ask LUMBERGH anything"));
         assert!(content.contains("New workspace"));
         assert!(content.contains("NO WORKSPACE YET"));
         assert!(content.contains("OVERVIEW"));
@@ -3200,6 +3483,52 @@ mod tests {
 
         assert!(matches!(navigator.enter_action(), Action::FocusManager));
         assert!(navigator.prompt.is_none());
+    }
+
+    #[test]
+    fn manager_copy_view_contains_progress_without_dashboard_chrome() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut navigator = Navigator::empty();
+        navigator.manager.messages = vec![
+            ManagerMessage {
+                id: 1,
+                manager_session_id: "manager_test".to_string(),
+                role: "user".to_string(),
+                content: "List the workspaces".to_string(),
+                created_at: String::new(),
+            },
+            ManagerMessage {
+                id: 2,
+                manager_session_id: "manager_test".to_string(),
+                role: "assistant".to_string(),
+                content: "There are two workspaces.".to_string(),
+                created_at: String::new(),
+            },
+        ];
+        navigator.manager.progress = vec![ManagerProgress {
+            id: "tool_1".to_string(),
+            label: "MCP · wipsaw/run_wipsaw".to_string(),
+            detail: None,
+            status: ManagerProgressStatus::Completed,
+        }];
+        navigator.manager.copy_view = true;
+
+        terminal
+            .draw(|frame| navigator.render(frame))
+            .expect("render copy view");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("LUMBERGH OUTPUT"));
+        assert!(content.contains("MCP · wipsaw/run_wipsaw"));
+        assert!(content.contains("There are two workspaces."));
+        assert!(!content.contains("Ready to cut?"));
+        assert!(!content.contains("OVERVIEW"));
     }
 
     #[test]

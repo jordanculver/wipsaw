@@ -188,7 +188,7 @@ authentication, Ratatui, and the private Wipsaw MCP stdio server:
 - fixed both manager types to `gpt-5.6-terra` with medium reasoning;
 - generated private manager Codex homes that reference, rather than copy, the
   selected home's `auth.json`, ignore user config/rules, and install only the
-  `wipsaw-manager` skill;
+  `wipsaw-manager` skill (later expanded by the verified follow-up below);
 - disabled personal MCPs, plugins, apps, unrelated skills, image, multi-agent,
   and shell tools; and
 - exposed exactly `manager_guide` and `run_wipsaw` through a required private
@@ -214,6 +214,29 @@ runtime paired with the registered Codex binary. The embedded composer also
 gained multiline bracketed paste, scoped `@` file and `$` skill completion,
 bounded file attachment, and manager-only clipboard actions using tmux plus
 OSC 52.
+
+Manager UX/capability follow-up, 2026-08-09: manager homes now copy the complete
+`skill-creator` and `skill-installer` packages beside `wipsaw-manager`, and the
+`$` picker advertises all three while unrelated skills remain disabled. The
+composer uses a blank `λ` prompt. JSONL reasoning, MCP calls, completion,
+failure, and token usage are upserted in the response box. Idle screens no
+longer repaint continuously, and a transcript-only selection view freezes
+manager redraws for native terminal copying. The validated manager command
+surface now includes `workspace delete <exact-id> --yes`; application guards
+stop the live tmux session, reject self-deletion or a working Middle Manager,
+and cascade only the target workspace's tabs and manager history. Unit tests
+cover all three skill packages, progress transitions, copy-view isolation,
+delete confirmation, and database cascades.
+
+The live harness also caught two transport-specific regressions before release.
+Marking the mixed `run_wipsaw` gateway itself destructive caused
+non-interactive Codex to cancel even `workspace list`; destructive intent now
+stays on the validated `--yes` subcommand and application guards. Codex's stdio
+MCP launcher also sanitizes inherited variables, so Wipsaw supplies its
+config/state/data/runtime paths, tmux target, executable, and Middle Manager
+scope explicitly in the MCP server configuration. A second live run listed the
+isolated registry correctly, then had Lumbergh delete a disposable workspace,
+stop its exact tmux session, and report the managed ID in the response box.
 
 ## Priority spikes
 
