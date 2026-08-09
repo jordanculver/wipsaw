@@ -262,10 +262,13 @@ nonexistent implementation.
   is presented as the built-in skill lookup/installer. Managers do not inherit
   personal MCPs, plugins, apps, unrelated skills, shell execution, image tools,
   or multi-agent tools.
-- Typed manager tools list workspaces with their tabs, search and read bounded
-  native Codex history, and atomically create a launched tab whose new thread
-  begins with a curated handoff summary. The standard local Codex home remains
-  searchable read-only even when it is not registered as a destination home.
+- Typed manager tools list workspaces with their tabs, create a new tab with an
+  immediately bound and running Codex session, start or repair a session in an
+  existing tab, search and read bounded native Codex history, and atomically
+  create a launched tab whose new thread begins with a curated handoff summary.
+  Raw tab creation is shell-only and cannot be reported as a Codex session. The
+  standard local Codex home remains searchable read-only even when it is not
+  registered as a destination home.
 - Historical excerpts contain only user and final-assistant text; tool output,
   reasoning, likely credential assignments, and excess context are excluded.
 - Lumbergh has machine-wide read access through credential-filtered private
@@ -276,9 +279,11 @@ nonexistent implementation.
 - A Middle Manager's workspace ID also constrains Wipsaw operations: it cannot
   target another workspace, create/delete workspaces, change global identity
   homes, or mutate its own scope. It escalates those operations to Lumbergh.
-- The embedded composer supports multiline editing and paste, scoped `@` file
-  completion, `$` completion over the skills allowed in that manager home, and
-  a blank `λ` prompt instead of placeholder content. Referenced file contents
+- The embedded composer supports UTF-8-safe caret movement and insertion across
+  lines, Home/End and word navigation, deletion, multiline paste, mouse caret
+  placement, scoped `@` file completion, `$` completion over the skills allowed
+  in that manager home, and a blank `λ` prompt instead of placeholder content.
+  Referenced file contents
   are bounded, credential-filtered, and confined to the same enforced scope as
   the private file tools.
 - Codex reasoning, tool calls, completion/failure state, and usage render in
@@ -286,9 +291,12 @@ nonexistent implementation.
 - Copy actions target the latest manager response or its transcript. A
   redraw-stable, manager-only selection view also supports native terminal copy
   without selecting the surrounding dashboard.
-- Long manager conversations scroll relative to the live bottom; composer mode
-  uses Ctrl-Up/Down and the transcript-only view supports arrows, Page Up/Down,
-  Home, and End.
+- Long manager conversations scroll relative to the live bottom. Composer mode
+  keeps prompt arrows for editing while Page Up/Down and the mouse wheel move
+  history without progress snapping it back. The transcript-only view supports
+  arrows, Page Up/Down, Home, and End with mouse capture disabled for selection.
+- Manager mutations trigger inventory reconciliation so tabs, Codex bindings,
+  thread details, and dashboard counts update without a manual refresh.
 - Human TUI, CLI, and MCP actions call the same application services.
 - The manager can organize tabs, create WIPs, inspect runs, change safe
   settings, and report health.

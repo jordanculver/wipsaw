@@ -18,8 +18,9 @@ use crate::codex::{
 use crate::error::{Result, WipsawError};
 use crate::id::{EntityKind, WipsawId};
 use crate::manager::{
-    MANAGER_MODEL, MANAGER_REASONING_EFFORT, ManagerContextScope, ManagerEvent, ManagerTurnRequest,
-    ManagerTurnResult, expand_prompt_references, prepare_runtime, spawn_turn,
+    MANAGER_MODEL, MANAGER_REASONING_EFFORT, MANAGER_TRANSCRIPT_MESSAGE_LIMIT, ManagerContextScope,
+    ManagerEvent, ManagerTurnRequest, ManagerTurnResult, expand_prompt_references, prepare_runtime,
+    spawn_turn,
 };
 use crate::model::{
     Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ManagerKind,
@@ -59,6 +60,15 @@ pub struct CodexThreadLaunch {
     pub codex_home_id: String,
     pub cwd: PathBuf,
     pub return_shell: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexTabSessionLaunch {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub tab: Tab,
+    pub thread: CodexThread,
+    pub launch: CodexThreadLaunch,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1005,6 +1015,92 @@ impl WipsawApp {
         inserted
     }
 
+    /// Create, bind, and launch a fresh Codex session in one tab operation.
+    /// Unlike `create_tab`, this never returns a shell-only tab.
+    pub fn create_codex_tab(
+        &mut self,
+        workspace_ref: &str,
+        name: &str,
+        cwd: &Path,
+        home_ref: Option<&str>,
+        profile_ref: Option<&str>,
+    ) -> Result<CodexTabSessionLaunch> {
+        self.create_launched_codex_tab(workspace_ref, name, cwd, home_ref, profile_ref, None)
+    }
+
+    fn create_launched_codex_tab(
+        &mut self,
+        workspace_ref: &str,
+        name: &str,
+        cwd: &Path,
+        home_ref: Option<&str>,
+        profile_ref: Option<&str>,
+        handoff: Option<&str>,
+    ) -> Result<CodexTabSessionLaunch> {
+        let workspace = self.workspace(workspace_ref)?;
+        let tab = self.create_tab(
+            &workspace.id,
+            name,
+            Some(cwd),
+            TabLaunchSettings {
+                account: None,
+                codex_home: home_ref,
+                model_profile: profile_ref,
+            },
+        )?;
+        let home_id = tab
+            .codex_home_id
+            .clone()
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "Codex home",
+                message: "no Codex home is available for the new Codex tab".to_string(),
+            });
+        let home_id = match home_id {
+            Ok(home_id) => home_id,
+            Err(error) => {
+                self.rollback_new_tab(&workspace, &tab);
+                return Err(error);
+            }
+        };
+        let thread = self.create_codex_thread_seeded(
+            name,
+            &home_id,
+            Some(&tab.cwd),
+            profile_ref,
+            Some((&workspace.id, &tab.id)),
+            handoff,
+        );
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.rollback_new_tab(&workspace, &tab);
+                return Err(error);
+            }
+        };
+        let launch = self.resume_codex_thread(&thread.id, &workspace.id, &tab.id);
+        let launch = match launch {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.rollback_codex_tab(&workspace, &tab, &thread);
+                return Err(error);
+            }
+        };
+        let tab = self
+            .registry
+            .tab_by_ref(&workspace.id, &tab.id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab.id.clone(),
+            })?;
+        Ok(CodexTabSessionLaunch {
+            workspace_id: workspace.id,
+            workspace_name: workspace.name,
+            tab,
+            thread,
+            launch,
+        })
+    }
+
     /// Create, seed, bind, and launch a Codex tab as one manager operation.
     /// Any resource created before a failure is removed on a best-effort basis
     /// so a manager retry does not multiply empty tabs or orphan threads.
@@ -1027,67 +1123,20 @@ impl WipsawApp {
                 message: "must contain between 1 and 48,000 characters".to_string(),
             });
         }
-        let workspace = self.workspace(workspace_ref)?;
-        let tab = self.create_tab(
-            &workspace.id,
+        let created = self.create_launched_codex_tab(
+            workspace_ref,
             name,
-            Some(cwd),
-            TabLaunchSettings {
-                account: None,
-                codex_home: home_ref,
-                model_profile: profile_ref,
-            },
-        )?;
-        let home_id = tab
-            .codex_home_id
-            .clone()
-            .ok_or_else(|| WipsawError::InvalidInput {
-                field: "Codex home",
-                message: "no Codex home is available for the handoff tab".to_string(),
-            });
-        let home_id = match home_id {
-            Ok(home_id) => home_id,
-            Err(error) => {
-                self.rollback_new_tab(&workspace, &tab);
-                return Err(error);
-            }
-        };
-        let thread = self.create_codex_thread_seeded(
-            name,
-            &home_id,
-            Some(&tab.cwd),
+            cwd,
+            home_ref,
             profile_ref,
-            Some((&workspace.id, &tab.id)),
             Some(handoff),
-        );
-        let thread = match thread {
-            Ok(thread) => thread,
-            Err(error) => {
-                self.rollback_new_tab(&workspace, &tab);
-                return Err(error);
-            }
-        };
-        let launch = self.resume_codex_thread(&thread.id, &workspace.id, &tab.id);
-        let launch = match launch {
-            Ok(launch) => launch,
-            Err(error) => {
-                self.rollback_handoff(&workspace, &tab, &thread);
-                return Err(error);
-            }
-        };
-        let tab = self
-            .registry
-            .tab_by_ref(&workspace.id, &tab.id)?
-            .ok_or_else(|| WipsawError::NotFound {
-                entity: "tab",
-                value: tab.id.clone(),
-            })?;
+        )?;
         Ok(CodexHandoffLaunch {
-            workspace_id: workspace.id,
-            workspace_name: workspace.name,
-            tab,
-            thread,
-            launch,
+            workspace_id: created.workspace_id,
+            workspace_name: created.workspace_name,
+            tab: created.tab,
+            thread: created.thread,
+            launch: created.launch,
             source_codex_home_id: source_codex_home_id.to_string(),
             source_native_thread_id: source_native_thread_id.to_string(),
         })
@@ -1100,7 +1149,7 @@ impl WipsawApp {
         let _ = self.registry.delete_tab(&tab.id);
     }
 
-    fn rollback_handoff(&mut self, workspace: &Workspace, tab: &Tab, thread: &CodexThread) {
+    fn rollback_codex_tab(&mut self, workspace: &Workspace, tab: &Tab, thread: &CodexThread) {
         self.rollback_new_tab(workspace, tab);
         if let Ok(Some(home)) = self.registry.codex_home_by_ref(&thread.codex_home_id) {
             let _ = delete_thread(&home, &thread.native_thread_id);
@@ -1178,7 +1227,9 @@ impl WipsawApp {
             Some(workspace) => self.ensure_middle_manager(workspace)?,
             None => self.ensure_lumbergh()?,
         };
-        let messages = self.registry.list_manager_messages(&session.id, 200)?;
+        let messages = self
+            .registry
+            .list_manager_messages(&session.id, MANAGER_TRANSCRIPT_MESSAGE_LIMIT)?;
         Ok((session, messages))
     }
 

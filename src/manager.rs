@@ -26,6 +26,7 @@ use crate::tmux::TmuxBackend;
 
 pub const MANAGER_MODEL: &str = "gpt-5.6-terra";
 pub const MANAGER_REASONING_EFFORT: &str = "medium";
+pub const MANAGER_TRANSCRIPT_MESSAGE_LIMIT: usize = 2_000;
 pub const MANAGER_SKILL_NAME: &str = "wipsaw-manager";
 pub const MANAGER_SKILL_NAMES: [&str; 3] = [MANAGER_SKILL_NAME, "skill-creator", "skill-installer"];
 const SYSTEM_MANAGER_SKILLS: [&str; 2] = ["skill-creator", "skill-installer"];
@@ -50,9 +51,11 @@ description: Manage Wipsaw workspaces, tabs, Codex sessions, identities, model p
 Use only the tools from the `wipsaw` MCP server for Wipsaw operations.
 
 - Call `manager_guide` before the first operation in a session.
-- Prefer purpose-built tools over `run_wipsaw`. Use `workspace_overview` for workspaces and tabs, `codex_history_search` plus `codex_history_read` for prior sessions, and `create_handoff_tab` for an atomic summary-based session handoff.
+- Prefer purpose-built tools over `run_wipsaw`. Use `workspace_overview` for workspaces and tabs, `create_codex_tab` for a new tab with a running Codex session, `start_codex_session` to create or restart a session in an existing tab, `codex_history_search` plus `codex_history_read` for prior sessions, and `create_handoff_tab` for an atomic summary-based session handoff.
 - Use `run_wipsaw` only when no purpose-built tool covers the operation. Always begin its `args` array with `--json`.
 - Inspect current state before changing it. Pass exact IDs returned by inspection tools into mutations.
+- `tab create` creates a shell-only tab. If the user says Codex, session, thread, or asks for a tab like an existing Codex tab, never use raw `tab create`; use `create_codex_tab`. A successful Codex result must contain a non-null `tab.codex_thread_id`, a Wipsaw thread ID, a native Codex thread ID, and a launch result. Never claim that a shell tab will gain a session later unless the user explicitly requested lazy startup.
+- Use `start_codex_session` for an existing tab whose `codex_thread_id` is null or whose Codex process stopped. Report `running: false` as a failure, not as a ready session.
 - Wipsaw nouns are singular CLI groups. For example, list workspaces with `args: ["--json", "workspace", "list"]`.
 - Delete a workspace only after confirming the exact ID and the user's intent, then call `args: ["--json", "workspace", "delete", "<id>", "--yes"]`.
 - Lumbergh can manage a Middle Manager's explicit file scope with `workspace context list|add|remove`. A Middle Manager may list but cannot broaden or remove its own scope.
@@ -762,6 +765,10 @@ fn manager_mcp_response(request: &Value) -> Option<Value> {
                 "workspace_overview" => {
                     workspace_overview_tool(request.pointer("/params/arguments"))
                 }
+                "create_codex_tab" => create_codex_tab_tool(request.pointer("/params/arguments")),
+                "start_codex_session" => {
+                    start_codex_session_tool(request.pointer("/params/arguments"))
+                }
                 "codex_history_search" => {
                     codex_history_search_tool(request.pointer("/params/arguments"))
                 }
@@ -839,6 +846,45 @@ fn manager_mcp_tools() -> Value {
                 "properties": {
                     "workspace": { "type": "string", "maxLength": 256 }
                 },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "create_codex_tab",
+            "description": "Create a new workspace tab, create and bind a native Codex thread immediately, and launch Codex in its tmux pane as one rollback-safe operation. Use this whenever the user asks for a Codex tab/session; raw tab create is shell-only.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 96 },
+                    "cwd": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "home": { "type": "string", "maxLength": 256 },
+                    "profile": { "type": "string", "maxLength": 256 }
+                },
+                "required": ["workspace", "name", "cwd"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "start_codex_session",
+            "description": "Ensure an existing non-manager tab has a bound native Codex thread and a running Codex process. Use this to repair a shell-only tab or restart a stopped session. Returns running=false as an error instead of claiming success.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "tab": { "type": "string", "minLength": 1, "maxLength": 256 }
+                },
+                "required": ["workspace", "tab"],
                 "additionalProperties": false
             }
         },
@@ -1402,6 +1448,133 @@ fn workspace_overview_tool(arguments: Option<&Value>) -> Value {
             ),
             Err(error) => manager_tool_result(&error.to_string(), true, None),
         },
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn create_codex_tab_tool(arguments: Option<&Value>) -> Value {
+    let workspace = arguments
+        .and_then(|arguments| arguments.get("workspace"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let name = arguments
+        .and_then(|arguments| arguments.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let cwd = arguments
+        .and_then(|arguments| arguments.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (Some(workspace), Some(name), Some(cwd)) = (workspace, name, cwd) else {
+        return manager_tool_result(
+            "'workspace', 'name', and 'cwd' must be non-empty strings",
+            true,
+            None,
+        );
+    };
+    let home = arguments
+        .and_then(|arguments| arguments.get("home"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let profile = arguments
+        .and_then(|arguments| arguments.get("profile"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let result = (|| -> Result<Value> {
+        let scope = manager_scope_from_env()?;
+        let cwd = scope.resolve(cwd)?;
+        if !cwd.is_dir() {
+            return Err(WipsawError::InvalidInput {
+                field: "Codex tab cwd",
+                message: format!("'{}' is not a directory", cwd.display()),
+            });
+        }
+        let mut app = open_manager_app()?;
+        let created = app.create_codex_tab(workspace, name, &cwd, home, profile)?;
+        if created.tab.codex_thread_id.as_deref() != Some(created.thread.id.as_str()) {
+            return Err(WipsawError::Manager(
+                "Codex tab creation returned without the new thread binding".to_string(),
+            ));
+        }
+        serde_json::to_value(created).map_err(Into::into)
+    })();
+    match result {
+        Ok(structured) => manager_tool_result(
+            &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+            false,
+            Some(json!({ "session": structured })),
+        ),
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn start_codex_session_tool(arguments: Option<&Value>) -> Value {
+    let workspace_ref = arguments
+        .and_then(|arguments| arguments.get("workspace"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let tab_ref = arguments
+        .and_then(|arguments| arguments.get("tab"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (Some(workspace_ref), Some(tab_ref)) = (workspace_ref, tab_ref) else {
+        return manager_tool_result(
+            "'workspace' and 'tab' must be non-empty strings",
+            true,
+            None,
+        );
+    };
+    let result = (|| -> Result<(Value, bool)> {
+        let _scope = manager_scope_from_env()?;
+        let mut app = open_manager_app()?;
+        let workspace = app.workspace(workspace_ref)?;
+        let thread = app.start_tab_codex(&workspace.id, tab_ref)?;
+        let tab = app
+            .registry
+            .tab_by_ref(&workspace.id, tab_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab_ref.to_string(),
+            })?;
+        if tab.codex_thread_id.as_deref() != Some(thread.id.as_str()) {
+            return Err(WipsawError::Manager(
+                "Codex startup returned without binding the thread to the tab".to_string(),
+            ));
+        }
+        let running = app.tmux.window_has_managed_thread(
+            &workspace.tmux_session,
+            &tab.tmux_window_id,
+            &thread.id,
+        )?;
+        Ok((
+            json!({
+                "workspaceId": workspace.id,
+                "workspaceName": workspace.name,
+                "tab": tab,
+                "thread": thread,
+                "running": running
+            }),
+            running,
+        ))
+    })();
+    match result {
+        Ok((structured, true)) => manager_tool_result(
+            &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+            false,
+            Some(json!({ "session": structured })),
+        ),
+        Ok((structured, false)) => manager_tool_result(
+            "The native Codex thread is bound, but Codex is not running because the tab pane is busy. Stop the pane's foreground process or open a new Codex tab; do not report this session as ready.",
+            true,
+            Some(json!({ "session": structured })),
+        ),
         Err(error) => manager_tool_result(&error.to_string(), true, None),
     }
 }
@@ -1979,16 +2152,30 @@ fn run_wipsaw_tool(arguments: Option<&Value>) -> Value {
             }
             let structured = serde_json::from_str::<Value>(&stdout)
                 .ok()
-                .map(|result| json!({ "result": result }));
-            manager_tool_result(
-                if stdout.is_empty() {
-                    "Wipsaw command completed without output"
-                } else {
-                    &stdout
-                },
-                false,
-                structured,
-            )
+                .map(|result| {
+                    if args.get(1).map(String::as_str) == Some("tab")
+                        && args.get(2).map(String::as_str) == Some("create")
+                    {
+                        json!({
+                            "result": result,
+                            "managerWarning": "tab create is shell-only; codex_thread_id is null. Use create_codex_tab or start_codex_session before claiming a Codex session exists."
+                        })
+                    } else {
+                        json!({ "result": result })
+                    }
+                });
+            let text = if args.get(1).map(String::as_str) == Some("tab")
+                && args.get(2).map(String::as_str) == Some("create")
+            {
+                format!(
+                    "{stdout}\n\nWipsaw manager warning: this created a shell-only tab with codex_thread_id=null. Do not report a Codex session; use create_codex_tab for a new session or start_codex_session for this tab."
+                )
+            } else if stdout.is_empty() {
+                "Wipsaw command completed without output".to_string()
+            } else {
+                stdout
+            };
+            manager_tool_result(&text, false, structured)
         }
         Err(error) => manager_tool_result(
             &format!("could not start the Wipsaw command: {error}"),
@@ -2860,6 +3047,8 @@ mod tests {
                 "manager_guide",
                 "context_list",
                 "workspace_overview",
+                "create_codex_tab",
+                "start_codex_session",
                 "codex_history_search",
                 "codex_history_read",
                 "create_handoff_tab",

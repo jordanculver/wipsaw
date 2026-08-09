@@ -143,9 +143,12 @@ authentication but ignores inherited configuration and installs only the
 Wipsaw manager, `skill-creator`, and `skill-installer` skill directories. The
 installer is the manager's default lookup surface. A read-only manager process
 receives one required, private MCP server exposing `manager_guide`, a validated
-`run_wipsaw` escape hatch, typed workspace/history/handoff operations, and
+`run_wipsaw` escape hatch, typed workspace/Codex-session/history/handoff operations, and
 scoped context/list/search/read tools. `workspace_overview` eliminates raw tab
-query positionals. Native Codex history search/read spans registered homes and
+query positionals. `create_codex_tab` makes new Codex tabs rollback-safe and
+`start_codex_session` verifies the thread binding and live process for existing
+tabs; the raw tab command is identified as shell-only. Native Codex history
+search/read spans registered homes and
 the standard local Codex home; older homes that cannot initialize the current
 app-server use bounded, read-only rollout parsing. `create_handoff_tab` starts a
 new native thread, injects a curated summary into model-visible history without
@@ -167,7 +170,8 @@ filtered to that workspace; Middle Managers cannot create/delete workspaces,
 alter global accounts or Codex homes, or mutate their own context rows.
 Lumbergh and direct human CLI invocations retain cross-workspace authority.
 
-The composer preserves multiline bracketed paste and provides client-side
+The composer maintains a UTF-8-safe insertion caret with horizontal, vertical,
+line, word, deletion, paste, and mouse-click editing, and provides client-side
 completion for scoped `@` files and allowed `$` skills. Lumbergh supports lazy
 absolute-path browsing from `/`; Middle Managers index and browse only their
 explicit roots. Wipsaw resolves file references through the same central scope
@@ -178,11 +182,13 @@ Directory context explicitly directs the manager to its scoped browse/search/rea
 tools. The composer renders an empty `λ`
 input instead of placeholder or activity text. Clipboard actions copy only the
 latest response or manager transcript through tmux and OSC 52. A separate
-transcript-only view removes adjacent dashboard columns and pauses redraws so
-native terminal selection remains stable. Conversation scrolling is stored as
-an offset from the live bottom so Up/Page Up works after long transcripts while
-new turns still follow live output; idle dashboard rendering also blocks until
-input. Codex startup, app-server, health checks, and manager turns prepend
+transcript-only view removes adjacent dashboard columns, disables mouse capture,
+and pauses redraws so native terminal selection remains stable. Conversation
+scrolling is stored as an offset from the live bottom; Page Up/Page Down and the
+mouse wheel work while composing, and progress does not reset an explicit
+history position. Completed manager mutations reconcile workspace, tab, thread,
+home, profile, and manager inventory before the next frame. Codex startup,
+app-server, health checks, and manager turns prepend
 the Node runtime belonging to the registered npm Codex installation, avoiding
 stale version-manager paths retained by long-lived tmux servers.
 

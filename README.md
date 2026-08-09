@@ -53,6 +53,9 @@ image tools, and multi-agent tools are not loaded into manager sessions.
 
 Core manager workflows use typed tools instead of making the model assemble CLI
 positionals. `workspace_overview` returns workspaces with their tabs;
+`create_codex_tab` atomically creates, binds, and launches a real Codex session;
+`start_codex_session` repairs or restarts an existing tab and verifies that its
+process is running; raw `tab create` is explicitly shell-only;
 `codex_history_search` and `codex_history_read` find query-focused excerpts from
 native sessions across registered homes and the standard local `~/.codex`
 history; and `create_handoff_tab` creates, seeds, binds, and launches a new
@@ -61,7 +64,9 @@ home cannot initialize the current app-server. History handoffs include only
 user and final-assistant text, omit tool output and reasoning, redact likely
 credential assignments, and remain bounded before they reach a manager turn.
 
-The blank `λ` manager composer accepts multiline paste. `Enter` sends;
+The blank `λ` manager composer is a real multiline editor: arrows move the
+caret, Home/End move within a line, Ctrl-Left/Ctrl-Right move by word, Delete
+and Backspace edit at the caret, and mouse clicks place it. `Enter` sends;
 `Shift+Enter` or `Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker
 and `$` for allowed skills. Lumbergh has machine-wide read access: type `@/` and
 continue through directories to browse from the filesystem root. Each Middle
@@ -75,9 +80,10 @@ the same response box as the final answer. Outside the composer, `v` opens a
 manager-only, redraw-stable selection view for native terminal copying, `y`
 copies the latest manager response, and `Y` copies the transcript; `Ctrl-O`
 opens the selection view and `Ctrl-Y` copies the latest response while
-composing. `Ctrl-Up`/`Ctrl-Down` scroll the conversation while composing;
+composing. Page Up/Page Down or the mouse wheel scroll the conversation without
+leaving the composer; progress updates preserve the user's history position.
 Up/Down, Page Up/Page Down, Home, and End scroll in the manager-only selection
-view.
+view, where mouse capture is disabled so native terminal selection still works.
 
 Middle Manager authority is enforced by workspace ID as well: it sees and
 manages only its own workspace, tabs, and threads; cannot create or delete

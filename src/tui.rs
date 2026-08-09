@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -28,8 +28,9 @@ use crate::app::{TabLaunchSettings, WipsawApp};
 use crate::doctor::DoctorReport;
 use crate::error::{Result, WipsawError};
 use crate::manager::{
-    MANAGER_MODEL, MANAGER_SKILL_NAMES, ManagerContextScope, ManagerEvent, ManagerProgress,
-    ManagerProgressStatus, list_manager_directory, sensitive_reference,
+    MANAGER_MODEL, MANAGER_SKILL_NAMES, MANAGER_TRANSCRIPT_MESSAGE_LIMIT, ManagerContextScope,
+    ManagerEvent, ManagerProgress, ManagerProgressStatus, list_manager_directory,
+    sensitive_reference,
 };
 use crate::model::{
     Account, CodexHome, CodexThread, ManagerMessage, ManagerSession, ModelProfile, Tab, Workspace,
@@ -73,6 +74,7 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
 
     loop {
         navigator.poll_manager(app);
+        session.set_mouse_capture(!navigator.manager.copy_view)?;
         session.terminal.draw(|frame| navigator.render(frame))?;
 
         let input = if navigator.manager.turn.is_some() && !navigator.manager.copy_view {
@@ -92,6 +94,7 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
                 navigator.handle_paste(&value);
                 Action::None
             }
+            Event::Mouse(mouse) => navigator.handle_mouse(mouse),
             _ => continue,
         };
         let new_workspace = navigator.selected_workspace().map(|item| item.id.clone());
@@ -289,6 +292,7 @@ impl Drop for NavigatorPopupGuard {
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     active: bool,
+    mouse_capture: bool,
 }
 
 impl TerminalSession {
@@ -299,6 +303,7 @@ impl TerminalSession {
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableMouseCapture,
             Hide,
             ClearTerminal(ClearType::All)
         ) {
@@ -309,7 +314,21 @@ impl TerminalSession {
         Ok(Self {
             terminal,
             active: true,
+            mouse_capture: true,
         })
+    }
+
+    fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()> {
+        if !self.active || self.mouse_capture == enabled {
+            return Ok(());
+        }
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_capture = enabled;
+        Ok(())
     }
 
     fn suspend(&mut self) -> io::Result<()> {
@@ -318,10 +337,12 @@ impl TerminalSession {
             execute!(
                 self.terminal.backend_mut(),
                 DisableBracketedPaste,
+                DisableMouseCapture,
                 Show,
                 LeaveAlternateScreen
             )?;
             self.active = false;
+            self.mouse_capture = false;
         }
         Ok(())
     }
@@ -333,6 +354,7 @@ impl TerminalSession {
                 self.terminal.backend_mut(),
                 EnterAlternateScreen,
                 EnableBracketedPaste,
+                EnableMouseCapture,
                 Hide,
                 ClearTerminal(ClearType::All)
             ) {
@@ -340,6 +362,7 @@ impl TerminalSession {
                 return Err(error);
             }
             self.active = true;
+            self.mouse_capture = true;
             self.terminal.clear()?;
         }
         Ok(())
@@ -361,6 +384,7 @@ impl Drop for TerminalSession {
             let _ = execute!(
                 self.terminal.backend_mut(),
                 DisableBracketedPaste,
+                DisableMouseCapture,
                 Show,
                 LeaveAlternateScreen
             );
@@ -433,6 +457,11 @@ struct ManagerChat {
     session: Option<ManagerSession>,
     messages: Vec<ManagerMessage>,
     composer: String,
+    composer_cursor: usize,
+    composer_area: Option<Rect>,
+    composer_view_start: usize,
+    composer_width: usize,
+    transcript_area: Option<Rect>,
     focused: bool,
     overlay: bool,
     activity: Option<String>,
@@ -640,6 +669,7 @@ impl Navigator {
         self.manager.overlay = true;
         self.manager.focused = true;
         self.manager.composer.clear();
+        self.manager.composer_cursor = 0;
         self.message = None;
         Ok(())
     }
@@ -652,6 +682,7 @@ impl Navigator {
         self.manager.overlay = false;
         self.manager.focused = false;
         self.manager.composer.clear();
+        self.manager.composer_cursor = 0;
         self.load_manager(app, None)?;
         Ok(())
     }
@@ -673,7 +704,10 @@ impl Navigator {
         });
         self.manager.scroll = 0;
         if let Some(session) = &self.manager.session {
-            match app.registry.list_manager_messages(&session.id, 200) {
+            match app
+                .registry
+                .list_manager_messages(&session.id, MANAGER_TRANSCRIPT_MESSAGE_LIMIT)
+            {
                 Ok(messages) => self.manager.messages = messages,
                 Err(error) => self.error(error),
             }
@@ -683,6 +717,7 @@ impl Navigator {
     fn poll_manager(&mut self, app: &WipsawApp) {
         let mut events = Vec::new();
         let mut disconnected = false;
+        let mut refresh_inventory = false;
         if let Some(turn) = self.manager.turn.as_ref() {
             loop {
                 match turn.receiver.try_recv() {
@@ -716,9 +751,11 @@ impl Navigator {
                     });
                 }
                 ManagerEvent::Progress(progress) => {
+                    refresh_inventory |= manager_progress_changes_inventory(&progress);
                     self.upsert_manager_progress(progress);
                 }
                 ManagerEvent::Finished(result) => {
+                    refresh_inventory = true;
                     let session_id = self
                         .manager
                         .turn
@@ -797,12 +834,17 @@ impl Navigator {
                         }
                         self.manager.session = Some(session);
                     }
-                    if let Ok(messages) = app.registry.list_manager_messages(&session_id, 200) {
+                    if let Ok(messages) = app
+                        .registry
+                        .list_manager_messages(&session_id, MANAGER_TRANSCRIPT_MESSAGE_LIMIT)
+                    {
                         self.manager.messages = messages;
                     }
-                    self.manager.scroll = 0;
                 }
             }
+        }
+        if refresh_inventory && let Err(error) = self.refresh_inventory(app) {
+            self.error(error);
         }
     }
 
@@ -826,10 +868,15 @@ impl Navigator {
                 self.manager.progress.remove(removable);
             }
         }
-        self.manager.scroll = 0;
     }
 
     fn refresh(&mut self, app: &WipsawApp) -> Result<()> {
+        self.refresh_inventory(app)?;
+        self.health = SystemHealth::collect(app);
+        Ok(())
+    }
+
+    fn refresh_inventory(&mut self, app: &WipsawApp) -> Result<()> {
         let workspace_id = self.selected_workspace().map(|item| item.id.clone());
         let tab_id = self.selected_tab().map(|item| item.id.clone());
         let thread_id = self.selected_thread().map(|item| item.id.clone());
@@ -859,7 +906,6 @@ impl Navigator {
             self.manager.references = manager_reference_catalog(&scope);
             self.manager.scope = Some(scope);
         }
-        self.health = SystemHealth::collect(app);
         select_id(
             &mut self.thread_state,
             self.threads
@@ -1086,16 +1132,28 @@ impl Navigator {
         let matches = self.manager_reference_matches();
         if !matches.is_empty() && !self.manager.reference_dismissed {
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.manager.reference_index = self.manager.reference_index.saturating_sub(1);
                     return Action::None;
                 }
-                KeyCode::Down => {
+                KeyCode::Down
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
                     self.manager.reference_index =
                         (self.manager.reference_index + 1).min(matches.len() - 1);
                     return Action::None;
                 }
-                KeyCode::Tab | KeyCode::Enter => {
+                KeyCode::Tab => {
+                    self.insert_manager_reference();
+                    return Action::None;
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
                     self.insert_manager_reference();
                     return Action::None;
                 }
@@ -1116,25 +1174,120 @@ impl Navigator {
                 Action::None
             }
             KeyCode::Backspace => {
-                self.manager.composer.pop();
-                self.manager.reference_index = 0;
-                self.manager.reference_dismissed = false;
+                self.delete_manager_character(true);
+                Action::None
+            }
+            KeyCode::Delete => {
+                self.delete_manager_character(false);
+                Action::None
+            }
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.move_manager_word(false);
+                Action::None
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.move_manager_word(true);
+                Action::None
+            }
+            KeyCode::Left => {
+                self.manager.composer_cursor =
+                    previous_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::Right => {
+                self.manager.composer_cursor =
+                    next_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::Up
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.manager.composer_cursor = move_cursor_vertically(
+                    &self.manager.composer,
+                    self.manager.composer_cursor,
+                    self.manager.composer_width,
+                    false,
+                );
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::Down
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.manager.composer_cursor = move_cursor_vertically(
+                    &self.manager.composer,
+                    self.manager.composer_cursor,
+                    self.manager.composer_width,
+                    true,
+                );
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::Home => {
+                self.manager.composer_cursor =
+                    current_line_start(&self.manager.composer, self.manager.composer_cursor);
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::End => {
+                self.manager.composer_cursor =
+                    current_line_end(&self.manager.composer, self.manager.composer_cursor);
+                self.manager_reference_cursor_moved();
                 Action::None
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.manager.composer.clear();
+                self.manager.composer_cursor = 0;
                 self.manager.reference_index = 0;
                 self.manager.reference_dismissed = false;
+                Action::None
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.manager.composer_cursor =
+                    current_line_start(&self.manager.composer, self.manager.composer_cursor);
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.manager.composer_cursor =
+                    current_line_end(&self.manager.composer, self.manager.composer_cursor);
+                self.manager_reference_cursor_moved();
+                Action::None
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_manager_word();
                 Action::None
             }
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.copy_latest_manager_message()
             }
-            KeyCode::PageUp | KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::PageUp => {
+                self.manager.scroll = self.manager.scroll.saturating_add(12);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.manager.scroll = self.manager.scroll.saturating_sub(12);
+                Action::None
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.manager.scroll = self.manager.scroll.saturating_add(3);
                 Action::None
             }
-            KeyCode::PageDown | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.manager.scroll = self.manager.scroll.saturating_sub(3);
                 Action::None
             }
@@ -1161,6 +1314,7 @@ impl Navigator {
                     return Action::None;
                 }
                 self.manager.composer.clear();
+                self.manager.composer_cursor = 0;
                 self.manager.reference_index = 0;
                 self.manager.reference_dismissed = false;
                 let workspace_id = self
@@ -1221,11 +1375,51 @@ impl Navigator {
     }
 
     fn handle_paste(&mut self, value: &str) {
-        if !self.manager.focused || self.manager.turn.is_some() {
+        if !self.manager.focused {
             return;
         }
         let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
         self.insert_manager_text(&normalized);
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        let over_transcript = self
+            .manager
+            .transcript_area
+            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row));
+        match mouse.kind {
+            MouseEventKind::ScrollUp if over_transcript => {
+                self.manager.scroll = self.manager.scroll.saturating_add(6);
+            }
+            MouseEventKind::ScrollDown if over_transcript => {
+                self.manager.scroll = self.manager.scroll.saturating_sub(6);
+            }
+            MouseEventKind::Down(MouseButton::Left) if over_transcript => {
+                self.manager.focused = false;
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .manager
+                    .composer_area
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) =>
+            {
+                let area = self.manager.composer_area.expect("composer area checked");
+                let visual_row =
+                    self.manager.composer_view_start + mouse.row.saturating_sub(area.y) as usize;
+                let visual_column = mouse.column.saturating_sub(area.x).saturating_sub(2) as usize;
+                self.manager.composer_cursor = editor_cursor_from_position(
+                    &self.manager.composer,
+                    self.manager.composer_width,
+                    visual_row,
+                    visual_column,
+                );
+                self.manager.focused = true;
+                self.manager_reference_cursor_moved();
+                self.message = None;
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     fn insert_manager_text(&mut self, value: &str) {
@@ -1234,13 +1428,58 @@ impl Navigator {
         if remaining == 0 {
             return;
         }
-        self.manager.composer.extend(value.chars().take(remaining));
+        let inserted = value.chars().take(remaining).collect::<String>();
+        let cursor = clamp_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+        self.manager.composer.insert_str(cursor, &inserted);
+        self.manager.composer_cursor = cursor + inserted.len();
+        self.manager_reference_cursor_moved();
+    }
+
+    fn delete_manager_character(&mut self, backwards: bool) {
+        let cursor = clamp_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+        let (start, end) = if backwards {
+            (
+                previous_char_boundary(&self.manager.composer, cursor),
+                cursor,
+            )
+        } else {
+            (cursor, next_char_boundary(&self.manager.composer, cursor))
+        };
+        if start != end {
+            self.manager.composer.replace_range(start..end, "");
+            self.manager.composer_cursor = start;
+        }
+        self.manager_reference_cursor_moved();
+    }
+
+    fn move_manager_word(&mut self, forwards: bool) {
+        self.manager.composer_cursor = if forwards {
+            next_word_boundary(&self.manager.composer, self.manager.composer_cursor)
+        } else {
+            previous_word_boundary(&self.manager.composer, self.manager.composer_cursor)
+        };
+        self.manager_reference_cursor_moved();
+    }
+
+    fn delete_manager_word(&mut self) {
+        let cursor = clamp_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+        let start = previous_word_boundary(&self.manager.composer, cursor);
+        if start != cursor {
+            self.manager.composer.replace_range(start..cursor, "");
+            self.manager.composer_cursor = start;
+        }
+        self.manager_reference_cursor_moved();
+    }
+
+    fn manager_reference_cursor_moved(&mut self) {
         self.manager.reference_index = 0;
         self.manager.reference_dismissed = false;
     }
 
     fn manager_reference_matches(&self) -> Vec<ManagerReference> {
-        let Some((kind, _, query)) = active_manager_reference(&self.manager.composer) else {
+        let cursor = clamp_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+        let Some((kind, _, query)) = active_manager_reference(&self.manager.composer[..cursor])
+        else {
             return Vec::new();
         };
         let normalized_query = query.to_ascii_lowercase();
@@ -1272,7 +1511,9 @@ impl Navigator {
     }
 
     fn insert_manager_reference(&mut self) {
-        let Some((kind, start, _)) = active_manager_reference(&self.manager.composer) else {
+        let cursor = clamp_char_boundary(&self.manager.composer, self.manager.composer_cursor);
+        let Some((kind, start, _)) = active_manager_reference(&self.manager.composer[..cursor])
+        else {
             return;
         };
         let matches = self.manager_reference_matches();
@@ -1301,7 +1542,10 @@ impl Navigator {
             } else {
                 format!("{sigil}{label} ")
             };
-        self.manager.composer.replace_range(start.., &replacement);
+        self.manager
+            .composer
+            .replace_range(start..cursor, &replacement);
+        self.manager.composer_cursor = start + replacement.len();
         self.manager.reference_index = 0;
         self.manager.reference_dismissed = false;
     }
@@ -1531,6 +1775,8 @@ impl Navigator {
 
     fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        self.manager.transcript_area = None;
+        self.manager.composer_area = None;
         frame.render_widget(Block::default().style(Style::default().bg(DEEP)), area);
         if self.manager.copy_view {
             self.render_manager_copy_view(frame, area);
@@ -1856,7 +2102,7 @@ impl Navigator {
         self.render_home_activity(frame, rows[4]);
     }
 
-    fn render_manager_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_manager_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let label = self.manager_label();
         let activity = self.manager.activity.as_deref().unwrap_or("ready");
         let scope = self
@@ -1880,6 +2126,18 @@ impl Navigator {
                 Span::styled("CODEX MANAGER · TERRA MEDIUM", Style::default().fg(MUTED)),
                 Span::styled(format!(" · {scope}"), Style::default().fg(MUTED)),
                 Span::styled(format!(" · {activity} "), Style::default().fg(AMBER)),
+                Span::styled(
+                    if self.manager.scroll > 0 {
+                        format!(" · HISTORY ↑{} ", self.manager.scroll)
+                    } else {
+                        " · LIVE ".to_string()
+                    },
+                    Style::default().fg(if self.manager.scroll > 0 {
+                        AMBER
+                    } else {
+                        GREEN
+                    }),
+                ),
             ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if self.manager.turn.is_some() {
@@ -1889,6 +2147,7 @@ impl Navigator {
             }))
             .style(Style::default().bg(PANEL));
         let inner = block.inner(area);
+        self.manager.transcript_area = Some(inner);
         let lines = manager_transcript_lines(
             &self.manager.messages,
             &self.manager.progress,
@@ -1905,28 +2164,40 @@ impl Navigator {
         );
     }
 
-    fn render_manager_composer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let working = self.manager.turn.is_some();
+    fn render_manager_composer(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .title(if area.width >= 76 {
-                " COMPOSER · Enter send · Ctrl+J newline · Ctrl+↑↓ scroll · @ files · $ skills "
+                " COMPOSER · Enter send · Ctrl+J newline · arrows edit · PgUp/PgDn history · @ files · $ skills "
             } else {
-                " COMPOSER · Enter send · Ctrl+J newline "
+                " COMPOSER · Enter send · arrows edit "
             })
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if self.manager.focused { CYAN } else { BORDER }))
             .style(Style::default().bg(DEEP));
         let inner = block.inner(area);
-        let mut lines = manager_editor_lines(
+        self.manager.composer_area = Some(inner);
+        self.manager.composer_width = inner.width.saturating_sub(2).max(1) as usize;
+        let (lines, cursor_row) = manager_editor_lines(
             &self.manager.composer,
+            self.manager.composer_cursor,
             inner.width.max(4) as usize,
-            self.manager.focused && !working,
+            self.manager.focused,
         );
-        let visible = inner.height as usize;
-        if lines.len() > visible {
-            lines = lines.split_off(lines.len() - visible);
-        }
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        let visible = (inner.height as usize).max(1);
+        let view_start = if lines.len() > visible {
+            cursor_row
+                .saturating_sub(visible - 1)
+                .min(lines.len() - visible)
+        } else {
+            0
+        };
+        self.manager.composer_view_start = view_start;
+        let visible_lines = lines
+            .into_iter()
+            .skip(view_start)
+            .take(visible)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(visible_lines).block(block), area);
     }
 
     fn render_manager_reference_menu(&self, frame: &mut Frame<'_>, composer: Rect) {
@@ -1993,7 +2264,7 @@ impl Navigator {
         );
     }
 
-    fn render_manager_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_manager_overlay(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let popup = centered_rect(area, 104, area.height.saturating_sub(4));
         frame.render_widget(Clear, popup);
         frame.render_widget(Block::default().style(Style::default().bg(DEEP)), popup);
@@ -2034,7 +2305,10 @@ impl Navigator {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("Enter", Style::default().fg(CYAN)),
-                Span::styled(" send  ·  Ctrl+J newline  ·  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    " send  ·  arrows edit  ·  PgUp/PgDn history  ·  ",
+                    Style::default().fg(MUTED),
+                ),
                 Span::styled("Esc", Style::default().fg(CYAN)),
                 Span::styled(
                     if self.manager.focused {
@@ -2691,7 +2965,7 @@ impl Navigator {
             (text, false)
         });
         let keys = if self.manager.focused {
-            "Enter send   Ctrl+J newline   Ctrl+↑↓ scroll   @ files   $ skills   Ctrl+O output"
+            "←→↑↓ edit   Enter send   Ctrl+J newline   PgUp/PgDn history   @ files   $ skills"
         } else if self.manager.overlay || self.view == View::Home {
             "Enter compose   v select output   y latest   Y transcript   ↑↓ scroll   ? guide"
         } else if self.prefix_pending {
@@ -2726,7 +3000,7 @@ impl Navigator {
     }
 
     fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
-        let popup = centered_rect(area, 88, 31);
+        let popup = centered_rect(area, 88, 34);
         frame.render_widget(Clear, popup);
         let help = Text::from(vec![
             Line::styled(
@@ -2756,7 +3030,10 @@ impl Navigator {
             Line::raw(""),
             Line::styled("MANAGER COMPOSER", Style::default().fg(AMBER)),
             Line::from("  Enter          send · Shift+Enter or Ctrl+J inserts a newline"),
-            Line::from("  Ctrl-Up/Down   scroll the manager conversation while composing"),
+            Line::from("  arrows         move the caret left/right and between prompt lines"),
+            Line::from("  Home/End       start/end of line · Ctrl-Left/Right moves by word"),
+            Line::from("  PgUp/PgDn      scroll conversation while keeping the prompt editable"),
+            Line::from("  mouse wheel    scroll conversation · click composer to place caret"),
             Line::from("  @ / $          find a scoped file / available manager skill"),
             Line::from("  Ctrl+O         open selection view · Ctrl+Y copies latest response"),
             Line::from("  paste          preserves multiple lines"),
@@ -3063,6 +3340,177 @@ fn manager_reference_label(scope: &ManagerContextScope, path: &Path, directory: 
     label
 }
 
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn clamp_char_boundary(value: &str, requested: usize) -> usize {
+    let mut cursor = requested.min(value.len());
+    while !value.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+    cursor
+}
+
+fn previous_char_boundary(value: &str, cursor: usize) -> usize {
+    let cursor = clamp_char_boundary(value, cursor);
+    value[..cursor]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(value: &str, cursor: usize) -> usize {
+    let cursor = clamp_char_boundary(value, cursor);
+    value[cursor..]
+        .chars()
+        .next()
+        .map(|character| cursor + character.len_utf8())
+        .unwrap_or(value.len())
+}
+
+fn current_line_start(value: &str, cursor: usize) -> usize {
+    let cursor = clamp_char_boundary(value, cursor);
+    value[..cursor]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn current_line_end(value: &str, cursor: usize) -> usize {
+    let cursor = clamp_char_boundary(value, cursor);
+    value[cursor..]
+        .find('\n')
+        .map(|offset| cursor + offset)
+        .unwrap_or(value.len())
+}
+
+fn byte_at_character_column(value: &str, start: usize, end: usize, column: usize) -> usize {
+    value[start..end]
+        .char_indices()
+        .nth(column)
+        .map(|(offset, _)| start + offset)
+        .unwrap_or(end)
+}
+
+fn move_cursor_vertically(value: &str, cursor: usize, width: usize, down: bool) -> usize {
+    let cursor = clamp_char_boundary(value, cursor);
+    let width = if width == 0 { 80 } else { width };
+    let rows = editor_rows(value, width);
+    let row_index = rows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| cursor >= row.start && cursor <= row.end)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let row = rows[row_index];
+    let column = value[row.start..cursor.min(row.end)].chars().count();
+    let target = if down {
+        rows.get(row_index + 1)
+    } else {
+        row_index.checked_sub(1).and_then(|index| rows.get(index))
+    };
+    target
+        .map(|target| byte_at_character_column(value, target.start, target.end, column))
+        .unwrap_or(cursor)
+}
+
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn previous_word_boundary(value: &str, cursor: usize) -> usize {
+    let mut cursor = clamp_char_boundary(value, cursor);
+    while cursor > 0 {
+        let previous = previous_char_boundary(value, cursor);
+        let character = value[previous..cursor].chars().next().unwrap_or_default();
+        if is_word_character(character) {
+            break;
+        }
+        cursor = previous;
+    }
+    while cursor > 0 {
+        let previous = previous_char_boundary(value, cursor);
+        let character = value[previous..cursor].chars().next().unwrap_or_default();
+        if !is_word_character(character) {
+            break;
+        }
+        cursor = previous;
+    }
+    cursor
+}
+
+fn next_word_boundary(value: &str, cursor: usize) -> usize {
+    let mut cursor = clamp_char_boundary(value, cursor);
+    while cursor < value.len() {
+        let next = next_char_boundary(value, cursor);
+        let character = value[cursor..next].chars().next().unwrap_or_default();
+        if !is_word_character(character) {
+            break;
+        }
+        cursor = next;
+    }
+    while cursor < value.len() {
+        let next = next_char_boundary(value, cursor);
+        let character = value[cursor..next].chars().next().unwrap_or_default();
+        if is_word_character(character) {
+            break;
+        }
+        cursor = next;
+    }
+    cursor
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EditorRow {
+    start: usize,
+    end: usize,
+}
+
+fn editor_rows(value: &str, width: usize) -> Vec<EditorRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut columns = 0;
+    for (index, character) in value.char_indices() {
+        if character == '\n' {
+            rows.push(EditorRow { start, end: index });
+            start = index + character.len_utf8();
+            columns = 0;
+            continue;
+        }
+        if columns == width {
+            rows.push(EditorRow { start, end: index });
+            start = index;
+            columns = 0;
+        }
+        columns += 1;
+    }
+    rows.push(EditorRow {
+        start,
+        end: value.len(),
+    });
+    rows
+}
+
+fn editor_cursor_from_position(
+    value: &str,
+    width: usize,
+    visual_row: usize,
+    visual_column: usize,
+) -> usize {
+    let rows = editor_rows(value, width);
+    let Some(row) = rows.get(visual_row) else {
+        return value.len();
+    };
+    byte_at_character_column(value, row.start, row.end, visual_column)
+}
+
 fn active_manager_reference(value: &str) -> Option<(ManagerReferenceKind, usize, &str)> {
     if let Some(start) = value.rfind("@{")
         && !value[start + 2..].contains('}')
@@ -3187,6 +3635,18 @@ fn manager_scroll_position(line_count: usize, viewport_height: u16, scroll_back:
     max_scroll.saturating_sub(scroll_back.min(max_scroll))
 }
 
+fn manager_progress_changes_inventory(progress: &ManagerProgress) -> bool {
+    progress.status == ManagerProgressStatus::Completed
+        && [
+            "wipsaw/run_wipsaw",
+            "wipsaw/create_codex_tab",
+            "wipsaw/start_codex_session",
+            "wipsaw/create_handoff_tab",
+        ]
+        .iter()
+        .any(|tool| progress.label.contains(tool))
+}
+
 fn append_manager_progress_lines(
     lines: &mut Vec<Line<'static>>,
     progress: &[ManagerProgress],
@@ -3267,26 +3727,81 @@ fn manager_transcript_text(
     blocks.join("\n\n")
 }
 
-fn manager_editor_lines(value: &str, width: usize, show_cursor: bool) -> Vec<Line<'static>> {
-    let segments = wrap_editor_text(value, width.saturating_sub(2).max(1));
-    let last = segments.len().saturating_sub(1);
-    segments
+fn manager_editor_lines(
+    value: &str,
+    cursor: usize,
+    width: usize,
+    show_cursor: bool,
+) -> (Vec<Line<'static>>, usize) {
+    let content_width = width.saturating_sub(2).max(1);
+    let cursor = clamp_char_boundary(value, cursor);
+    let mut rows = editor_rows(value, content_width);
+    if cursor == value.len()
+        && rows
+            .last()
+            .is_some_and(|row| value[row.start..row.end].chars().count() == content_width)
+    {
+        rows.push(EditorRow {
+            start: value.len(),
+            end: value.len(),
+        });
+    }
+    let cursor_row = rows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| cursor >= row.start && cursor <= row.end)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let lines = rows
         .into_iter()
         .enumerate()
-        .map(|(index, segment)| {
+        .map(|(index, row)| {
             let mut spans = vec![Span::styled(
                 if index == 0 { "λ " } else { "  " },
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             )];
-            spans.push(Span::styled(segment, Style::default().fg(INK)));
-            if show_cursor && index == last {
-                spans.push(Span::styled("█", Style::default().fg(CYAN)));
+            if show_cursor && index == cursor_row {
+                let split = cursor.clamp(row.start, row.end);
+                spans.push(Span::styled(
+                    value[row.start..split].to_string(),
+                    Style::default().fg(INK),
+                ));
+                if split < row.end {
+                    let next = next_char_boundary(value, split).min(row.end);
+                    spans.push(Span::styled(
+                        value[split..next].to_string(),
+                        Style::default()
+                            .fg(DEEP)
+                            .bg(CYAN)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        value[next..row.end].to_string(),
+                        Style::default().fg(INK),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default()
+                            .fg(DEEP)
+                            .bg(CYAN)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(
+                    value[row.start..row.end].to_string(),
+                    Style::default().fg(INK),
+                ));
             }
             Line::from(spans)
         })
-        .collect()
+        .collect();
+    (lines, cursor_row)
 }
 
+#[cfg(test)]
 fn wrap_editor_text(value: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
@@ -3502,8 +4017,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Action, Navigator, active_manager_reference, base64_encode, manager_reference_catalog,
-        manager_scroll_position, wrap_editor_text, wrap_text,
+        Action, Navigator, active_manager_reference, base64_encode, editor_cursor_from_position,
+        manager_progress_changes_inventory, manager_reference_catalog, manager_scroll_position,
+        wrap_editor_text, wrap_text,
     };
     use crate::manager::{ManagerContextScope, ManagerProgress, ManagerProgressStatus};
     use crate::model::ManagerMessage;
@@ -3524,9 +4040,50 @@ mod tests {
         navigator.handle_paste("second\r\nthird");
         assert_eq!(navigator.manager.composer, "first\nsecond\nthird");
         assert_eq!(
+            navigator.manager.composer_cursor,
+            navigator.manager.composer.len()
+        );
+        assert_eq!(
             wrap_editor_text(&navigator.manager.composer, 20),
             ["first", "second", "third"]
         );
+    }
+
+    #[test]
+    fn manager_composer_supports_full_cursor_editing() {
+        let mut navigator = Navigator::empty();
+        navigator.manager.focused = true;
+        navigator.insert_manager_text("abc\ndef");
+
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        navigator.insert_manager_text("X");
+        assert_eq!(navigator.manager.composer, "abc\ndXef");
+
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(navigator.manager.composer, "ac\ndXef");
+        assert!(
+            navigator
+                .manager
+                .composer
+                .is_char_boundary(navigator.manager.composer_cursor)
+        );
+
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        navigator.insert_manager_text("!");
+        assert_eq!(navigator.manager.composer, "ac!\ndXef");
+    }
+
+    #[test]
+    fn manager_composer_moves_between_visually_wrapped_rows() {
+        let mut navigator = Navigator::empty();
+        navigator.manager.focused = true;
+        navigator.manager.composer_width = 3;
+        navigator.insert_manager_text("abcdef");
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        navigator.insert_manager_text("X");
+        assert_eq!(navigator.manager.composer, "abcXdef");
     }
 
     #[test]
@@ -3541,6 +4098,34 @@ mod tests {
         assert_eq!(navigator.manager.scroll, 3);
         navigator.handle_manager_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(navigator.manager.scroll, 0);
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(navigator.manager.scroll, 12);
+        navigator.upsert_manager_progress(ManagerProgress {
+            id: "call".to_string(),
+            label: "MCP · wipsaw/search_files".to_string(),
+            detail: None,
+            status: ManagerProgressStatus::Completed,
+        });
+        assert_eq!(navigator.manager.scroll, 12);
+    }
+
+    #[test]
+    fn editor_clicks_map_to_a_real_character_boundary() {
+        let text = "alpha\nbéta";
+        let cursor = editor_cursor_from_position(text, 20, 1, 2);
+        assert_eq!(&text[cursor..], "ta");
+        assert!(text.is_char_boundary(cursor));
+    }
+
+    #[test]
+    fn completed_wipsaw_mutations_request_inventory_refresh() {
+        let progress = ManagerProgress {
+            id: "call".to_string(),
+            label: "MCP · wipsaw/create_codex_tab".to_string(),
+            detail: None,
+            status: ManagerProgressStatus::Completed,
+        };
+        assert!(manager_progress_changes_inventory(&progress));
     }
 
     #[test]
@@ -3568,9 +4153,10 @@ mod tests {
             ["wipsaw-manager", "skill-creator", "skill-installer"]
         );
         navigator.manager.composer = "Review @READ".to_string();
+        navigator.manager.composer_cursor = navigator.manager.composer.len();
         navigator.insert_manager_reference();
         assert_eq!(navigator.manager.composer, "Review @README.md ");
-        navigator.manager.composer.push_str("$skill-c");
+        navigator.insert_manager_text("$skill-c");
         navigator.insert_manager_reference();
         assert!(navigator.manager.composer.ends_with("$skill-creator "));
         assert!(active_manager_reference("Use @notes").is_some());
