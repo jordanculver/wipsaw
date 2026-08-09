@@ -64,6 +64,14 @@ does not include this turnless thread, although `thread/read` by exact ID does;
 Wipsaw therefore treats its own registry as the table of contents and never
 uses native list visibility as proof that a known thread disappeared.
 
+Launcher update, 2026-08-08: `wipsaw thread resume` now validates the target
+tab's account, home, and model-profile binding, then starts `codex resume` by
+exact native ID in that tab's tmux pane. It exports only non-secret Wipsaw and
+thread identifiers plus `CODEX_HOME`; the credential remains inside that home.
+A detached live smoke reached the Codex TUI login screen in a disposable,
+unauthenticated home. The launch command restores the configured login shell
+when Codex exits.
+
 ### SPIKE-003: Wiphand runtime and Docker executor inventory
 
 Status: Passed
@@ -103,6 +111,143 @@ references, canonicalizes Codex-home paths, and prevents one writable home from
 being assigned to two accounts. Unit and live CLI tests passed. Authentication
 and concurrent app-server proof remain outstanding, so this spike is still only
 partially passed.
+
+### SPIKE-012: Navigator and shell-shortcut viability
+
+Status: Passed for the local alpha
+Decision: Keep Ratatui as the control surface and tmux as the durable PTY owner
+
+Validated locally with Ratatui 0.30.2, Crossterm 0.29.0, tmux 3.4, Bash, and
+the user's Oh My Zsh setup:
+
+- rendered and exited both the wide test backend and a real 80-column
+  pseudo-terminal without leaving raw or alternate-screen state behind;
+- created a workspace and tab through the interactive prompts and confirmed
+  their SQLite and tmux records;
+- injected `codex`, `manager`, `lumberg`, and `lumbergh` only in Wipsaw shells;
+- detected that a pre-existing `.zshrc` `codex` function outranked a PATH-only
+  shim, then proved the managed rc loads the user's configuration first and
+  the Wipsaw function last;
+- confirmed the private tmux environment and managed `Ctrl-b w`, `Ctrl-b c`,
+  `Ctrl-b ,`, and `Ctrl-b m` bindings.
+
+Result: the initial TUI and shortcut architecture is usable without changing
+global shell files. Nested SSH, custom shell profiles beyond Bash/Zsh, and the
+bundled-tmux distribution matrix remain follow-up work.
+
+Hardening update, 2026-08-08: repeated navigator prefix bindings now use a
+session guard, making `Ctrl-b w` a close/toggle while the popup is active
+instead of allowing recursively nested popups. Wipsaw also reloads its private
+tmux config for live registered workspaces after upgrades.
+
+Dashboard update, 2026-08-08: replaced the equal-weight three-table landing
+screen with a manager-first Home view and separate Sessions, Threads, and WIPs
+views. Live 144×42 and 80×24 pseudo-terminal checks confirmed that Lumbergh,
+the primary action, navigation, selected workspace, and key guidance remain
+visible across both layout tiers. The wide layout uses the source W logo's
+center notch and saw cutout as Unicode full/half-block art; the compact layout
+uses a one-cell badge. Ratatui backend tests cover both sizes and the first-run
+Home-to-manager prompt flow.
+
+Runtime recovery update, 2026-08-08: a stopped real workspace reproduced stale
+`display-message` and attach failures because persisted tmux window IDs outlived
+the private session. Activation now reconstructs all registered windows and
+transactionally reconciles reused targets. The stopped workspace recovered its
+Middle Manager entry point and existing native thread mapping, a second live
+workspace received its own Middle Manager, and repeated starts retained the
+same ordinary terminal processes.
+
+Exact-session recovery follow-up, 2026-08-09: Wipsaw now adopts a supplied
+native Codex ID without creating a summary replacement, persists the owning
+home, tab, and working directory, and reopens every bound conversation when a
+workspace is reconstructed. Linux writer locks prevent a conversation from
+being opened twice; an active outside writer produces a durable deferred import
+instead of a false success. An isolated fake-Codex smoke test killed the private
+tmux server, started the workspace again, reconstructed both windows, and
+launched the same native ID a second time with one reported reopen and zero
+failures.
+
+### SPIKE-013: First-run Codex app-server recovery
+
+Status: Passed for the local alpha
+
+The first real managed workspace exposed an intermittent app-server close
+during `initialize`. The same registered Codex home and request subsequently
+passed direct initialization, `wipsaw home probe`, and eight concurrent probe
+processes, so authentication and the request shape were not the failure.
+
+The adapter now captures bounded app-server stderr, retries transient startup
+and pipe closes three times with backoff, and returns an initialization-specific
+error with a `wipsaw init` recovery path. Tests cover both a server that closes
+twice before succeeding and a persistent failure whose stderr must reach the
+operator. `wipsaw init` provides an idempotent first-run verification command,
+and new or previously unconfigured tabs inherit the preferred current home.
+
+### SPIKE-015: Embedded manager transport and capability isolation
+
+Status: Passed for the local alpha
+Decision: Supports ADR-009
+
+Tested locally with Codex CLI 0.147.0, the user's existing ChatGPT
+authentication, Ratatui, and the private Wipsaw MCP stdio server:
+
+- replaced raw Codex TUI attachment with asynchronous `codex exec --json` and
+  exact-ID `exec resume` turns rendered inside Wipsaw;
+- created one durable Lumbergh record for Home and a distinct Middle Manager
+  record for each registered workspace;
+- fixed both manager types to `gpt-5.6-terra` with medium reasoning;
+- generated private manager Codex homes that reference, rather than copy, the
+  selected home's `auth.json`, ignore user config/rules, and install only the
+  `wipsaw-manager` skill (later expanded by the verified follow-up below);
+- disabled personal MCPs, plugins, apps, unrelated skills, image, multi-agent,
+  and shell tools; and
+- exposed exactly `manager_guide` and `run_wipsaw` through a required private
+  MCP server whose CLI argument arrays are validated and cannot attach a TUI.
+
+The first general-shell prototype failed under nested Landlock/bwrap sandboxing.
+That result strengthened the boundary: the manager now calls a narrow Wipsaw
+capability instead of receiving a shell. A manual MCP initialize/list/call
+handshake returned only the two expected tools. Live dashboard and workspace
+turns both completed, persisted different native thread IDs, and showed the
+real registered workspace state without leaving the Ratatui UI.
+
+Limitations: the allowlist covers only currently implemented host commands.
+WIP CRUD, service operations, audit policy, cancellation, concurrent turns,
+and the public WIP/runtime MCP remain future work. This private manager MCP is
+not the public extension/runtime server planned for the WIP transplant.
+
+Composer/runtime follow-up, 2026-08-08: a live private tmux server retained
+Node 12 in `PATH` while the registered npm Codex 0.147 installation belonged to
+Node 20, causing its JavaScript launcher to fail on top-level `await`. Codex
+startup, app-server, health, and manager launches now find and prepend the
+runtime paired with the registered Codex binary. The embedded composer also
+gained multiline bracketed paste, scoped `@` file and `$` skill completion,
+bounded file attachment, and manager-only clipboard actions using tmux plus
+OSC 52.
+
+Manager UX/capability follow-up, 2026-08-09: manager homes now copy the complete
+`skill-creator` and `skill-installer` packages beside `wipsaw-manager`, and the
+`$` picker advertises all three while unrelated skills remain disabled. The
+composer uses a blank `λ` prompt. JSONL reasoning, MCP calls, completion,
+failure, and token usage are upserted in the response box. Idle screens no
+longer repaint continuously, and a transcript-only copy view selects exact
+source offsets with mouse or keyboard even when IDs visually wrap. The
+validated manager command
+surface now includes `workspace delete <exact-id> --yes`; application guards
+stop the live tmux session, reject self-deletion or a working Middle Manager,
+and cascade only the target workspace's tabs and manager history. Unit tests
+cover all three skill packages, progress transitions, copy-view isolation,
+delete confirmation, and database cascades.
+
+The live harness also caught two transport-specific regressions before release.
+Marking the mixed `run_wipsaw` gateway itself destructive caused
+non-interactive Codex to cancel even `workspace list`; destructive intent now
+stays on the validated `--yes` subcommand and application guards. Codex's stdio
+MCP launcher also sanitizes inherited variables, so Wipsaw supplies its
+config/state/data/runtime paths, tmux target, executable, and Middle Manager
+scope explicitly in the MCP server configuration. A second live run listed the
+isolated registry correctly, then had Lumbergh delete a disposable workspace,
+stop its exact tmux session, and report the managed ID in the response box.
 
 ## Priority spikes
 

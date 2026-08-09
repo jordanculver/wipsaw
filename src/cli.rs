@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -21,11 +22,13 @@ pub struct Cli {
     pub json: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Adopt and verify the active Codex home, authentication, and app-server.
+    Init,
     /// Check local Wipsaw dependencies and state.
     Doctor,
     /// Manage durable tmux-backed workspaces.
@@ -40,6 +43,31 @@ pub enum Command {
     Thread(ThreadArgs),
     /// Manage reusable model and Codex launch profiles.
     Profile(ProfileArgs),
+    /// Internal entry points used by Wipsaw-managed shell shortcuts.
+    #[command(hide = true)]
+    Shortcut(ShortcutArgs),
+    /// Private MCP server used by embedded Wipsaw managers.
+    #[command(hide = true)]
+    ManagerMcp,
+}
+
+#[derive(Debug, Args)]
+pub struct ShortcutArgs {
+    #[command(subcommand)]
+    pub command: ShortcutCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShortcutCommand {
+    /// Resume or create the Codex thread assigned to the current tab.
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    /// Open this workspace's embedded Middle Manager.
+    Manager,
+    /// Open the single top-level Lumbergh manager in the dashboard.
+    Lumbergh,
 }
 
 #[derive(Debug, Args)]
@@ -50,7 +78,7 @@ pub struct WorkspaceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCommand {
-    /// Create a private tmux session with a manager tab.
+    /// Create a private tmux session with a Middle Manager tab.
     Create {
         name: String,
         #[arg(long, default_value = ".")]
@@ -61,8 +89,32 @@ pub enum WorkspaceCommand {
     },
     /// List registered workspaces.
     List,
+    /// Start or reconstruct a stopped workspace and its Middle Manager.
+    Start { workspace: String },
+    /// Permanently remove a workspace and stop its private tmux session.
+    Delete {
+        workspace: String,
+        /// Confirm this destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Manage the exact file and directory allowlist for this workspace's Middle Manager.
+    Context {
+        #[command(subcommand)]
+        command: WorkspaceContextCommand,
+    },
     /// Attach to a workspace by name or ID.
     Attach { workspace: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceContextCommand {
+    /// Add one existing file or directory to the Middle Manager's read scope.
+    Add { workspace: String, path: PathBuf },
+    /// List the Middle Manager's explicit read scope.
+    List { workspace: String },
+    /// Remove one file or directory from the Middle Manager's read scope.
+    Remove { workspace: String, path: PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -197,6 +249,26 @@ pub enum ThreadCommand {
         #[arg(long)]
         tab: Option<String>,
     },
+    /// Adopt and open an exact existing native Codex session without creating a new conversation.
+    Import {
+        native_thread_id: String,
+        #[arg(long)]
+        home: String,
+        #[arg(long)]
+        workspace: String,
+        /// Existing destination tab. Omit to create a durable tab.
+        #[arg(long)]
+        tab: Option<String>,
+        /// Name for a newly created tab. Defaults to the native session name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace a different thread currently bound to --tab without deleting its history.
+        #[arg(long)]
+        replace_existing: bool,
+        /// Attach to the imported session after opening it.
+        #[arg(long)]
+        attach: bool,
+    },
     /// List Wipsaw-managed Codex threads, optionally for one home.
     List {
         #[arg(long)]
@@ -204,12 +276,52 @@ pub enum ThreadCommand {
     },
     /// Read current metadata from the owning Codex home by exact native ID.
     Inspect { thread: String },
+    /// Permanently delete a native Codex thread and its Wipsaw record.
+    Delete {
+        thread: String,
+        /// Confirm this destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Replace a tab's shell with the mapped Codex TUI, then return to the shell on exit.
+    Resume {
+        thread: String,
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        tab: String,
+        /// Attach to the workspace after launching Codex.
+        #[arg(long)]
+        attach: bool,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    if matches!(&cli.command, Some(Command::ManagerMcp)) {
+        return crate::manager::run_manager_mcp_server();
+    }
     let mut app = WipsawApp::from_env()?;
     match cli.command {
-        Command::Doctor => {
+        None => crate::tui::run(&mut app)?,
+        Some(Command::Init) => {
+            let report = app.initialize()?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("Wipsaw initialization: {}", report.status);
+                println!(
+                    "  account: {} via home '{}'",
+                    report.codex.account_alias, report.codex.home_name
+                );
+                println!("  Codex home: {}", report.codex.configured_path);
+                println!("  Codex: {}", report.codex.codex_version);
+                println!("  app-server: ready");
+                println!("  shortcuts: {}", report.shortcut_bin.display());
+                println!("  tmux socket: {}", report.tmux_socket);
+                println!("  next: run `wipsaw`");
+            }
+        }
+        Some(Command::Doctor) => {
             let report = DoctorReport::collect(&app);
             if cli.json {
                 print_json(&report)?;
@@ -228,14 +340,15 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("  state: {}", report.paths.state);
             }
         }
-        Command::Workspace(args) => match args.command {
+        Some(Command::Workspace(args)) => match args.command {
             WorkspaceCommand::Create { name, cwd, attach } => {
                 let workspace = app.create_workspace(&name, &cwd)?;
+                app.start_workspace(&workspace.id)?;
                 if cli.json {
                     print_json(&workspace)?;
                 } else {
                     println!(
-                        "created workspace '{}' ({}) on tmux session {}",
+                        "created workspace '{}' ({}) with its Middle Manager ready on tmux session {}",
                         workspace.name, workspace.id, workspace.tmux_session
                     );
                 }
@@ -265,9 +378,91 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            WorkspaceCommand::Start { workspace } => {
+                let started = app.start_workspace(&workspace)?;
+                output(cli.json, &started, || {
+                    let mut message = if started.restored {
+                        format!(
+                            "restored workspace '{}' with its Middle Manager ready",
+                            started.workspace.name
+                        )
+                    } else {
+                        format!(
+                            "workspace '{}' is running with its Middle Manager ready",
+                            started.workspace.name
+                        )
+                    };
+                    if !started.reopened_threads.is_empty() {
+                        message.push_str(&format!(
+                            "; reopened {} Codex conversation(s)",
+                            started.reopened_threads.len()
+                        ));
+                    }
+                    if !started.reopen_failures.is_empty() {
+                        message.push_str(&format!(
+                            "; {} conversation(s) need attention",
+                            started.reopen_failures.len()
+                        ));
+                    }
+                    message
+                })?;
+            }
+            WorkspaceCommand::Delete { workspace, yes } => {
+                if !yes {
+                    return Err(WipsawError::InvalidInput {
+                        field: "workspace delete",
+                        message: "requires --yes because this removes its tabs and manager history"
+                            .to_string(),
+                    });
+                }
+                let deleted = app.delete_workspace(&workspace)?;
+                output(cli.json, &deleted, || {
+                    format!(
+                        "deleted workspace '{}' ({}) and {} native Codex thread(s)",
+                        deleted.workspace.name,
+                        deleted.workspace.id,
+                        deleted.deleted_threads.len()
+                            + usize::from(deleted.deleted_manager_thread_id.is_some())
+                    )
+                })?;
+            }
+            WorkspaceCommand::Context { command } => match command {
+                WorkspaceContextCommand::Add { workspace, path } => {
+                    let context = app.add_workspace_context(&workspace, &path)?;
+                    output(cli.json, &context, || {
+                        format!(
+                            "added {} '{}' to the Middle Manager context",
+                            context.kind,
+                            context.path.display()
+                        )
+                    })?;
+                }
+                WorkspaceContextCommand::List { workspace } => {
+                    let contexts = app.list_workspace_contexts(&workspace)?;
+                    if cli.json {
+                        print_json(&contexts)?;
+                    } else if contexts.is_empty() {
+                        println!("this workspace's Middle Manager has no file context");
+                    } else {
+                        for context in contexts {
+                            println!("{:<9} {}", context.kind, context.path.display());
+                        }
+                    }
+                }
+                WorkspaceContextCommand::Remove { workspace, path } => {
+                    let context = app.remove_workspace_context(&workspace, &path)?;
+                    output(cli.json, &context, || {
+                        format!(
+                            "removed {} '{}' from the Middle Manager context",
+                            context.kind,
+                            context.path.display()
+                        )
+                    })?;
+                }
+            },
             WorkspaceCommand::Attach { workspace } => app.attach_workspace(&workspace)?,
         },
-        Command::Tab(args) => match args.command {
+        Some(Command::Tab(args)) => match args.command {
             TabCommand::Create {
                 workspace,
                 name,
@@ -331,7 +526,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 output(cli.json, &tab, || format!("renamed tab to '{}'", tab.name))?;
             }
         },
-        Command::Account(args) => match args.command {
+        Some(Command::Account(args)) => match args.command {
             AccountCommand::Add {
                 alias,
                 auth,
@@ -364,7 +559,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Command::Home(args) => match args.command {
+        Some(Command::Home(args)) => match args.command {
             HomeCommand::Add {
                 name,
                 account,
@@ -410,7 +605,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
-        Command::Thread(args) => match args.command {
+        Some(Command::Thread(args)) => match args.command {
             ThreadCommand::Create {
                 name,
                 home,
@@ -442,6 +637,37 @@ pub fn run(cli: Cli) -> Result<()> {
                         thread.name, thread.id, thread.native_thread_id
                     )
                 })?;
+            }
+            ThreadCommand::Import {
+                native_thread_id,
+                home,
+                workspace,
+                tab,
+                name,
+                replace_existing,
+                attach,
+            } => {
+                let imported = app.import_codex_session(
+                    &workspace,
+                    &home,
+                    &native_thread_id,
+                    tab.as_deref(),
+                    name.as_deref(),
+                    replace_existing,
+                )?;
+                output(cli.json, &imported, || {
+                    let mut message = format!(
+                        "imported native Codex session '{}' as thread '{}' in tab '{}'",
+                        imported.thread.native_thread_id, imported.thread.id, imported.tab.name
+                    );
+                    if let Some(reason) = &imported.deferred_reason {
+                        message.push_str(&format!("; launch deferred: {reason}"));
+                    }
+                    message
+                })?;
+                if attach && imported.launch.is_some() {
+                    app.activate_tab(&imported.workspace_id, &imported.tab.id)?;
+                }
             }
             ThreadCommand::List { home } => {
                 let threads = app.list_codex_threads(home.as_deref())?;
@@ -487,8 +713,43 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            ThreadCommand::Delete { thread, yes } => {
+                if !yes {
+                    return Err(WipsawError::InvalidInput {
+                        field: "thread delete",
+                        message:
+                            "requires --yes because native Codex history is permanently removed"
+                                .to_string(),
+                    });
+                }
+                let deleted = app.delete_codex_thread(&thread)?;
+                output(cli.json, &deleted, || {
+                    format!(
+                        "deleted Codex thread '{}' ({}, native {})",
+                        deleted.name, deleted.thread_id, deleted.native_thread_id
+                    )
+                })?;
+            }
+            ThreadCommand::Resume {
+                thread,
+                workspace,
+                tab,
+                attach,
+            } => {
+                app.start_workspace(&workspace)?;
+                let launch = app.resume_codex_thread(&thread, &workspace, &tab)?;
+                output(cli.json, &launch, || {
+                    format!(
+                        "resumed Codex thread '{}' in tab '{}'",
+                        launch.thread_id, launch.tab_id
+                    )
+                })?;
+                if attach {
+                    app.activate_tab(&launch.workspace_id, &launch.tab_id)?;
+                }
+            }
         },
-        Command::Profile(args) => match args.command {
+        Some(Command::Profile(args)) => match args.command {
             ProfileCommand::Add {
                 name,
                 model,
@@ -535,6 +796,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        Some(Command::Shortcut(args)) => match args.command {
+            ShortcutCommand::Codex { args } => app.run_codex_shortcut(&args)?,
+            ShortcutCommand::Manager => app.run_manager_shortcut()?,
+            ShortcutCommand::Lumbergh => app.run_lumbergh_shortcut()?,
+        },
+        Some(Command::ManagerMcp) => unreachable!("manager MCP is handled before app startup"),
     }
     Ok(())
 }

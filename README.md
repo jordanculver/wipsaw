@@ -1,14 +1,19 @@
-# Wipsaw
+<p align="center">
+  <img src="assets/brand/wipsaw-logo.png" alt="Wipsaw angular W with a saw-tooth cutout" width="420">
+</p>
+
+<h1 align="center">Wipsaw</h1>
 
 Wipsaw is a Linux-first, tmux-style workspace for managing Codex terminals,
 multiple Codex and ChatGPT accounts, remote hosts, and scheduled WIPs inherited
 from Wiphand.
 
-The project is currently in its first executable alpha slice. The Rust CLI can
-create and inspect private tmux workspaces/tabs, register isolated account and
-Codex-home metadata, and create named native Codex threads with Wipsaw-managed
-IDs. The Ratatui navigator, interactive thread launcher, WIP runtime transplant,
-secret-provider integration, and MCP server are not implemented yet.
+The project is currently in its first usable alpha slice. The Rust CLI and
+Ratatui navigator can create and inspect private tmux workspaces/tabs, register
+isolated account and Codex-home metadata, and create, inspect, and resume named
+native Codex threads with Wipsaw-managed IDs. The WIP runtime transplant,
+settings editor, secret-provider integration, and public WIP MCP surface are
+not implemented yet. A private, capability-scoped manager MCP server is live.
 
 ## Quick start
 
@@ -19,18 +24,129 @@ toolchain, the Codex CLI, and tmux 3.4 or later.
 git clone https://github.com/jordanculver/wipsaw.git
 cd wipsaw
 cargo install --path .
+wipsaw init
 wipsaw doctor
-wipsaw home list
-wipsaw workspace create development --cwd "$PWD"
-wipsaw workspace attach development
+wipsaw
+```
+
+`wipsaw init` adopts the active `CODEX_HOME` and existing authentication,
+verifies the exact Codex binary and app-server handshake, installs the managed
+shell shortcuts, and prints the selected account/home before anything is
+launched. It is safe to rerun as a setup or repair check.
+
+The navigator opens on a dashboard instead of dropping a new user into several
+empty tables. Lumbergh—the one top-level manager—is embedded directly on Home
+and is ready as soon as Wipsaw starts. Press `Enter` to focus its composer and
+describe what you want to set up, run, or inspect. Press `m` from any view to
+return to Lumbergh. Use `c` to create a workspace; every workspace receives a
+separate embedded **Middle Manager** that is opened from its manager tab in
+Sessions.
+
+Lumbergh and every Middle Manager run as resumable `codex exec --json` threads
+with `gpt-5.6-terra` and medium reasoning. Their generated Codex homes link the
+selected account's existing `auth.json` without copying it, ignore personal
+Codex configuration, and expose only `$wipsaw-manager`, `$skill-creator`, and
+`$skill-installer` (the built-in skill lookup/installer) plus a private Wipsaw
+MCP surface for validated Wipsaw operations and scoped file browsing/search/read.
+Personal MCPs, plugins, apps, unrelated skills, shell execution,
+image tools, and multi-agent tools are not loaded into manager sessions.
+
+Core manager workflows use typed tools instead of making the model assemble CLI
+positionals. `workspace_overview` returns workspaces with their tabs;
+`create_codex_tab` atomically creates, binds, and launches a real Codex session;
+`start_codex_session` repairs or restarts an existing tab and verifies that its
+process is running; raw `tab create` is explicitly shell-only;
+`codex_history_search` and `codex_history_read` find query-focused excerpts from
+native sessions across registered homes and the standard local `~/.codex`
+history; `import_codex_session` adopts the exact native session ID and opens its
+full original conversation in a durable tab; and `create_handoff_tab` creates a
+separate, summary-seeded conversation only when that is what the user asks for.
+An unregistered local history home is persisted during a Lumbergh import after
+its account is resolved, so the mapping remains restartable. Legacy rollout
+files are read only when an older home cannot initialize the current app-server.
+History handoffs include only user and final-assistant text, omit tool output
+and reasoning, redact likely credential assignments, and remain bounded before
+they reach a manager turn.
+
+The blank `λ` manager composer is a real multiline editor: arrows move the
+caret, Home/End move within a line, Ctrl-Left/Ctrl-Right move by word, Delete
+and Backspace edit at the caret, and mouse clicks place it. `Enter` sends;
+`Shift+Enter` or `Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker
+and `$` for allowed skills. Lumbergh has machine-wide read access: type `@/` and
+continue through directories to browse from the filesystem root. Each Middle
+Manager is technically confined to an explicit file/directory allowlist seeded
+with the workspace's `--cwd`. Selected text files are attached to the model
+prompt; directory references attach a bounded listing and become browse/search
+targets for the manager's private tools. Credential-like and out-of-scope paths
+are rejected. Codex
+reasoning, tool calls, completion state, failures, and token usage appear in
+the same response box as the final answer. Outside the composer, `v` opens a
+manager-only exact-text copy view, `y`
+copies the latest manager response, and `Y` copies the transcript; `Ctrl-O`
+opens the selection view and `Ctrl-Y` copies the latest response while
+composing. Page Up/Page Down or the mouse wheel scroll the conversation without
+leaving the composer; progress updates preserve the user's history position.
+Copy mode is an in-app exact-text view: mouse-drag or Shift+arrows selects only
+the manager transcript—even when a session ID visually wraps—and `y` or Enter
+copies the selection. `Ctrl-A` selects all, `Y` copies the whole transcript,
+Page Up/Page Down scroll, and Esc returns to the dashboard.
+
+Middle Manager authority is enforced by workspace ID as well: it sees and
+manages only its own workspace, tabs, and threads; cannot create or delete
+workspaces; cannot change global accounts or Codex homes; and cannot broaden
+its own file scope. Ask Lumbergh—or use the explicit CLI context commands—to
+make those cross-cutting changes.
+
+Use `1` through `4` for Home, Sessions, Threads, and WIPs; `Tab` cycles between
+those views. `c` creates a workspace, `n` creates and starts a named Codex
+session, and `t` creates a shell tab. Press `Enter` for the current view's
+primary action and `?` for the complete guide. The layout collapses from a
+dashboard with navigation and live system status to a compact header at narrow
+terminal widths.
+
+Opening any stopped workspace or one of its tabs automatically reconstructs
+the private tmux session from Wipsaw's registry, reconciles new tmux window
+IDs, restores its Middle Manager entry point, and reopens every bound Codex TUI
+at its exact native session ID and saved working directory. One unavailable
+home or missing directory is reported for that tab without blocking recovery of
+the workspace's other conversations. To repair or warm one without attaching,
+run:
+
+```bash
+wipsaw workspace start "workspace name"
+```
+
+Lumbergh can also remove a workspace after resolving its exact ID and
+confirming the request. The equivalent explicit CLI command is destructive and
+requires `--yes`:
+
+```bash
+wipsaw workspace delete ws_... --yes
+```
+
+Deletion now removes the workspace's tmux runtime, Middle Manager history and
+native manager thread, and native Codex threads owned by its tabs. A native
+deletion failure leaves the durable workspace record in place for a safe retry.
+Manage a Middle Manager's context explicitly with:
+
+```bash
+wipsaw workspace context list "workspace name"
+wipsaw workspace context add "workspace name" /absolute/project-or-file
+wipsaw workspace context remove "workspace name" /absolute/project-or-file
 ```
 
 On a new Wipsaw registry, the first command automatically adopts the active
 `CODEX_HOME`, or `~/.codex` when that variable is unset, as the `current`
 account and home. Wipsaw references that directory in place, so the user's
 existing Codex authentication, sessions, settings, skills, and plugins remain
-available without another login or copied credential. Set
+available to ordinary Codex tabs without another login or copied credential;
+manager sessions retain the isolated surface described above. Set
 `WIPSAW_AUTO_ADOPT_CODEX=0` to disable this behavior.
+
+App-server initialization is retried three times for transient process and
+pipe failures. If all attempts fail, Wipsaw includes the captured Codex stderr
+and points back to `wipsaw init` instead of returning only a closed-protocol
+message.
 
 Power users can then register additional, isolated account identities and
 Codex homes:
@@ -66,7 +182,56 @@ wipsaw thread create "API implementation" \
 
 wipsaw thread list --home company-home
 wipsaw thread inspect thread_...
+wipsaw thread import 019fab4e-fc47-75c1-9be8-66050a58add7 \
+  --home company-home \
+  --workspace development \
+  --name "Existing API session" \
+  --attach
+wipsaw thread delete thread_... --yes
+wipsaw thread resume thread_... \
+  --workspace development \
+  --tab api \
+  --attach
 ```
+
+`thread import` creates no new native conversation: it validates the supplied
+session in its source home, records the exact native ID, creates or rebinds a
+tab, and opens the original history. Add `--tab <tab> --replace-existing` to
+replace a disposable tab binding while retaining its old conversation as an
+unbound Wipsaw thread. If the same native session is already open in another
+Codex terminal, Wipsaw safely saves the exact mapping and reports a deferred
+launch; opening the workspace after that outside writer closes starts it in the
+mapped tab automatically. `thread resume` opens an already managed thread in
+its target tab. Both use the owning Codex home and existing authentication;
+when Codex exits, Wipsaw starts the managed shell again in that tab.
+
+Every Wipsaw shell preserves the user's Bash or Zsh configuration, including
+Oh My Zsh, and then installs tab-aware commands without changing global shell
+files:
+
+- `codex [resume options]` resumes the tab's mapped thread, creating and naming
+  it on first use with the tab's home/account/model settings;
+- `manager` opens the current workspace's Middle Manager;
+- `lumberg` and `lumbergh` return to the single dashboard Lumbergh;
+- `Ctrl-b w` opens the navigator as a tmux popup, `Ctrl-b c` opens its managed
+  tab-creation prompt, `Ctrl-b ,` renames the current managed tab, and
+  `Ctrl-b m` opens the current workspace's Middle Manager.
+
+Common navigator controls are `h/j/k/l`, arrow keys, `1`/`2`/`3`/`4`, `Tab`,
+`Enter`, `c`, `n`, `t`, `m`, `v` for manager-only selection, `,` to rename a
+focused tab, `r` to refresh, and `q` to close. Its prefix mode accepts `Ctrl-b`
+followed by `w`, `s`, `t`, `g`, `m`, `n`, `p`, `c`, `?`, or `q`.
+
+## Navigator design
+
+<p align="center">
+  <img src="docs/images/wipsaw-dashboard-concept.png" alt="Wipsaw manager-first terminal dashboard design reference" width="960">
+</p>
+
+The image above is the implementation reference. The live TUI uses real
+registry, tmux, Codex, account, model-profile, and dependency state; it does
+not invent sample sessions. WIPs are visibly marked as the next runtime slice
+until the Wiphand scheduler transplant is connected.
 
 API-key and access-token accounts require a reference such as
 `secret://account/company-openai`; the CLI rejects raw credential-looking
@@ -85,6 +250,7 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 
 - Linux only.
 - Rust host application with Ratatui and Clap.
+- MIT license.
 - A private tmux server provides durable terminal windows and panes.
 - A tested tmux build will be bundled as a fallback when the host has no
   compatible tmux installation.
@@ -105,7 +271,11 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - UUIDv7-backed typed IDs such as `ws_...`, `tab_...`, `acct_...`, and
   `thread_...`.
 - Generated Wipsaw-only tmux config and private socket.
-- Workspace create/list/attach and tab create/list/rename.
+- Workspace create/list/start/attach/delete and tab create/list/rename. Delete
+  requires `--yes`, stops the private tmux session, permanently deletes native
+  tab and Middle Manager threads, and removes the workspace registry graph.
+  Opening a stopped workspace recreates its windows from durable metadata and
+  updates reused tmux targets transactionally.
 - Dependency doctor for tmux, Codex, Docker, Compose, and SSH.
 - Account/home registration with canonical paths and one-account-per-home
   enforcement.
@@ -116,4 +286,42 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - Codex app-server home probing plus native thread create/name/inspect with the
   native ID, rollout path, resolved model, and Wipsaw ID persisted atomically
   with an optional tab binding.
-- Human-readable and JSON output suitable for the future MCP/manager layer.
+- Exact native-session adoption and Codex TUI resume inside mapped tmux tabs,
+  with one-writer safety, account/home compatibility checks, persistent
+  tab/thread/cwd mappings, and automatic conversation reopen during workspace
+  reconstruction.
+- One persistent Lumbergh on the dashboard and one separate Middle Manager per
+  workspace, all embedded in Wipsaw instead of attaching a raw Codex TUI.
+- Resumable manager turns through `codex exec --json`, fixed to Terra/medium,
+  with reasoning/tool progress and token usage rendered inline, persistent
+  transcript history, and exact native thread IDs.
+- A blank `λ` multiline manager composer with bracketed paste, scoped `@` file
+  and `$` skill completion, working transcript scrolling, response/transcript
+  clipboard actions, and a manager-only in-app copy view whose exact selection
+  remains intact across visual line wrapping.
+- Codex launch and health-check PATH repair that selects the Node runtime
+  belonging to a registered npm Codex installation instead of inheriting stale
+  tmux state.
+- Private manager Codex homes containing only the Wipsaw manager,
+  `skill-creator`, and `skill-installer` skills, plus a capability-scoped Wipsaw MCP
+  server with validated operations and enforced file tools. Lumbergh can read
+  machine-wide while each Middle Manager is confined to durable workspace
+  context rows. Manager turns ignore inherited user configuration and disable
+  shell, personal MCPs, plugins, apps, unrelated skills, image generation, and
+  multi-agent tools.
+- A responsive, manager-first dashboard with separate Home, Sessions, Threads,
+  and WIPs views, onboarding guidance, live dependency/account summaries, and
+  create/rename prompts.
+- The exact Wipsaw source logo for GitHub plus a faithful Unicode block-cell W
+  and saw-tooth mark in the wide terminal navigation rail.
+- Wipsaw-only `codex`, `manager`, `lumberg`, and `lumbergh` overrides that are
+  loaded after the user's Bash/Zsh/Oh My Zsh configuration without editing it.
+- `Ctrl-b w` navigator popup plus managed `Ctrl-b c`, `Ctrl-b ,`, and
+  `Ctrl-b m` bindings in the private tmux server. Navigator popups are guarded
+  per session, so repeating a popup binding toggles/closes instead of nesting.
+- Human-readable and JSON output shared by the CLI and validated private
+  manager MCP layer.
+
+## License
+
+Wipsaw is released under the [MIT License](LICENSE).

@@ -9,8 +9,8 @@ Platform: Linux only
 Wipsaw is a terminal workspace for people who operate several Codex sessions
 and scheduled AI jobs. It combines a familiar tmux interaction model with
 named Codex tabs, multiple accounts and Codex homes, WIP scheduling, execution
-observation, remote Linux hosts, and a persistent Codex manager named
-Lumbergh.
+observation, remote Linux hosts, one top-level Codex manager named Lumbergh,
+and a workspace-scoped Middle Manager for every workspace.
 
 Wipsaw is both human-operated and agent-operable. Every important TUI action
 must have a structured CLI or MCP equivalent so Lumbergh can manage the same
@@ -50,7 +50,8 @@ environment without simulating keystrokes.
 | Run | One scheduled or manually triggered occurrence of a WIP. |
 | Execution | The observable Docker, Codex, or process execution underlying a run. |
 | Host | The local machine or a configured Linux SSH server. |
-| Lumbergh | The pinned manager Codex thread that operates Wipsaw through structured tools. |
+| Lumbergh | The single top-level manager thread embedded in the Home dashboard. |
+| Middle Manager | A separate manager thread scoped to one workspace and opened from that workspace's manager tab. |
 
 ## Primary users
 
@@ -72,12 +73,20 @@ remote session persistence, path-aware profiles, and one local navigator.
 
 ## Core experience
 
-Launching `wipsaw` opens or reattaches the selected workspace. A branded tmux
-status line shows tabs. The current tab is an ordinary shell or Codex TUI. A
-Wipsaw navigator can be opened as a popup or pinned drawer.
+Launching `wipsaw` opens a manager-first Home dashboard with Lumbergh embedded
+directly in it, so a new user can type a request without leaving Wipsaw or
+learning its information architecture first. Lumbergh is the one top manager
+across the environment. Creating a workspace adds a separate Middle Manager
+scoped to that workspace. Both manager types use the selected machine's
+existing Codex authentication, resumable non-interactive Codex threads, and a
+private Wipsaw-only tool surface. A branded tmux status line shows tabs, and
+the navigator can also be opened as a popup or pinned drawer from an ordinary
+shell or Codex TUI.
 
 Navigator modes:
 
+- Home: manager entry point, quick actions, active workspace, live system and
+  identity summary, onboarding, and honest notices for unavailable runtimes.
 - Sessions: workspaces, tabs, panes, Codex threads, activity, account, model.
 - WIPs: schedules, next run, current run, health, last result.
 - Runs: queued/running/completed/failed executions and artifacts.
@@ -100,7 +109,7 @@ The initial prefix remains `Ctrl-b`. Wipsaw preserves common tmux meanings:
 | `Ctrl-b %` / `"` | Split the current tab. |
 | `Ctrl-b &` | Close a tab after showing what will remain resumable. |
 | `Ctrl-b w` | Toggle the Wipsaw navigator. |
-| `Ctrl-b m` | Select or create Lumbergh. |
+| `Ctrl-b m` | Open the current workspace's Middle Manager. |
 | `Ctrl-b e` | Open settings for the current tab or WIP. |
 | `Ctrl-b g` | Open the WIP schedule view. |
 
@@ -112,18 +121,32 @@ policy checks even when invoked by Lumbergh.
 ### Workspaces, tabs, and terminals
 
 - Create, rename, reorder, move, detach, reattach, archive, and delete tabs.
+- Delete a workspace only through an exact resolved target and explicit
+  confirmation; stop its private tmux session, permanently delete native Codex
+  threads owned by its tabs and Middle Manager, and cascade its tabs, context,
+  and scoped manager history without touching Lumbergh. If native deletion
+  fails, keep the durable workspace graph available for a safe retry.
 - Restore Wipsaw after its TUI or daemon restarts; tmux remains the durable PTY
-  owner.
+  owner. If the private tmux session itself is gone, opening the workspace must
+  reconstruct registered tabs, reconcile ephemeral window IDs, and restore the
+  Middle Manager entry point and native thread mapping without requiring manual
+  database repair.
 - Support bash and zsh initially, including user-selected rc files and
   Oh My Zsh configuration.
 - Inject Wipsaw shortcuts without editing the user's global shell files.
-- Provide `codex`, `manager`, and `lumberg` commands inside managed shells.
+- Provide `codex`, `manager`, `lumberg`, and `lumbergh` commands inside managed
+  shells. `manager` targets the current Middle Manager; `lumberg` and
+  `lumbergh` target the one dashboard Lumbergh.
 - Resolve and validate a working directory on the selected host.
 - Allow custom status-line themes, navigator themes, and key maps.
 
 ### Codex sessions
 
 - Create, name, list, search, resume, fork, archive, and inspect threads.
+- Adopt an exact existing native thread from any registered local Codex home,
+  bind it to one durable tab, and retain its original history and ID. If that
+  thread already has a writer in another terminal, persist the mapping and
+  defer launch rather than starting a competing writer.
 - Track thread ID together with host, Codex home, account, working directory,
   Codex version, model profile, and originating tab or run.
 - Use the Codex app-server protocol when compatible and a versioned CLI adapter
@@ -232,7 +255,53 @@ nonexistent implementation.
 
 ### Agent management
 
-- Lumbergh operates Wipsaw through structured CLI and MCP operations.
+- One Lumbergh coordinates the whole environment; every workspace owns one
+  Middle Manager that escalates cross-workspace decisions to Lumbergh.
+- Managers run through resumable `codex exec --json` threads at the configured
+  manager model/effort default, initially `gpt-5.6-terra` with medium effort.
+- Manager Codex homes reuse the selected account's authentication by reference
+  while ignoring inherited user configuration.
+- Manager sessions expose only the Wipsaw manager, `skill-creator`, and
+  `skill-installer` skills plus private validated Wipsaw MCP tools. The latter
+  is presented as the built-in skill lookup/installer. Managers do not inherit
+  personal MCPs, plugins, apps, unrelated skills, shell execution, image tools,
+  or multi-agent tools.
+- Typed manager tools list workspaces with their tabs, create a new tab with an
+  immediately bound and running Codex session, start or repair a session in an
+  existing tab, search and read bounded native Codex history, and atomically
+  create a launched tab whose new thread begins with a curated handoff summary.
+  Raw tab creation is shell-only and cannot be reported as a Codex session. The
+  standard local Codex home remains searchable read-only even when it is not
+  registered as a destination home.
+- Historical excerpts contain only user and final-assistant text; tool output,
+  reasoning, likely credential assignments, and excess context are excluded.
+- Lumbergh has machine-wide read access through credential-filtered private
+  file tools and lazy absolute-path `@` browsing. Every Middle Manager is
+  technically restricted to explicit file/directory context rows owned by its
+  workspace; workspace creation seeds the selected working directory, and the
+  user or Lumbergh can add/remove roots.
+- A Middle Manager's workspace ID also constrains Wipsaw operations: it cannot
+  target another workspace, create/delete workspaces, change global identity
+  homes, or mutate its own scope. It escalates those operations to Lumbergh.
+- The embedded composer supports UTF-8-safe caret movement and insertion across
+  lines, Home/End and word navigation, deletion, multiline paste, mouse caret
+  placement, scoped `@` file completion, `$` completion over the skills allowed
+  in that manager home, and a blank `λ` prompt instead of placeholder content.
+  Referenced file contents
+  are bounded, credential-filtered, and confined to the same enforced scope as
+  the private file tools.
+- Codex reasoning, tool calls, completion/failure state, and usage render in
+  order inside the manager response box before the final answer.
+- Copy actions target the latest manager response or its transcript. A
+  manager-only exact-text view supports mouse and keyboard selection without
+  selecting the surrounding dashboard or inserting visual-wrap newlines.
+- Long manager conversations scroll relative to the live bottom. Composer mode
+  keeps prompt arrows for editing while Page Up/Down and the mouse wheel move
+  history without progress snapping it back. The transcript-only view supports
+  mouse drag, Shift+arrows, Page Up/Down, Home/End, select-all, and explicit
+  clipboard copy.
+- Manager mutations trigger inventory reconciliation so tabs, Codex bindings,
+  thread details, and dashboard counts update without a manual refresh.
 - Human TUI, CLI, and MCP actions call the same application services.
 - The manager can organize tabs, create WIPs, inspect runs, change safe
   settings, and report health.
@@ -297,7 +366,8 @@ Docker log handles, Wiphand migration, model overrides, and Linux packaging.
 ### Slice 1: local session workspace
 
 Private tmux, Rust launcher/controller, tabs, navigator, one or more Codex
-homes, model profiles, naming/resume, settings inspector, and Lumbergh CLI.
+homes, model profiles, naming/resume, settings inspector, embedded Lumbergh,
+workspace Middle Managers, and the private manager MCP surface.
 
 ### Slice 2: WIP runtime
 

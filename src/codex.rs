@@ -1,7 +1,13 @@
+use std::collections::HashSet;
+use std::env;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +18,8 @@ use crate::error::{Result, WipsawError};
 use crate::model::{CodexHome, ModelProfile};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_ATTEMPTS: usize = 3;
+const RETRY_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CodexHomeProbe {
@@ -52,10 +60,30 @@ pub struct NativeCodexThreadInspection {
     pub native_updated_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeCodexHistoryMessage {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeCodexHistoryTurn {
+    pub turn_id: String,
+    pub status: String,
+    pub messages: Vec<NativeCodexHistoryMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeCodexThreadHistory {
+    pub thread: NativeCodexThreadInspection,
+    pub turns: Vec<NativeCodexHistoryTurn>,
+}
+
 pub fn probe_home(home: &CodexHome) -> Result<CodexHomeProbe> {
     let version_output = Command::new(&home.codex_binary)
         .arg("--version")
         .env("CODEX_HOME", &home.path)
+        .env("PATH", launch_path(home))
         .output()
         .map_err(|error| WipsawError::ExecutableUnavailable {
             program: home.codex_binary.display().to_string(),
@@ -106,6 +134,18 @@ pub fn start_named_thread(
     name: &str,
     profile: Option<&ModelProfile>,
 ) -> Result<NativeCodexThread> {
+    start_named_thread_with_handoff(home, cwd, name, profile, None)
+}
+
+/// Create a named thread and optionally append a curated handoff to its
+/// model-visible history without running an agent turn.
+pub fn start_named_thread_with_handoff(
+    home: &CodexHome,
+    cwd: &Path,
+    name: &str,
+    profile: Option<&ModelProfile>,
+    handoff: Option<&str>,
+) -> Result<NativeCodexThread> {
     let mut client = AppServerClient::connect(home)?;
     let params = thread_start_params(cwd, profile);
     let response = client.request("thread/start", Value::Object(params))?;
@@ -127,6 +167,24 @@ pub fn start_named_thread(
         return Err(error);
     }
 
+    if let Some(handoff) = handoff {
+        let injected = client.request(
+            "thread/inject_items",
+            json!({
+                "threadId": native_thread_id,
+                "items": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": handoff}]
+                }]
+            }),
+        );
+        if let Err(error) = injected {
+            let _ = client.request("thread/delete", json!({"threadId": native_thread_id}));
+            return Err(error);
+        }
+    }
+
     Ok(NativeCodexThread {
         native_thread_id,
         name: name.to_string(),
@@ -144,9 +202,231 @@ pub fn start_named_thread(
     })
 }
 
+/// Load an existing native Codex thread without starting a turn.
+///
+/// App-server documents `thread/resume` as returning the same runtime metadata
+/// as `thread/start`. Wipsaw uses that response to adopt a pre-existing
+/// conversation under its durable ID while leaving the conversation history
+/// and native thread ID unchanged.
+pub fn resume_native_thread(home: &CodexHome, native_thread_id: &str) -> Result<NativeCodexThread> {
+    let mut client = AppServerClient::connect(home)?;
+    let response = client.request("thread/resume", json!({"threadId": native_thread_id}))?;
+    let result = response.get("result").ok_or_else(|| {
+        WipsawError::CodexProtocol("thread/resume response did not contain a result".to_string())
+    })?;
+    let thread = result.get("thread").ok_or_else(|| {
+        WipsawError::CodexProtocol(
+            "thread/resume response did not contain result.thread".to_string(),
+        )
+    })?;
+    let returned_id = required_string(thread, "id", "thread/resume result.thread.id")?;
+    if returned_id != native_thread_id {
+        return Err(WipsawError::CodexProtocol(format!(
+            "thread/resume returned ID '{returned_id}' while '{native_thread_id}' was requested"
+        )));
+    }
+    let cwd = optional_string(result, "cwd")
+        .or_else(|| optional_string(thread, "cwd"))
+        .ok_or_else(|| {
+            WipsawError::CodexProtocol(
+                "thread/resume response did not contain a working directory".to_string(),
+            )
+        })?;
+    let model_provider = optional_string(result, "modelProvider")
+        .or_else(|| optional_string(thread, "modelProvider"))
+        .ok_or_else(|| {
+            WipsawError::CodexProtocol(
+                "thread/resume response did not contain a model provider".to_string(),
+            )
+        })?;
+    let name = optional_string(thread, "name")
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            optional_string(thread, "preview").and_then(|preview| {
+                preview
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| format!("Codex {}", short_native_id(native_thread_id)));
+
+    Ok(NativeCodexThread {
+        native_thread_id: returned_id,
+        name,
+        cwd: PathBuf::from(cwd),
+        // Older app-server builds can omit the resolved model on resume. The
+        // CLI still restores the model from the rollout; this value is display
+        // metadata and never becomes a command-line override.
+        model: optional_string(result, "model")
+            .or_else(|| optional_string(thread, "model"))
+            .unwrap_or_else(|| "saved-session".to_string()),
+        model_provider,
+        reasoning_effort: optional_string(result, "reasoningEffort")
+            .or_else(|| optional_string(thread, "reasoningEffort")),
+        status: thread_status(thread),
+        rollout_path: optional_string(thread, "path").map(PathBuf::from),
+        native_created_at: thread.get("createdAt").and_then(Value::as_i64),
+    })
+}
+
+/// Return whether another Codex process currently owns the native thread's
+/// Linux writer lock. A conversation may be read from multiple processes, but
+/// Codex intentionally permits only one writer at a time.
+pub fn native_thread_has_active_writer(home: &CodexHome, native_thread_id: &str) -> Result<bool> {
+    if native_thread_id.is_empty()
+        || !native_thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(WipsawError::InvalidInput {
+            field: "native Codex thread ID",
+            message: "must contain only ASCII letters, numbers, hyphens, or underscores"
+                .to_string(),
+        });
+    }
+    let lock_path = home
+        .path
+        .join("thread-writer-locks")
+        .join(format!("{native_thread_id}.lock"));
+    if !lock_path.is_file() {
+        return Ok(false);
+    }
+    let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    // SAFETY: `lock` owns a valid file descriptor for the duration of both
+    // calls. LOCK_NB ensures this check never waits behind another Codex TUI.
+    let acquired = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if acquired == 0 {
+        // SAFETY: this descriptor acquired the advisory lock immediately above.
+        let unlocked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        if unlocked != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error();
+    if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+        Ok(true)
+    } else {
+        Err(error.into())
+    }
+}
+
+/// List native Codex threads, including histories Wipsaw has not imported.
+/// Pagination is bounded so a manager cannot accidentally ingest an
+/// unbounded account history into one turn.
+pub fn list_native_threads(
+    home: &CodexHome,
+    requested_limit: usize,
+) -> Result<Vec<NativeCodexThreadInspection>> {
+    let limit = requested_limit.clamp(1, 500);
+    let mut client = AppServerClient::connect(home)?;
+    let mut cursor: Option<String> = None;
+    let mut threads = Vec::new();
+    while threads.len() < limit {
+        let page_size = (limit - threads.len()).min(100);
+        let mut params = Map::from_iter([
+            ("limit".to_string(), json!(page_size)),
+            (
+                "sourceKinds".to_string(),
+                json!([
+                    "cli",
+                    "vscode",
+                    "exec",
+                    "appServer",
+                    "subAgent",
+                    "subAgentReview",
+                    "subAgentCompact",
+                    "subAgentThreadSpawn",
+                    "subAgentOther",
+                    "unknown"
+                ]),
+            ),
+        ]);
+        if let Some(cursor) = &cursor {
+            params.insert("cursor".to_string(), Value::String(cursor.clone()));
+        }
+        let response = client.request("thread/list", Value::Object(params))?;
+        let result = response.get("result").ok_or_else(|| {
+            WipsawError::CodexProtocol("thread/list response did not contain a result".to_string())
+        })?;
+        let page = result
+            .get("data")
+            .or_else(|| result.get("threads"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                WipsawError::CodexProtocol(
+                    "thread/list response did not contain result.data".to_string(),
+                )
+            })?;
+        for thread in page {
+            threads.push(native_thread_inspection(thread)?);
+            if threads.len() == limit {
+                break;
+            }
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if page.is_empty() || cursor.is_none() {
+            break;
+        }
+    }
+    Ok(threads)
+}
+
+/// Read only user and final agent text from a native thread. Command output,
+/// tool payloads, and reasoning are intentionally excluded from manager
+/// history handoffs.
+pub fn read_native_thread_history(
+    home: &CodexHome,
+    native_thread_id: &str,
+) -> Result<NativeCodexThreadHistory> {
+    let mut client = AppServerClient::connect(home)?;
+    let response = client.request(
+        "thread/read",
+        json!({"threadId": native_thread_id, "includeTurns": true}),
+    )?;
+    let thread = response
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .ok_or_else(|| {
+            WipsawError::CodexProtocol(
+                "thread/read response did not contain result.thread".to_string(),
+            )
+        })?;
+    let inspection = native_thread_inspection(thread)?;
+    if inspection.native_thread_id != native_thread_id {
+        return Err(WipsawError::CodexProtocol(format!(
+            "thread/read returned ID '{}' while '{native_thread_id}' was requested",
+            inspection.native_thread_id
+        )));
+    }
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(history_turn)
+        .collect::<Vec<_>>();
+    Ok(NativeCodexThreadHistory {
+        thread: inspection,
+        turns,
+    })
+}
+
 pub fn archive_thread(home: &CodexHome, native_thread_id: &str) -> Result<()> {
     let mut client = AppServerClient::connect(home)?;
     client.request("thread/archive", json!({"threadId": native_thread_id}))?;
+    Ok(())
+}
+
+/// Permanently remove a native Codex thread and its persisted rollout data.
+pub fn delete_thread(home: &CodexHome, native_thread_id: &str) -> Result<()> {
+    let mut client = AppServerClient::connect(home)?;
+    client.request("thread/delete", json!({"threadId": native_thread_id}))?;
     Ok(())
 }
 
@@ -167,31 +447,75 @@ pub fn inspect_thread(
                 "thread/read response did not contain result.thread".to_string(),
             )
         })?;
-    let returned_id = required_string(thread, "id", "thread/read result.thread.id")?;
+    let inspection = native_thread_inspection(thread)?;
+    let returned_id = inspection.native_thread_id.as_str();
     if returned_id != native_thread_id {
         return Err(WipsawError::CodexProtocol(format!(
             "thread/read returned ID '{returned_id}' while '{native_thread_id}' was requested"
         )));
     }
+    Ok(inspection)
+}
+
+fn native_thread_inspection(thread: &Value) -> Result<NativeCodexThreadInspection> {
     Ok(NativeCodexThreadInspection {
-        native_thread_id: returned_id,
+        native_thread_id: required_string(thread, "id", "Codex thread.id")?,
         name: optional_string(thread, "name"),
-        cwd: PathBuf::from(required_string(
-            thread,
-            "cwd",
-            "thread/read result.thread.cwd",
-        )?),
-        model_provider: required_string(
-            thread,
-            "modelProvider",
-            "thread/read result.thread.modelProvider",
-        )?,
+        cwd: PathBuf::from(required_string(thread, "cwd", "Codex thread.cwd")?),
+        model_provider: required_string(thread, "modelProvider", "Codex thread.modelProvider")?,
         status: thread_status(thread),
         rollout_path: optional_string(thread, "path").map(PathBuf::from),
         preview: optional_string(thread, "preview").unwrap_or_default(),
         native_created_at: thread.get("createdAt").and_then(Value::as_i64),
         native_updated_at: thread.get("updatedAt").and_then(Value::as_i64),
     })
+}
+
+fn history_turn(turn: &Value) -> NativeCodexHistoryTurn {
+    let messages = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("userMessage") => {
+                let text = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|content| content.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.trim().is_empty()).then_some(NativeCodexHistoryMessage {
+                    role: "user".to_string(),
+                    text,
+                })
+            }
+            Some("agentMessage")
+                if item.get("phase").and_then(Value::as_str) != Some("commentary") =>
+            {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| NativeCodexHistoryMessage {
+                        role: "assistant".to_string(),
+                        text: text.to_string(),
+                    })
+            }
+            _ => None,
+        })
+        .collect();
+    NativeCodexHistoryTurn {
+        turn_id: optional_string(turn, "id").unwrap_or_else(|| "unknown".to_string()),
+        status: turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        messages,
+    }
 }
 
 fn thread_start_params(cwd: &Path, profile: Option<&ModelProfile>) -> Map<String, Value> {
@@ -256,6 +580,10 @@ fn optional_string(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
+fn short_native_id(native_thread_id: &str) -> &str {
+    native_thread_id.get(..8).unwrap_or(native_thread_id)
+}
+
 fn thread_status(thread: &Value) -> String {
     thread
         .get("status")
@@ -268,6 +596,7 @@ fn thread_status(thread: &Value) -> String {
 struct AppServerClient {
     stdin: std::process::ChildStdin,
     receiver: Receiver<std::io::Result<String>>,
+    diagnostics: CapturedStderr,
     next_id: i64,
     reported_home: String,
     _child: ChildGuard,
@@ -275,12 +604,40 @@ struct AppServerClient {
 
 impl AppServerClient {
     fn connect(home: &CodexHome) -> Result<Self> {
+        let mut last_error = None;
+        let mut attempts = 0;
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            attempts = attempt;
+            match Self::connect_once(home) {
+                Ok(client) => return Ok(client),
+                Err(error) => {
+                    let retry = retryable_connect_error(&error) && attempt < CONNECT_ATTEMPTS;
+                    last_error = Some(error);
+                    if !retry {
+                        break;
+                    }
+                    thread::sleep(RETRY_DELAY * attempt as u32);
+                }
+            }
+        }
+        let detail = last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown initialization failure".to_string());
+        Err(WipsawError::CodexInitialization {
+            home: home.name.clone(),
+            attempts,
+            detail,
+        })
+    }
+
+    fn connect_once(home: &CodexHome) -> Result<Self> {
         let mut child = Command::new(&home.codex_binary)
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", &home.path)
+            .env("PATH", launch_path(home))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: home.codex_binary.display().to_string(),
@@ -293,10 +650,15 @@ impl AppServerClient {
         let stdout = child.stdout.take().ok_or_else(|| {
             WipsawError::CodexProtocol("app-server stdout was unavailable".to_string())
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            WipsawError::CodexProtocol("app-server stderr was unavailable".to_string())
+        })?;
         let receiver = spawn_line_reader(stdout);
+        let diagnostics = CapturedStderr::spawn(stderr);
         let mut client = Self {
             stdin,
             receiver,
+            diagnostics,
             next_id: 1,
             reported_home: String::new(),
             _child: ChildGuard(child),
@@ -339,8 +701,11 @@ impl AppServerClient {
         send(
             &mut self.stdin,
             &json!({"method": method, "id": request_id, "params": params}),
-        )?;
-        wait_for_response(&self.receiver, request_id, method)
+        )
+        .map_err(|error| {
+            WipsawError::CodexProtocol(with_diagnostics(error.to_string(), &self.diagnostics))
+        })?;
+        wait_for_response(&self.receiver, &self.diagnostics, request_id, method)
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -348,7 +713,63 @@ impl AppServerClient {
             &mut self.stdin,
             &json!({"method": method, "params": params}),
         )
+        .map_err(|error| {
+            WipsawError::CodexProtocol(with_diagnostics(error.to_string(), &self.diagnostics))
+        })
     }
+}
+
+fn launch_path(home: &CodexHome) -> std::ffi::OsString {
+    let launcher_home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    codex_launch_path(&home.codex_binary, &launcher_home)
+}
+
+pub(crate) fn codex_launch_path(codex_binary: &Path, launcher_home: &Path) -> OsString {
+    let inherited = env::var_os("PATH").unwrap_or_default();
+    let mut entries = Vec::new();
+    if let Some(runtime) = codex_node_runtime(codex_binary, launcher_home) {
+        entries.push(runtime);
+    }
+    entries.extend(env::split_paths(&inherited));
+    let mut seen = HashSet::new();
+    entries.retain(|entry| seen.insert(entry.clone()));
+    env::join_paths(entries).unwrap_or(inherited)
+}
+
+/// npm's Codex entrypoint uses `#!/usr/bin/env node`. Long-lived tmux servers
+/// can retain an obsolete Node at the front of PATH, so locate the Node that
+/// belongs to the registered Codex installation and place it first.
+fn codex_node_runtime(codex_binary: &Path, launcher_home: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(codex_binary).ok();
+    for path in std::iter::once(codex_binary).chain(canonical.as_deref()) {
+        for ancestor in path.ancestors() {
+            let bin = ancestor.join("bin");
+            if bin.join("node").is_file() && bin.join("codex").exists() {
+                return Some(bin);
+            }
+        }
+    }
+
+    let script = fs::read_to_string(codex_binary).ok()?;
+    for marker in ["$HOME/", "${HOME}/"] {
+        let mut remainder = script.as_str();
+        while let Some(start) = remainder.find(marker) {
+            let after = &remainder[start + marker.len()..];
+            if let Some(end) = after.find("/bin/codex") {
+                let candidate = launcher_home.join(&after[..end + "/bin/codex".len()]);
+                if let Some(bin) = candidate.parent()
+                    && bin.join("node").is_file()
+                {
+                    return Some(bin.to_path_buf());
+                }
+            }
+            remainder = after;
+        }
+    }
+    None
 }
 
 fn send(stdin: &mut impl Write, value: &Value) -> Result<()> {
@@ -374,33 +795,109 @@ fn spawn_line_reader(
 
 fn wait_for_response(
     receiver: &Receiver<std::io::Result<String>>,
+    diagnostics: &CapturedStderr,
     request_id: i64,
     operation: &'static str,
 ) -> Result<Value> {
     loop {
-        let line = receiver
-            .recv_timeout(RESPONSE_TIMEOUT)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => WipsawError::Timeout {
-                    operation,
-                    seconds: RESPONSE_TIMEOUT.as_secs(),
-                },
-                mpsc::RecvTimeoutError::Disconnected => WipsawError::CodexProtocol(format!(
-                    "app-server closed while waiting for {operation}"
-                )),
-            })??;
+        let line = match receiver.recv_timeout(RESPONSE_TIMEOUT) {
+            Ok(line) => line?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(WipsawError::CodexProtocol(with_diagnostics(
+                    format!(
+                        "app-server timed out after {}s while waiting for {operation}",
+                        RESPONSE_TIMEOUT.as_secs()
+                    ),
+                    diagnostics,
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(WipsawError::CodexProtocol(with_diagnostics(
+                    format!("app-server closed while waiting for {operation}"),
+                    diagnostics,
+                )));
+            }
+        };
         let value: Value = serde_json::from_str(&line).map_err(|error| {
-            WipsawError::CodexProtocol(format!("invalid JSON from app-server: {error}"))
+            WipsawError::CodexProtocol(with_diagnostics(
+                format!("invalid JSON from app-server: {error}"),
+                diagnostics,
+            ))
         })?;
         if value.get("id").and_then(Value::as_i64) != Some(request_id) {
             continue;
         }
         if let Some(error) = value.get("error") {
-            return Err(WipsawError::CodexProtocol(format!(
-                "request {request_id} failed: {error}"
+            return Err(WipsawError::CodexProtocol(with_diagnostics(
+                format!("request {request_id} failed: {error}"),
+                diagnostics,
             )));
         }
         return Ok(value);
+    }
+}
+
+fn retryable_connect_error(error: &WipsawError) -> bool {
+    match error {
+        WipsawError::CodexProtocol(message) => {
+            message.contains("closed while waiting for initialize")
+                || message.contains("timed out")
+                || message.contains("Broken pipe")
+        }
+        // During initialization, any pipe I/O error can be a child startup
+        // race. Deterministic executable/config errors use other variants.
+        WipsawError::Io(_) => true,
+        WipsawError::Timeout { .. } => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Default)]
+struct CapturedStderr(Arc<Mutex<Vec<String>>>);
+
+impl CapturedStderr {
+    fn spawn(stderr: impl std::io::Read + Send + 'static) -> Self {
+        let captured = Self::default();
+        let writer = captured.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                let line = line
+                    .chars()
+                    .filter(|character| !character.is_control() || *character == '\t')
+                    .collect::<String>();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(mut lines) = writer.0.lock() {
+                    lines.push(line);
+                    if lines.len() > 12 {
+                        lines.remove(0);
+                    }
+                }
+            }
+        });
+        captured
+    }
+
+    fn snapshot(&self) -> String {
+        // stdout and stderr close together; give the stderr reader one short
+        // scheduling window before constructing the actionable error.
+        thread::sleep(Duration::from_millis(20));
+        let joined = self
+            .0
+            .lock()
+            .map(|lines| lines.join(" | "))
+            .unwrap_or_default();
+        joined.chars().take(2_000).collect()
+    }
+}
+
+fn with_diagnostics(message: String, diagnostics: &CapturedStderr) -> String {
+    let stderr = diagnostics.snapshot();
+    if stderr.is_empty() {
+        message
+    } else {
+        format!("{message}; stderr: {stderr}")
     }
 }
 
@@ -416,12 +913,17 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
 
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{inspect_thread, probe_home, start_named_thread};
+    use super::{
+        delete_thread, inspect_thread, list_native_threads, native_thread_has_active_writer,
+        probe_home, read_native_thread_history, resume_native_thread, start_named_thread,
+        start_named_thread_with_handoff,
+    };
     use crate::model::{CodexHome, ModelProfile};
 
     fn test_home(binary: std::path::PathBuf, path: std::path::PathBuf) -> CodexHome {
@@ -491,6 +993,10 @@ case "$request" in
   *thread/read*)
     printf '{"id":2,"result":{"thread":{"id":"native-123","name":"API work","preview":"","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/rollout.jsonl","cwd":"%s/project"}}}\n' "$CODEX_HOME" "$CODEX_HOME"
     ;;
+  *thread/delete*)
+    printf '%s\n' "$request" >> "$CODEX_HOME/requests.jsonl"
+    printf '%s\n' '{"id":2,"result":{}}'
+    ;;
 esac
 "#,
         )
@@ -534,5 +1040,196 @@ esac
         assert_eq!(inspection.name.as_deref(), Some("API work"));
         assert_eq!(inspection.status, "notLoaded");
         assert_eq!(inspection.native_updated_at, Some(1_700_000_001));
+
+        delete_thread(&home, "native-123").unwrap();
+        let requests = fs::read_to_string(home_path.join("requests.jsonl")).unwrap();
+        let delete = requests.lines().last().unwrap();
+        let delete: Value = serde_json::from_str(delete).unwrap();
+        assert_eq!(delete["method"], "thread/delete");
+        assert_eq!(delete["params"]["threadId"], "native-123");
+    }
+
+    #[test]
+    fn initialization_retries_transient_app_server_closes() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        fs::create_dir(&home_path).unwrap();
+        let binary = root.path().join("flaky-codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'codex-cli test'
+  exit 0
+fi
+counter="$CODEX_HOME/start-count"
+count=0
+if [ -r "$counter" ]; then count=$(sed -n '1p' "$counter"); fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$counter"
+if [ "$count" -lt 3 ]; then
+  printf '%s\n' 'temporary app-server startup failure' >&2
+  exit 1
+fi
+IFS= read -r initialize
+printf '{"id":1,"result":{"codexHome":"%s"}}\n' "$CODEX_HOME"
+IFS= read -r initialized
+IFS= read -r list
+printf '%s\n' '{"id":2,"result":{"data":[]}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let report = probe_home(&test_home(binary, home_path.clone())).unwrap();
+        assert!(report.app_server_compatible);
+        assert_eq!(
+            fs::read_to_string(home_path.join("start-count"))
+                .unwrap()
+                .trim(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn native_history_can_be_searched_read_and_injected_without_an_agent_turn() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        let project_path = home_path.join("project");
+        fs::create_dir_all(&project_path).unwrap();
+        let binary = root.path().join("history-codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '{"id":1,"result":{"codexHome":"%s"}}\n' "$CODEX_HOME"
+IFS= read -r initialized
+IFS= read -r request
+printf '%s\n' "$request" >> "$CODEX_HOME/history-requests.jsonl"
+case "$request" in
+  *thread/list*)
+    printf '{"id":2,"result":{"data":[{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/history.jsonl","cwd":"%s/project"}],"nextCursor":null}}\n' "$CODEX_HOME" "$CODEX_HOME"
+    ;;
+  *thread/read*)
+    printf '{"id":2,"result":{"thread":{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/history.jsonl","cwd":"%s/project","turns":[{"id":"turn-1","status":"completed","items":[{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"Which browser stores did we publish to?"}]},{"id":"comment-1","type":"agentMessage","phase":"commentary","text":"Checking now"},{"id":"agent-1","type":"agentMessage","phase":"final_answer","text":"The release notes list the Chrome and Edge stores."},{"id":"tool-1","type":"commandExecution","command":"secret","commandActions":[],"cwd":"/tmp","status":"completed","aggregatedOutput":"must not leak"}]}]}}}\n' "$CODEX_HOME" "$CODEX_HOME"
+    ;;
+  *thread/resume*)
+    printf '{"id":2,"result":{"thread":{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"status":{"type":"idle"},"path":"%s/history.jsonl","cwd":"%s/project"},"model":"gpt-saved","modelProvider":"openai","cwd":"%s/project","reasoningEffort":"high"}}\n' "$CODEX_HOME" "$CODEX_HOME" "$CODEX_HOME"
+    ;;
+  *thread/start*)
+    printf '{"id":2,"result":{"thread":{"id":"seeded-1","createdAt":1700000002,"status":{"type":"idle"},"path":"%s/seeded.jsonl"},"model":"gpt-test","modelProvider":"openai","cwd":"%s/project","reasoningEffort":"medium"}}\n' "$CODEX_HOME" "$CODEX_HOME"
+    IFS= read -r set_name
+    printf '%s\n' "$set_name" >> "$CODEX_HOME/history-requests.jsonl"
+    printf '%s\n' '{"id":3,"result":{}}'
+    IFS= read -r inject
+    printf '%s\n' "$inject" >> "$CODEX_HOME/history-requests.jsonl"
+    printf '%s\n' '{"id":4,"result":{}}'
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let home = test_home(binary, home_path.clone());
+
+        let listed = list_native_threads(&home, 20).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].native_thread_id, "history-1");
+        assert_eq!(listed[0].name.as_deref(), Some("Privacy Lens extension"));
+
+        let history = read_native_thread_history(&home, "history-1").unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].messages.len(), 2);
+        assert_eq!(history.turns[0].messages[0].role, "user");
+        assert!(
+            history.turns[0].messages[1]
+                .text
+                .contains("Chrome and Edge")
+        );
+        assert!(history.turns[0].messages.iter().all(|message| {
+            !message.text.contains("must not leak") && message.text != "Checking now"
+        }));
+
+        let resumed = resume_native_thread(&home, "history-1").unwrap();
+        assert_eq!(resumed.native_thread_id, "history-1");
+        assert_eq!(resumed.name, "Privacy Lens extension");
+        assert_eq!(resumed.model, "gpt-saved");
+        assert_eq!(resumed.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(resumed.status, "idle");
+
+        let seeded = start_named_thread_with_handoff(
+            &home,
+            &project_path,
+            "Privacy Lens follow-up",
+            None,
+            Some("Curated source facts"),
+        )
+        .unwrap();
+        assert_eq!(seeded.native_thread_id, "seeded-1");
+        let requests = fs::read_to_string(home_path.join("history-requests.jsonl")).unwrap();
+        let inject = requests
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|request| request["method"] == "thread/inject_items")
+            .unwrap();
+        assert_eq!(inject["params"]["threadId"], "seeded-1");
+        assert_eq!(
+            inject["params"]["items"][0]["content"][0]["text"],
+            "Curated source facts"
+        );
+    }
+
+    #[test]
+    fn active_native_writer_lock_is_detected_without_waiting() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        let lock_dir = home_path.join("thread-writer-locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("history-1.lock");
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: the test owns `held` until the lock is explicitly released.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let home = test_home(root.path().join("unused-codex"), home_path);
+        assert!(native_thread_has_active_writer(&home, "history-1").unwrap());
+        // SAFETY: `held` acquired this lock above.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert!(!native_thread_has_active_writer(&home, "history-1").unwrap());
+        assert!(native_thread_has_active_writer(&home, "../outside").is_err());
+    }
+
+    #[test]
+    fn initialization_error_includes_captured_stderr_and_recovery_hint() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        fs::create_dir(&home_path).unwrap();
+        let binary = root.path().join("broken-codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'codex-cli test'
+  exit 0
+fi
+printf '%s\n' 'fatal init: state database is locked' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = probe_home(&test_home(binary, home_path)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("after 3 attempt(s)"), "{message}");
+        assert!(
+            message.contains("fatal init: state database is locked"),
+            "{message}"
+        );
+        assert!(message.contains("wipsaw init"), "{message}");
     }
 }

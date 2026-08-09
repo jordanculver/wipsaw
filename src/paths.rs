@@ -74,6 +74,10 @@ impl AppPaths {
             fs::create_dir_all(path)?;
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
         }
+        fs::create_dir_all(self.shortcut_bin_dir())?;
+        fs::set_permissions(self.shortcut_bin_dir(), fs::Permissions::from_mode(0o700))?;
+        fs::create_dir_all(self.manager_homes_dir())?;
+        fs::set_permissions(self.manager_homes_dir(), fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
@@ -87,6 +91,26 @@ impl AppPaths {
 
     pub fn bundled_tmux_path(&self) -> PathBuf {
         self.data_dir.join("bin/tmux")
+    }
+
+    pub fn shortcut_bin_dir(&self) -> PathBuf {
+        self.data_dir.join("shortcuts/bin")
+    }
+
+    pub fn shell_dir(&self) -> PathBuf {
+        self.data_dir.join("shell")
+    }
+
+    pub fn shell_launcher_path(&self) -> PathBuf {
+        self.shell_dir().join("wipsaw-shell")
+    }
+
+    pub fn manager_homes_dir(&self) -> PathBuf {
+        self.data_dir.join("manager-homes")
+    }
+
+    pub fn manager_home_root(&self, source_codex_home_id: &str) -> PathBuf {
+        self.manager_homes_dir().join(source_codex_home_id)
     }
 }
 

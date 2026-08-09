@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use serde::Serialize;
 
@@ -15,6 +17,7 @@ set-option -g base-index 0
 set-option -g renumber-windows on
 set-option -g allow-rename off
 set-option -g automatic-rename off
+set-option -g set-clipboard on
 set-option -g status on
 set-option -g status-position bottom
 set-option -g status-interval 2
@@ -28,6 +31,10 @@ set-option -g pane-border-style 'fg=#334155'
 set-option -g pane-active-border-style 'fg=#5eead4'
 set-option -g message-style 'bg=#1f2937,fg=#e2e8f0'
 set-option -g mode-style 'bg=#0f766e,fg=#f8fafc'
+bind-key w if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} wipsaw"'
+bind-key c if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=new-tab wipsaw"'
+bind-key , if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=rename-tab wipsaw"'
+bind-key m if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=middle-manager -e WIPSAW_MANAGER_WORKSPACE=#{session_name} wipsaw"'
 "#;
 
 #[derive(Debug, Clone)]
@@ -35,6 +42,8 @@ pub struct TmuxBackend {
     binary: PathBuf,
     socket_name: String,
     config_path: PathBuf,
+    path_env: OsString,
+    shell_launcher: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +53,25 @@ pub struct TmuxWindow {
     pub name: String,
     pub active: bool,
     pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TmuxPaneContext {
+    pub session: String,
+    pub window_id: String,
+    pub window_name: String,
+    pub pane_id: String,
+}
+
+pub struct CodexTabLaunch<'a> {
+    pub session: &'a str,
+    pub window_id: &'a str,
+    pub cwd: &'a Path,
+    pub codex_home: &'a Path,
+    pub codex_binary: &'a Path,
+    pub managed_thread_id: &'a str,
+    pub native_thread_id: &'a str,
+    pub return_shell: &'a Path,
 }
 
 impl TmuxBackend {
@@ -65,6 +93,8 @@ impl TmuxBackend {
             binary,
             socket_name,
             config_path: paths.tmux_config_path(),
+            path_env: augmented_path(&paths.shortcut_bin_dir()),
+            shell_launcher: paths.shell_launcher_path(),
         }
     }
 
@@ -78,6 +108,12 @@ impl TmuxBackend {
         Ok(())
     }
 
+    pub fn reload_config(&self) -> Result<()> {
+        let config = self.config_path.as_os_str().to_owned();
+        let args = self.base_args(vec![OsString::from("source-file"), config]);
+        self.run(&args).map(|_| ())
+    }
+
     pub fn binary(&self) -> &Path {
         &self.binary
     }
@@ -89,6 +125,7 @@ impl TmuxBackend {
     pub fn version(&self) -> Result<String> {
         let output = Command::new(&self.binary)
             .arg("-V")
+            .env("PATH", &self.path_env)
             .output()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -101,6 +138,7 @@ impl TmuxBackend {
         let args = self.base_args(["has-session", "-t", session]);
         let output = Command::new(&self.binary)
             .args(&args)
+            .env("PATH", &self.path_env)
             .output()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -120,13 +158,22 @@ impl TmuxBackend {
             OsString::from("-s"),
             OsString::from(session),
             OsString::from("-n"),
-            OsString::from("manager"),
+            OsString::from("middle-manager"),
             OsString::from("-c"),
             path_arg(cwd),
+            OsString::from("-e"),
+            OsString::from("WIPSAW_MANAGED=1"),
+            OsString::from("-e"),
+            OsString::from(format!("WIPSAW_TMUX_SOCKET={}", self.socket_name)),
+            OsString::from("-e"),
+            environment_assignment("PATH", &self.path_env),
+            OsString::from(shell_quote(self.shell_launcher.as_os_str())),
         ]);
         let output = self.run(&args)?;
         let window = parse_window(output.trim())?;
         self.set_environment(session, "WIPSAW_MANAGED", "1")?;
+        self.set_environment(session, "WIPSAW_TMUX_SOCKET", &self.socket_name)?;
+        self.set_environment(session, "PATH", &self.path_env.to_string_lossy())?;
         Ok(window)
     }
 
@@ -148,6 +195,7 @@ impl TmuxBackend {
             OsString::from(name),
             OsString::from("-c"),
             path_arg(cwd),
+            OsString::from(shell_quote(self.shell_launcher.as_os_str())),
         ]);
         parse_window(self.run(&args)?.trim())
     }
@@ -161,6 +209,137 @@ impl TmuxBackend {
     pub fn rename_tab(&self, session: &str, window_id: &str, name: &str) -> Result<()> {
         let target = format!("{session}:{window_id}");
         let args = self.base_args(["rename-window", "-t", target.as_str(), name]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn select_tab(&self, session: &str, window_id: &str) -> Result<()> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args(["select-window", "-t", target.as_str()]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn switch_client(&self, session: &str) -> Result<()> {
+        let args = self.base_args(["switch-client", "-t", session]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn clear_navigator_guard(&self, session: &str) -> Result<()> {
+        let args = self.base_args([
+            "set-option",
+            "-q",
+            "-u",
+            "-t",
+            session,
+            "@wipsaw_navigator_open",
+        ]);
+        self.run(&args).map(|_| ())
+    }
+
+    pub fn window_command(&self, session: &str, window_id: &str) -> Result<String> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args([
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "#{pane_current_command}",
+        ]);
+        self.run(&args)
+    }
+
+    /// Detect the managed Codex process beneath a pane shell. The launch
+    /// wrapper intentionally keeps a shell as the pane leader so it can return
+    /// to an interactive prompt when Codex exits; `pane_current_command` alone
+    /// therefore cannot distinguish that active Codex child from an idle zsh.
+    pub fn window_has_managed_thread(
+        &self,
+        session: &str,
+        window_id: &str,
+        managed_thread_id: &str,
+    ) -> Result<bool> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args([
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "#{pane_pid}",
+        ]);
+        let output = self.run(&args)?;
+        let pane_pid = output
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| WipsawError::MalformedTmuxOutput(output))?;
+        Ok(process_tree_has_environment(
+            pane_pid,
+            "WIPSAW_THREAD_ID",
+            managed_thread_id,
+        ))
+    }
+
+    pub fn current_context(&self) -> Result<TmuxPaneContext> {
+        let pane_id = env::var("TMUX_PANE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "terminal context",
+                message: "this shortcut must run inside a Wipsaw tmux tab".to_string(),
+            })?;
+        let args = self.base_args([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id.as_str(),
+            "-F",
+            "#{session_name}\x1f#{window_id}\x1f#{window_name}\x1f#{pane_id}",
+        ]);
+        let output = self.run(&args)?;
+        let fields = tmux_fields(output.trim());
+        if fields.len() != 4 {
+            return Err(WipsawError::MalformedTmuxOutput(output));
+        }
+        Ok(TmuxPaneContext {
+            session: fields[0].to_string(),
+            window_id: fields[1].to_string(),
+            window_name: fields[2].to_string(),
+            pane_id: fields[3].to_string(),
+        })
+    }
+
+    pub fn launch_codex_in_tab(&self, launch: CodexTabLaunch<'_>) -> Result<()> {
+        let target = format!("{}:{}", launch.session, launch.window_id);
+        let command = codex_launch_command(
+            launch.cwd,
+            launch.codex_home,
+            launch.codex_binary,
+            launch.managed_thread_id,
+            launch.native_thread_id,
+            &self.shell_launcher,
+        );
+        let args = self.base_args(vec![
+            OsString::from("respawn-pane"),
+            OsString::from("-k"),
+            OsString::from("-t"),
+            OsString::from(target),
+            OsString::from(command),
+        ]);
+        self.run(&args).map(|_| ())
+    }
+
+    /// Stop the current foreground process and return a managed tab to its
+    /// configured interactive shell. Used when an imported Codex conversation
+    /// is safely mapped but still has an active writer in another terminal.
+    pub fn reset_tab_to_shell(&self, session: &str, window_id: &str, cwd: &Path) -> Result<()> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args(vec![
+            OsString::from("respawn-pane"),
+            OsString::from("-k"),
+            OsString::from("-t"),
+            OsString::from(target),
+            OsString::from("-c"),
+            path_arg(cwd),
+            OsString::from(shell_quote(self.shell_launcher.as_os_str())),
+        ]);
         self.run(&args).map(|_| ())
     }
 
@@ -183,6 +362,9 @@ impl TmuxBackend {
         let args = self.base_args(["attach-session", "-t", session]);
         let status = Command::new(&self.binary)
             .args(&args)
+            .env("PATH", &self.path_env)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .status()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -198,6 +380,35 @@ impl TmuxBackend {
                 stderr: "tmux attach failed".to_string(),
             })
         }
+    }
+
+    /// Copy without placing transcript content in the process argument list.
+    /// `-w` asks tmux to forward the buffer through its clipboard integration.
+    pub fn copy_to_clipboard(&self, text: &str) -> Result<()> {
+        let args = self.base_args(["load-buffer", "-w", "-"]);
+        let mut child = Command::new(&self.binary)
+            .args(&args)
+            .env("PATH", &self.path_env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| WipsawError::ExecutableUnavailable {
+                program: self.binary.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| WipsawError::CommandFailed {
+                program: self.binary.display().to_string(),
+                args: args_text(&args),
+                code: None,
+                stderr: "tmux clipboard stdin was unavailable".to_string(),
+            })?
+            .write_all(text.as_bytes())?;
+        let output = child.wait_with_output()?;
+        successful_output(&self.binary, &args, output).map(|_| ())
     }
 
     fn set_environment(&self, session: &str, name: &str, value: &str) -> Result<()> {
@@ -223,6 +434,7 @@ impl TmuxBackend {
     fn run(&self, args: &[OsString]) -> Result<String> {
         let output = Command::new(&self.binary)
             .args(args)
+            .env("PATH", &self.path_env)
             .output()
             .map_err(|error| WipsawError::ExecutableUnavailable {
                 program: self.binary.display().to_string(),
@@ -230,6 +442,20 @@ impl TmuxBackend {
             })?;
         successful_output(&self.binary, args, output)
     }
+}
+
+fn augmented_path(shortcut_bin_dir: &Path) -> OsString {
+    let existing = env::var_os("PATH").unwrap_or_default();
+    let entries =
+        std::iter::once(shortcut_bin_dir.to_path_buf()).chain(env::split_paths(&existing));
+    env::join_paths(entries).unwrap_or(existing)
+}
+
+fn environment_assignment(name: &str, value: &OsStr) -> OsString {
+    let mut assignment = OsString::from(name);
+    assignment.push("=");
+    assignment.push(value);
+    assignment
 }
 
 fn successful_output(program: &Path, args: &[OsString], output: Output) -> Result<String> {
@@ -244,6 +470,32 @@ fn successful_output(program: &Path, args: &[OsString], output: Output) -> Resul
     })
 }
 
+fn process_tree_has_environment(root_pid: u32, name: &str, value: &str) -> bool {
+    let expected = format!("{name}={value}").into_bytes();
+    let mut pending = vec![root_pid];
+    let mut visited = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        let environment = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected.as_slice())
+        {
+            return true;
+        }
+        let children =
+            fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+        pending.extend(
+            children
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok()),
+        );
+    }
+    false
+}
+
 fn args_text(args: &[OsString]) -> String {
     args.iter()
         .map(|arg| arg.to_string_lossy())
@@ -255,16 +507,36 @@ fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_owned()
 }
 
+fn codex_launch_command(
+    cwd: &Path,
+    codex_home: &Path,
+    codex_binary: &Path,
+    managed_thread_id: &str,
+    native_thread_id: &str,
+    return_command: &Path,
+) -> String {
+    format!(
+        "cd {} && env CODEX_HOME={} WIPSAW_THREAD_ID={} WIPSAW_NATIVE_THREAD_ID={} {} resume {}; exec {}",
+        shell_quote(cwd.as_os_str()),
+        shell_quote(codex_home.as_os_str()),
+        shell_quote(OsStr::new(managed_thread_id)),
+        shell_quote(OsStr::new(native_thread_id)),
+        shell_quote(codex_binary.as_os_str()),
+        shell_quote(OsStr::new(native_thread_id)),
+        shell_quote(return_command.as_os_str()),
+    )
+}
+
+fn shell_quote(value: &OsStr) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
 fn parse_window(line: &str) -> Result<TmuxWindow> {
     // tmux renders non-printing format separators as octal escapes when it
     // serializes formatted output (US, 0x1f, becomes the four bytes `\\037`).
     // Keep accepting the raw separator as well for compatibility with tmux
     // versions or control-mode transports that preserve it.
-    let fields = if line.contains("\\037") {
-        line.split("\\037").collect::<Vec<_>>()
-    } else {
-        line.split('\x1f').collect::<Vec<_>>()
-    };
+    let fields = tmux_fields(line);
     if fields.len() != 5 {
         return Err(WipsawError::MalformedTmuxOutput(line.to_string()));
     }
@@ -279,9 +551,30 @@ fn parse_window(line: &str) -> Result<TmuxWindow> {
     })
 }
 
+fn tmux_fields(line: &str) -> Vec<&str> {
+    if line.contains("\\037") {
+        line.split("\\037").collect::<Vec<_>>()
+    } else {
+        line.split('\x1f').collect::<Vec<_>>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_window;
+    use std::path::Path;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{TMUX_CONFIG, codex_launch_command, parse_window, process_tree_has_environment};
+
+    #[test]
+    fn popup_bindings_expand_the_parent_context_before_launch() {
+        assert!(TMUX_CONFIG.contains(
+            "run-shell -C \"display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name}"
+        ));
+        assert!(TMUX_CONFIG.contains("-e WIPSAW_PARENT_WINDOW=#{window_id}"));
+    }
 
     #[test]
     fn window_format_is_parsed() {
@@ -298,5 +591,47 @@ mod tests {
         assert_eq!(window.id, "@3");
         assert_eq!(window.index, 2);
         assert_eq!(window.cwd.to_string_lossy(), "/tmp/project");
+    }
+
+    #[test]
+    fn codex_launch_is_shell_quoted_and_returns_to_the_shell() {
+        let command = codex_launch_command(
+            Path::new("/tmp/Jordan's project"),
+            Path::new("/tmp/codex home"),
+            Path::new("/opt/Codex CLI/codex"),
+            "thread_managed",
+            "native-123",
+            Path::new("/bin/zsh"),
+        );
+        assert!(command.contains("cd '/tmp/Jordan'\"'\"'s project'"));
+        assert!(command.contains("CODEX_HOME='/tmp/codex home'"));
+        assert!(command.contains("'/opt/Codex CLI/codex' resume 'native-123'"));
+        assert!(command.ends_with("exec '/bin/zsh'"));
+    }
+
+    #[test]
+    fn managed_codex_child_is_detected_beneath_its_pane_shell() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 10")
+            .env("WIPSAW_THREAD_ID", "thread_managed")
+            .spawn()
+            .unwrap();
+        let detected = (0..20).any(|_| {
+            let detected =
+                process_tree_has_environment(child.id(), "WIPSAW_THREAD_ID", "thread_managed");
+            if !detected {
+                thread::sleep(Duration::from_millis(10));
+            }
+            detected
+        });
+        assert!(detected);
+        assert!(!process_tree_has_environment(
+            child.id(),
+            "WIPSAW_THREAD_ID",
+            "thread_other"
+        ));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }
