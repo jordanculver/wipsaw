@@ -262,6 +262,12 @@ nonexistent implementation.
   is presented as the built-in skill lookup/installer. Managers do not inherit
   personal MCPs, plugins, apps, unrelated skills, shell execution, image tools,
   or multi-agent tools.
+- Typed manager tools list workspaces with their tabs, search and read bounded
+  native Codex history, and atomically create a launched tab whose new thread
+  begins with a curated handoff summary. The standard local Codex home remains
+  searchable read-only even when it is not registered as a destination home.
+- Historical excerpts contain only user and final-assistant text; tool output,
+  reasoning, likely credential assignments, and excess context are excluded.
 - Lumbergh has machine-wide read access through credential-filtered private
   file tools and lazy absolute-path `@` browsing. Every Middle Manager is
   technically restricted to explicit file/directory context rows owned by its

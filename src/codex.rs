@@ -59,6 +59,25 @@ pub struct NativeCodexThreadInspection {
     pub native_updated_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeCodexHistoryMessage {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeCodexHistoryTurn {
+    pub turn_id: String,
+    pub status: String,
+    pub messages: Vec<NativeCodexHistoryMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeCodexThreadHistory {
+    pub thread: NativeCodexThreadInspection,
+    pub turns: Vec<NativeCodexHistoryTurn>,
+}
+
 pub fn probe_home(home: &CodexHome) -> Result<CodexHomeProbe> {
     let version_output = Command::new(&home.codex_binary)
         .arg("--version")
@@ -114,6 +133,18 @@ pub fn start_named_thread(
     name: &str,
     profile: Option<&ModelProfile>,
 ) -> Result<NativeCodexThread> {
+    start_named_thread_with_handoff(home, cwd, name, profile, None)
+}
+
+/// Create a named thread and optionally append a curated handoff to its
+/// model-visible history without running an agent turn.
+pub fn start_named_thread_with_handoff(
+    home: &CodexHome,
+    cwd: &Path,
+    name: &str,
+    profile: Option<&ModelProfile>,
+    handoff: Option<&str>,
+) -> Result<NativeCodexThread> {
     let mut client = AppServerClient::connect(home)?;
     let params = thread_start_params(cwd, profile);
     let response = client.request("thread/start", Value::Object(params))?;
@@ -135,6 +166,24 @@ pub fn start_named_thread(
         return Err(error);
     }
 
+    if let Some(handoff) = handoff {
+        let injected = client.request(
+            "thread/inject_items",
+            json!({
+                "threadId": native_thread_id,
+                "items": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": handoff}]
+                }]
+            }),
+        );
+        if let Err(error) = injected {
+            let _ = client.request("thread/delete", json!({"threadId": native_thread_id}));
+            return Err(error);
+        }
+    }
+
     Ok(NativeCodexThread {
         native_thread_id,
         name: name.to_string(),
@@ -149,6 +198,110 @@ pub fn start_named_thread(
         status: thread_status(thread),
         rollout_path: optional_string(thread, "path").map(PathBuf::from),
         native_created_at: thread.get("createdAt").and_then(Value::as_i64),
+    })
+}
+
+/// List native Codex threads, including histories Wipsaw has not imported.
+/// Pagination is bounded so a manager cannot accidentally ingest an
+/// unbounded account history into one turn.
+pub fn list_native_threads(
+    home: &CodexHome,
+    requested_limit: usize,
+) -> Result<Vec<NativeCodexThreadInspection>> {
+    let limit = requested_limit.clamp(1, 500);
+    let mut client = AppServerClient::connect(home)?;
+    let mut cursor: Option<String> = None;
+    let mut threads = Vec::new();
+    while threads.len() < limit {
+        let page_size = (limit - threads.len()).min(100);
+        let mut params = Map::from_iter([
+            ("limit".to_string(), json!(page_size)),
+            (
+                "sourceKinds".to_string(),
+                json!([
+                    "cli",
+                    "vscode",
+                    "exec",
+                    "appServer",
+                    "subAgent",
+                    "subAgentReview",
+                    "subAgentCompact",
+                    "subAgentThreadSpawn",
+                    "subAgentOther",
+                    "unknown"
+                ]),
+            ),
+        ]);
+        if let Some(cursor) = &cursor {
+            params.insert("cursor".to_string(), Value::String(cursor.clone()));
+        }
+        let response = client.request("thread/list", Value::Object(params))?;
+        let result = response.get("result").ok_or_else(|| {
+            WipsawError::CodexProtocol("thread/list response did not contain a result".to_string())
+        })?;
+        let page = result
+            .get("data")
+            .or_else(|| result.get("threads"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                WipsawError::CodexProtocol(
+                    "thread/list response did not contain result.data".to_string(),
+                )
+            })?;
+        for thread in page {
+            threads.push(native_thread_inspection(thread)?);
+            if threads.len() == limit {
+                break;
+            }
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if page.is_empty() || cursor.is_none() {
+            break;
+        }
+    }
+    Ok(threads)
+}
+
+/// Read only user and final agent text from a native thread. Command output,
+/// tool payloads, and reasoning are intentionally excluded from manager
+/// history handoffs.
+pub fn read_native_thread_history(
+    home: &CodexHome,
+    native_thread_id: &str,
+) -> Result<NativeCodexThreadHistory> {
+    let mut client = AppServerClient::connect(home)?;
+    let response = client.request(
+        "thread/read",
+        json!({"threadId": native_thread_id, "includeTurns": true}),
+    )?;
+    let thread = response
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .ok_or_else(|| {
+            WipsawError::CodexProtocol(
+                "thread/read response did not contain result.thread".to_string(),
+            )
+        })?;
+    let inspection = native_thread_inspection(thread)?;
+    if inspection.native_thread_id != native_thread_id {
+        return Err(WipsawError::CodexProtocol(format!(
+            "thread/read returned ID '{}' while '{native_thread_id}' was requested",
+            inspection.native_thread_id
+        )));
+    }
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(history_turn)
+        .collect::<Vec<_>>();
+    Ok(NativeCodexThreadHistory {
+        thread: inspection,
+        turns,
     })
 }
 
@@ -182,31 +335,75 @@ pub fn inspect_thread(
                 "thread/read response did not contain result.thread".to_string(),
             )
         })?;
-    let returned_id = required_string(thread, "id", "thread/read result.thread.id")?;
+    let inspection = native_thread_inspection(thread)?;
+    let returned_id = inspection.native_thread_id.as_str();
     if returned_id != native_thread_id {
         return Err(WipsawError::CodexProtocol(format!(
             "thread/read returned ID '{returned_id}' while '{native_thread_id}' was requested"
         )));
     }
+    Ok(inspection)
+}
+
+fn native_thread_inspection(thread: &Value) -> Result<NativeCodexThreadInspection> {
     Ok(NativeCodexThreadInspection {
-        native_thread_id: returned_id,
+        native_thread_id: required_string(thread, "id", "Codex thread.id")?,
         name: optional_string(thread, "name"),
-        cwd: PathBuf::from(required_string(
-            thread,
-            "cwd",
-            "thread/read result.thread.cwd",
-        )?),
-        model_provider: required_string(
-            thread,
-            "modelProvider",
-            "thread/read result.thread.modelProvider",
-        )?,
+        cwd: PathBuf::from(required_string(thread, "cwd", "Codex thread.cwd")?),
+        model_provider: required_string(thread, "modelProvider", "Codex thread.modelProvider")?,
         status: thread_status(thread),
         rollout_path: optional_string(thread, "path").map(PathBuf::from),
         preview: optional_string(thread, "preview").unwrap_or_default(),
         native_created_at: thread.get("createdAt").and_then(Value::as_i64),
         native_updated_at: thread.get("updatedAt").and_then(Value::as_i64),
     })
+}
+
+fn history_turn(turn: &Value) -> NativeCodexHistoryTurn {
+    let messages = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("userMessage") => {
+                let text = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|content| content.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.trim().is_empty()).then_some(NativeCodexHistoryMessage {
+                    role: "user".to_string(),
+                    text,
+                })
+            }
+            Some("agentMessage")
+                if item.get("phase").and_then(Value::as_str) != Some("commentary") =>
+            {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| NativeCodexHistoryMessage {
+                        role: "assistant".to_string(),
+                        text: text.to_string(),
+                    })
+            }
+            _ => None,
+        })
+        .collect();
+    NativeCodexHistoryTurn {
+        turn_id: optional_string(turn, "id").unwrap_or_else(|| "unknown".to_string()),
+        status: turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        messages,
+    }
 }
 
 fn thread_start_params(cwd: &Path, profile: Option<&ModelProfile>) -> Map<String, Value> {
@@ -605,7 +802,10 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{delete_thread, inspect_thread, probe_home, start_named_thread};
+    use super::{
+        delete_thread, inspect_thread, list_native_threads, probe_home, read_native_thread_history,
+        start_named_thread, start_named_thread_with_handoff,
+    };
     use crate::model::{CodexHome, ModelProfile};
 
     fn test_home(binary: std::path::PathBuf, path: std::path::PathBuf) -> CodexHome {
@@ -770,6 +970,84 @@ printf '%s\n' '{"id":2,"result":{"data":[]}}'
                 .unwrap()
                 .trim(),
             "3"
+        );
+    }
+
+    #[test]
+    fn native_history_can_be_searched_read_and_injected_without_an_agent_turn() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        let project_path = home_path.join("project");
+        fs::create_dir_all(&project_path).unwrap();
+        let binary = root.path().join("history-codex");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '{"id":1,"result":{"codexHome":"%s"}}\n' "$CODEX_HOME"
+IFS= read -r initialized
+IFS= read -r request
+printf '%s\n' "$request" >> "$CODEX_HOME/history-requests.jsonl"
+case "$request" in
+  *thread/list*)
+    printf '{"id":2,"result":{"data":[{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/history.jsonl","cwd":"%s/project"}],"nextCursor":null}}\n' "$CODEX_HOME" "$CODEX_HOME"
+    ;;
+  *thread/read*)
+    printf '{"id":2,"result":{"thread":{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/history.jsonl","cwd":"%s/project","turns":[{"id":"turn-1","status":"completed","items":[{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"Which browser stores did we publish to?"}]},{"id":"comment-1","type":"agentMessage","phase":"commentary","text":"Checking now"},{"id":"agent-1","type":"agentMessage","phase":"final_answer","text":"The release notes list the Chrome and Edge stores."},{"id":"tool-1","type":"commandExecution","command":"secret","commandActions":[],"cwd":"/tmp","status":"completed","aggregatedOutput":"must not leak"}]}]}}}\n' "$CODEX_HOME" "$CODEX_HOME"
+    ;;
+  *thread/start*)
+    printf '{"id":2,"result":{"thread":{"id":"seeded-1","createdAt":1700000002,"status":{"type":"idle"},"path":"%s/seeded.jsonl"},"model":"gpt-test","modelProvider":"openai","cwd":"%s/project","reasoningEffort":"medium"}}\n' "$CODEX_HOME" "$CODEX_HOME"
+    IFS= read -r set_name
+    printf '%s\n' "$set_name" >> "$CODEX_HOME/history-requests.jsonl"
+    printf '%s\n' '{"id":3,"result":{}}'
+    IFS= read -r inject
+    printf '%s\n' "$inject" >> "$CODEX_HOME/history-requests.jsonl"
+    printf '%s\n' '{"id":4,"result":{}}'
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let home = test_home(binary, home_path.clone());
+
+        let listed = list_native_threads(&home, 20).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].native_thread_id, "history-1");
+        assert_eq!(listed[0].name.as_deref(), Some("Privacy Lens extension"));
+
+        let history = read_native_thread_history(&home, "history-1").unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].messages.len(), 2);
+        assert_eq!(history.turns[0].messages[0].role, "user");
+        assert!(
+            history.turns[0].messages[1]
+                .text
+                .contains("Chrome and Edge")
+        );
+        assert!(history.turns[0].messages.iter().all(|message| {
+            !message.text.contains("must not leak") && message.text != "Checking now"
+        }));
+
+        let seeded = start_named_thread_with_handoff(
+            &home,
+            &project_path,
+            "Privacy Lens follow-up",
+            None,
+            Some("Curated source facts"),
+        )
+        .unwrap();
+        assert_eq!(seeded.native_thread_id, "seeded-1");
+        let requests = fs::read_to_string(home_path.join("history-requests.jsonl")).unwrap();
+        let inject = requests
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|request| request["method"] == "thread/inject_items")
+            .unwrap();
+        assert_eq!(inject["params"]["threadId"], "seeded-1");
+        assert_eq!(
+            inject["params"]["items"][0]["content"][0]["text"],
+            "Curated source facts"
         );
     }
 

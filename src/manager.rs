@@ -8,13 +8,21 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::codex::codex_launch_path;
+use crate::app::WipsawApp;
+use crate::codex::{
+    NativeCodexHistoryMessage, NativeCodexHistoryTurn, NativeCodexThreadHistory,
+    NativeCodexThreadInspection, codex_launch_path, inspect_thread, list_native_threads,
+    read_native_thread_history,
+};
 use crate::error::{Result, WipsawError};
-use crate::model::{CodexHome, ManagerKind, ManagerSession};
+use crate::model::{CodexHome, ManagerKind, ManagerSession, Tab, Workspace};
 use crate::paths::AppPaths;
+use crate::registry::Registry;
+use crate::tmux::TmuxBackend;
 
 pub const MANAGER_MODEL: &str = "gpt-5.6-terra";
 pub const MANAGER_REASONING_EFFORT: &str = "medium";
@@ -29,6 +37,8 @@ const MANAGER_SCOPE_ENV: &str = "WIPSAW_MANAGER_CONTEXT_SCOPE";
 const MAX_DIRECTORY_ENTRIES: usize = 20_000;
 const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCHED_ENTRIES: usize = 100_000;
+const MAX_HISTORY_THREADS: usize = 500;
+const MAX_HISTORY_EXCERPT_CHARS: usize = 64_000;
 
 const MANAGER_SKILL: &str = r#"---
 name: wipsaw-manager
@@ -40,8 +50,9 @@ description: Manage Wipsaw workspaces, tabs, Codex sessions, identities, model p
 Use only the tools from the `wipsaw` MCP server for Wipsaw operations.
 
 - Call `manager_guide` before the first operation in a session.
-- Call `run_wipsaw` with a structured `args` array. Always begin with `--json`.
-- Inspect current state before changing it.
+- Prefer purpose-built tools over `run_wipsaw`. Use `workspace_overview` for workspaces and tabs, `codex_history_search` plus `codex_history_read` for prior sessions, and `create_handoff_tab` for an atomic summary-based session handoff.
+- Use `run_wipsaw` only when no purpose-built tool covers the operation. Always begin its `args` array with `--json`.
+- Inspect current state before changing it. Pass exact IDs returned by inspection tools into mutations.
 - Wipsaw nouns are singular CLI groups. For example, list workspaces with `args: ["--json", "workspace", "list"]`.
 - Delete a workspace only after confirming the exact ID and the user's intent, then call `args: ["--json", "workspace", "delete", "<id>", "--yes"]`.
 - Lumbergh can manage a Middle Manager's explicit file scope with `workspace context list|add|remove`. A Middle Manager may list but cannot broaden or remove its own scope.
@@ -52,7 +63,8 @@ Use only the tools from the `wipsaw` MCP server for Wipsaw operations.
 - Never print, copy, or request raw authentication tokens. Work with Wipsaw account and Codex-home references.
 - Do not attach to a tmux client or launch an interactive TUI from this non-interactive manager session.
 - Explain destructive or externally visible operations before doing them.
-- Never invent a command result. If a Wipsaw command fails or returns no usable output, report the failure plainly and stop.
+- Never invent a command result. A read-only validation error may be corrected and retried once using the tool schema or returned usage. Continue independent work after a harmless read failure. Stop on a mutation failure or if the same read fails twice.
+- To create a tab from another Codex session, search native history, read query-focused excerpts, write a factual handoff summary, then call `create_handoff_tab`. Do not claim facts that were absent from the source excerpts.
 - If Wipsaw does not expose a requested operation yet, say so plainly and suggest the smallest safe next step.
 "#;
 
@@ -747,6 +759,18 @@ fn manager_mcp_response(request: &Value) -> Option<Value> {
                 .unwrap_or("");
             let result = match name {
                 "manager_guide" => manager_guide_tool(),
+                "workspace_overview" => {
+                    workspace_overview_tool(request.pointer("/params/arguments"))
+                }
+                "codex_history_search" => {
+                    codex_history_search_tool(request.pointer("/params/arguments"))
+                }
+                "codex_history_read" => {
+                    codex_history_read_tool(request.pointer("/params/arguments"))
+                }
+                "create_handoff_tab" => {
+                    create_handoff_tab_tool(request.pointer("/params/arguments"))
+                }
                 "run_wipsaw" => run_wipsaw_tool(request.pointer("/params/arguments")),
                 "context_list" => context_list_tool(),
                 "list_directory" => list_directory_tool(request.pointer("/params/arguments")),
@@ -799,6 +823,86 @@ fn manager_mcp_tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "workspace_overview",
+            "description": "List visible Wipsaw workspaces together with their registered and live tabs. Pass a workspace name or ID to narrow the result; no raw CLI positional arguments are needed.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "maxLength": 256 }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "codex_history_search",
+            "description": "Search native Codex session metadata across registered homes and the standard local ~/.codex history, including sessions Wipsaw has not imported. Search covers thread name, preview, and cwd. Use cwd to constrain a project when known.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 1, "maxLength": 512 },
+                    "cwd": { "type": "string", "maxLength": 4096 },
+                    "home": { "type": "string", "maxLength": 4096 },
+                    "maxResults": { "type": "integer", "minimum": 1, "maximum": 50 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "codex_history_read",
+            "description": "Read query-focused user/final-assistant excerpts from one native Codex session. Command output, tool payloads, reasoning, and likely credential assignments are excluded. Use the exact home and nativeThreadId returned by codex_history_search.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "home": { "type": "string", "maxLength": 4096 },
+                    "nativeThreadId": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "query": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                    "maxTurns": { "type": "integer", "minimum": 1, "maximum": 24 }
+                },
+                "required": ["home", "nativeThreadId", "query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "create_handoff_tab",
+            "description": "Atomically create a workspace tab, create and seed a native Codex thread from a curated historical summary, bind it, and launch Codex in the tab. Use exact workspace/home/thread IDs returned by read tools.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 96 },
+                    "cwd": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "sourceHome": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "sourceNativeThreadId": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "summary": { "type": "string", "minLength": 1, "maxLength": 48000 },
+                    "home": { "type": "string", "maxLength": 256 },
+                    "profile": { "type": "string", "maxLength": 256 }
+                },
+                "required": ["workspace", "name", "cwd", "sourceHome", "sourceNativeThreadId", "summary"],
                 "additionalProperties": false
             }
         },
@@ -922,6 +1026,831 @@ fn context_list_tool() -> Value {
         },
         Err(error) => manager_tool_result(&error.to_string(), true, None),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ManagerTabOverview {
+    #[serde(flatten)]
+    tab: Tab,
+    live: bool,
+    active: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagerWorkspaceOverview {
+    #[serde(flatten)]
+    workspace: Workspace,
+    live: bool,
+    tabs: Vec<ManagerTabOverview>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexHistorySearchHit {
+    score: usize,
+    home_id: String,
+    home_name: String,
+    home_path: PathBuf,
+    home_registered: bool,
+    account_alias: String,
+    native_thread_id: String,
+    name: Option<String>,
+    cwd: PathBuf,
+    preview: String,
+    status: String,
+    native_created_at: Option<i64>,
+    native_updated_at: Option<i64>,
+}
+
+fn open_manager_app() -> Result<WipsawApp> {
+    let paths = AppPaths::from_env()?;
+    paths.ensure()?;
+    let registry = Registry::open(&paths.registry_path())?;
+    let tmux = TmuxBackend::from_env(&paths);
+    tmux.write_config()?;
+    Ok(WipsawApp {
+        paths,
+        registry,
+        tmux,
+    })
+}
+
+fn history_homes(app: &WipsawApp, requested: Option<&str>) -> Result<Vec<(CodexHome, bool)>> {
+    if let Some(reference) = requested {
+        return resolve_history_home(app, reference).map(|home| vec![home]);
+    }
+    let registered = app.registry.list_codex_homes()?;
+    let mut homes = registered
+        .iter()
+        .cloned()
+        .map(|home| (home, true))
+        .collect::<Vec<_>>();
+    let mut standard_homes = BaseDirs::new()
+        .map(|base| vec![base.home_dir().join(".codex")])
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        standard_homes.push(home.join(".codex"));
+    }
+    standard_homes.sort();
+    standard_homes.dedup();
+    for standard in standard_homes {
+        if standard.is_dir() {
+            let standard = fs::canonicalize(standard)?;
+            let already_registered = registered.iter().any(|home| {
+                fs::canonicalize(&home.path)
+                    .map(|path| path == standard)
+                    .unwrap_or(false)
+            });
+            if !already_registered {
+                homes.push((transient_history_home(app, &standard)?, false));
+            }
+        }
+    }
+    Ok(homes)
+}
+
+fn resolve_history_home(app: &WipsawApp, reference: &str) -> Result<(CodexHome, bool)> {
+    if let Some(home) = app.registry.codex_home_by_ref(reference)? {
+        return Ok((home, true));
+    }
+    let path = reference
+        .strip_prefix("local:")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(reference));
+    if path.is_absolute() && path.join("sessions").is_dir() {
+        let path = fs::canonicalize(path)?;
+        return transient_history_home(app, &path).map(|home| (home, false));
+    }
+    Err(WipsawError::NotFound {
+        entity: "Codex history home",
+        value: reference.to_string(),
+    })
+}
+
+fn transient_history_home(app: &WipsawApp, path: &Path) -> Result<CodexHome> {
+    let template =
+        app.registry
+            .preferred_codex_home(None)?
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "Codex history home",
+                message: "register at least one Codex home before searching local legacy history"
+                    .to_string(),
+            })?;
+    Ok(CodexHome {
+        id: format!("local:{}", path.display()),
+        name: format!(
+            "local {}",
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("Codex home")
+        ),
+        host_id: template.host_id,
+        account_id: template.account_id,
+        account_alias: template.account_alias,
+        path: path.to_path_buf(),
+        codex_binary: template.codex_binary,
+        created_at: String::new(),
+        updated_at: String::new(),
+    })
+}
+
+fn legacy_rollout_files(home: &CodexHome, requested_limit: usize) -> Result<Vec<PathBuf>> {
+    let root = home.path.join("sessions");
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut queue = VecDeque::from([root]);
+    let mut visited = HashSet::new();
+    let mut files = Vec::new();
+    while let Some(directory) = queue.pop_front() {
+        let canonical = match fs::canonicalize(&directory) {
+            Ok(canonical) => canonical,
+            Err(_) => continue,
+        };
+        if !visited.insert(canonical) {
+            continue;
+        }
+        for entry in fs::read_dir(directory)?.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push_back(path);
+            } else if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_by_key(|path| {
+        std::cmp::Reverse(
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    });
+    files.truncate(requested_limit.clamp(1, MAX_HISTORY_THREADS));
+    Ok(files)
+}
+
+fn legacy_thread_inspection(path: &Path) -> Result<NativeCodexThreadInspection> {
+    let file = fs::File::open(path)?;
+    let mut native_thread_id = None;
+    let mut cwd = None;
+    let mut model_provider = None;
+    let mut preview = None;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            let payload = &value["payload"];
+            native_thread_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            cwd = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            model_provider = payload
+                .get("model_provider")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        } else if preview.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("response_item")
+            && value.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+            && value.pointer("/payload/role").and_then(Value::as_str) == Some("user")
+        {
+            preview = response_message_text(&value["payload"]);
+        }
+        if native_thread_id.is_some() && cwd.is_some() && preview.is_some() {
+            break;
+        }
+    }
+    let metadata = path.metadata()?;
+    let updated = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    Ok(NativeCodexThreadInspection {
+        native_thread_id: native_thread_id.ok_or_else(|| {
+            WipsawError::CodexProtocol(format!(
+                "legacy rollout '{}' has no session ID",
+                path.display()
+            ))
+        })?,
+        name: None,
+        cwd: cwd.ok_or_else(|| {
+            WipsawError::CodexProtocol(format!(
+                "legacy rollout '{}' has no working directory",
+                path.display()
+            ))
+        })?,
+        model_provider: model_provider.unwrap_or_else(|| "openai".to_string()),
+        status: "notLoaded".to_string(),
+        rollout_path: Some(path.to_path_buf()),
+        preview: preview.unwrap_or_default(),
+        native_created_at: None,
+        native_updated_at: updated,
+    })
+}
+
+fn list_legacy_threads(
+    home: &CodexHome,
+    requested_limit: usize,
+) -> Result<Vec<NativeCodexThreadInspection>> {
+    let threads = legacy_rollout_files(home, requested_limit)?
+        .into_iter()
+        .filter_map(|path| legacy_thread_inspection(&path).ok())
+        .collect::<Vec<_>>();
+    Ok(threads)
+}
+
+fn read_legacy_thread_history(
+    home: &CodexHome,
+    native_thread_id: &str,
+) -> Result<NativeCodexThreadHistory> {
+    let path = legacy_rollout_files(home, MAX_HISTORY_THREADS)?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.contains(native_thread_id))
+        })
+        .ok_or_else(|| WipsawError::NotFound {
+            entity: "legacy Codex thread",
+            value: native_thread_id.to_string(),
+        })?;
+    let inspection = legacy_thread_inspection(&path)?;
+    let file = fs::File::open(path)?;
+    let mut turns = Vec::new();
+    let mut messages = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item")
+            || value.pointer("/payload/type").and_then(Value::as_str) != Some("message")
+        {
+            continue;
+        }
+        let payload = &value["payload"];
+        let Some(role) = payload.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(role, "user" | "assistant")
+            || (role == "assistant"
+                && payload.get("phase").and_then(Value::as_str) == Some("commentary"))
+        {
+            continue;
+        }
+        let Some(text) = response_message_text(payload).filter(|text| !text.trim().is_empty())
+        else {
+            continue;
+        };
+        if role == "user" && !messages.is_empty() {
+            let turn_number = turns.len() + 1;
+            turns.push(NativeCodexHistoryTurn {
+                turn_id: format!("legacy-{turn_number}"),
+                status: "completed".to_string(),
+                messages,
+            });
+            messages = Vec::new();
+        }
+        messages.push(NativeCodexHistoryMessage {
+            role: role.to_string(),
+            text,
+        });
+    }
+    if !messages.is_empty() {
+        let turn_number = turns.len() + 1;
+        turns.push(NativeCodexHistoryTurn {
+            turn_id: format!("legacy-{turn_number}"),
+            status: "completed".to_string(),
+            messages,
+        });
+    }
+    Ok(NativeCodexThreadHistory {
+        thread: inspection,
+        turns,
+    })
+}
+
+fn response_message_text(payload: &Value) -> Option<String> {
+    let text = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn workspace_overview_tool(arguments: Option<&Value>) -> Value {
+    let requested = arguments
+        .and_then(|arguments| arguments.get("workspace"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let result = (|| -> Result<Vec<ManagerWorkspaceOverview>> {
+        let app = open_manager_app()?;
+        let workspaces = match requested {
+            Some(reference) => vec![(app.workspace(reference)?, false)],
+            None => app.list_workspaces()?,
+        };
+        workspaces
+            .into_iter()
+            .map(|(workspace, known_live)| {
+                let (_, tabs, windows) = app.list_tabs(&workspace.id)?;
+                let live = known_live || app.tmux.session_exists(&workspace.tmux_session)?;
+                let tabs = tabs
+                    .into_iter()
+                    .map(|tab| {
+                        let window = windows
+                            .iter()
+                            .find(|window| window.id == tab.tmux_window_id);
+                        ManagerTabOverview {
+                            tab,
+                            live: window.is_some(),
+                            active: window.is_some_and(|window| window.active),
+                        }
+                    })
+                    .collect();
+                Ok(ManagerWorkspaceOverview {
+                    workspace,
+                    live,
+                    tabs,
+                })
+            })
+            .collect()
+    })();
+    match result {
+        Ok(workspaces) => match serde_json::to_value(&workspaces) {
+            Ok(structured) => manager_tool_result(
+                &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+                false,
+                Some(json!({ "workspaces": structured })),
+            ),
+            Err(error) => manager_tool_result(&error.to_string(), true, None),
+        },
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn codex_history_search_tool(arguments: Option<&Value>) -> Value {
+    let query = arguments
+        .and_then(|arguments| arguments.get("query"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|query| !query.is_empty());
+    let Some(query) = query else {
+        return manager_tool_result("'query' must be a non-empty string", true, None);
+    };
+    let cwd = arguments
+        .and_then(|arguments| arguments.get("cwd"))
+        .and_then(Value::as_str);
+    let requested_home = arguments
+        .and_then(|arguments| arguments.get("home"))
+        .and_then(Value::as_str);
+    let max_results = arguments
+        .and_then(|arguments| arguments.get("maxResults"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(20)
+        .clamp(1, 50);
+    let result = (|| -> Result<(Vec<CodexHistorySearchHit>, Vec<String>, Vec<String>)> {
+        let scope = manager_scope_from_env()?;
+        let cwd = cwd
+            .map(|cwd| scope.resolve(cwd))
+            .transpose()?
+            .map(|cwd| {
+                if cwd.is_dir() {
+                    Ok(cwd)
+                } else {
+                    Err(WipsawError::InvalidInput {
+                        field: "Codex history cwd",
+                        message: format!("'{}' is not a directory", cwd.display()),
+                    })
+                }
+            })
+            .transpose()?;
+        let app = open_manager_app()?;
+        let homes = history_homes(&app, requested_home)?;
+        let mut hits = Vec::new();
+        let mut home_errors = Vec::new();
+        let mut home_warnings = Vec::new();
+        for (home, registered) in homes {
+            let threads = if registered {
+                match list_native_threads(&home, MAX_HISTORY_THREADS) {
+                    Ok(threads) => threads,
+                    Err(error) => {
+                        let legacy = list_legacy_threads(&home, MAX_HISTORY_THREADS)?;
+                        if legacy.is_empty() {
+                            home_errors.push(format!("{} ({}): {error}", home.name, home.id));
+                            continue;
+                        }
+                        home_warnings.push(format!(
+                            "{} ({}): app-server history was unavailable; searched persisted rollout files read-only",
+                            home.name, home.id
+                        ));
+                        legacy
+                    }
+                }
+            } else {
+                let legacy = list_legacy_threads(&home, MAX_HISTORY_THREADS)?;
+                if legacy.is_empty() {
+                    home_errors.push(format!(
+                        "{} ({}): no persisted rollout files were found",
+                        home.name, home.id
+                    ));
+                    continue;
+                }
+                home_warnings.push(format!(
+                    "{} ({}): searched this unregistered local home's persisted rollout files read-only",
+                    home.name, home.id
+                ));
+                legacy
+            };
+            for thread in threads {
+                if !history_path_permitted(&scope, &thread.cwd) {
+                    continue;
+                }
+                if cwd
+                    .as_ref()
+                    .is_some_and(|root| !thread.cwd.starts_with(root))
+                {
+                    continue;
+                }
+                let searchable = format!(
+                    "{}\n{}\n{}",
+                    thread.name.as_deref().unwrap_or_default(),
+                    thread.preview,
+                    thread.cwd.display()
+                );
+                let score = text_match_score(query, &searchable);
+                if score == 0 && cwd.is_none() {
+                    continue;
+                }
+                hits.push(CodexHistorySearchHit {
+                    score,
+                    home_id: home.id.clone(),
+                    home_name: home.name.clone(),
+                    home_path: home.path.clone(),
+                    home_registered: registered,
+                    account_alias: home.account_alias.clone(),
+                    native_thread_id: thread.native_thread_id,
+                    name: thread.name,
+                    cwd: thread.cwd,
+                    preview: truncate_chars(&thread.preview, 1_000),
+                    status: thread.status,
+                    native_created_at: thread.native_created_at,
+                    native_updated_at: thread.native_updated_at,
+                });
+            }
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.native_updated_at.cmp(&left.native_updated_at))
+        });
+        hits.truncate(max_results);
+        Ok((hits, home_errors, home_warnings))
+    })();
+    match result {
+        Ok((hits, home_errors, home_warnings)) => {
+            let structured = json!({
+                "hits": hits,
+                "homeErrors": home_errors,
+                "homeWarnings": home_warnings
+            });
+            let is_error = structured["hits"].as_array().is_some_and(Vec::is_empty)
+                && !structured["homeErrors"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty);
+            manager_tool_result(
+                &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+                is_error,
+                Some(structured),
+            )
+        }
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn codex_history_read_tool(arguments: Option<&Value>) -> Value {
+    let home_ref = arguments
+        .and_then(|arguments| arguments.get("home"))
+        .and_then(Value::as_str);
+    let native_thread_id = arguments
+        .and_then(|arguments| arguments.get("nativeThreadId"))
+        .and_then(Value::as_str);
+    let query = arguments
+        .and_then(|arguments| arguments.get("query"))
+        .and_then(Value::as_str);
+    let (Some(home_ref), Some(native_thread_id), Some(query)) = (home_ref, native_thread_id, query)
+    else {
+        return manager_tool_result(
+            "'home', 'nativeThreadId', and 'query' must be non-empty strings",
+            true,
+            None,
+        );
+    };
+    let max_turns = arguments
+        .and_then(|arguments| arguments.get("maxTurns"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(12)
+        .clamp(1, 24);
+    let result = (|| -> Result<Value> {
+        let scope = manager_scope_from_env()?;
+        let app = open_manager_app()?;
+        let (home, registered) = resolve_history_home(&app, home_ref)?;
+        let (history, fallback_warning) = if registered {
+            match read_native_thread_history(&home, native_thread_id) {
+                Ok(history) => (history, None),
+                Err(error) => (
+                    read_legacy_thread_history(&home, native_thread_id)?,
+                    Some(format!(
+                        "app-server history was unavailable ({error}); read the persisted rollout file read-only"
+                    )),
+                ),
+            }
+        } else {
+            (
+                read_legacy_thread_history(&home, native_thread_id)?,
+                Some(
+                    "read this unregistered local home's persisted rollout file read-only"
+                        .to_string(),
+                ),
+            )
+        };
+        if !history_path_permitted(&scope, &history.thread.cwd) {
+            return Err(WipsawError::InvalidInput {
+                field: "Codex history",
+                message: format!(
+                    "thread '{native_thread_id}' is outside this manager's enforced file scope"
+                ),
+            });
+        }
+        let total_turns = history.turns.len();
+        let (turns, query_matched) = select_history_turns(history.turns, query, max_turns);
+        Ok(json!({
+            "homeId": home.id,
+            "homeName": home.name,
+            "homePath": home.path,
+            "homeRegistered": registered,
+            "accountAlias": home.account_alias,
+            "thread": history.thread,
+            "query": query,
+            "queryMatched": query_matched,
+            "warning": fallback_warning,
+            "totalTurns": total_turns,
+            "selectedTurns": turns.len(),
+            "truncated": turns.len() < total_turns,
+            "turns": turns
+        }))
+    })();
+    match result {
+        Ok(structured) => manager_tool_result(
+            &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+            false,
+            Some(structured),
+        ),
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn create_handoff_tab_tool(arguments: Option<&Value>) -> Value {
+    let required = [
+        "workspace",
+        "name",
+        "cwd",
+        "sourceHome",
+        "sourceNativeThreadId",
+        "summary",
+    ];
+    let values = required
+        .iter()
+        .map(|key| {
+            arguments
+                .and_then(|arguments| arguments.get(*key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(values) = values else {
+        return manager_tool_result(
+            "workspace, name, cwd, sourceHome, sourceNativeThreadId, and summary are required",
+            true,
+            None,
+        );
+    };
+    let [
+        workspace,
+        name,
+        cwd,
+        source_home_ref,
+        source_thread_id,
+        summary,
+    ] = values.as_slice()
+    else {
+        unreachable!("six required handoff arguments")
+    };
+    let destination_home = arguments
+        .and_then(|arguments| arguments.get("home"))
+        .and_then(Value::as_str);
+    let profile = arguments
+        .and_then(|arguments| arguments.get("profile"))
+        .and_then(Value::as_str);
+    let result = (|| -> Result<Value> {
+        let scope = manager_scope_from_env()?;
+        let cwd = scope.resolve(cwd)?;
+        if !cwd.is_dir() {
+            return Err(WipsawError::InvalidInput {
+                field: "handoff cwd",
+                message: format!("'{}' is not a directory", cwd.display()),
+            });
+        }
+        let mut app = open_manager_app()?;
+        let workspace = app.workspace(workspace)?;
+        let (source_home, source_registered) = resolve_history_home(&app, source_home_ref)?;
+        let source = if source_registered {
+            match inspect_thread(&source_home, source_thread_id) {
+                Ok(source) => source,
+                Err(_) => read_legacy_thread_history(&source_home, source_thread_id)?.thread,
+            }
+        } else {
+            read_legacy_thread_history(&source_home, source_thread_id)?.thread
+        };
+        if !history_path_permitted(&scope, &source.cwd) {
+            return Err(WipsawError::InvalidInput {
+                field: "source Codex history",
+                message: format!(
+                    "thread '{source_thread_id}' is outside this manager's enforced file scope"
+                ),
+            });
+        }
+        let handoff = format!(
+            "# Wipsaw session handoff\n\nThis is curated historical context supplied by Wipsaw, not a request to perform work yet. Verify facts that may have changed before relying on them.\n\n- Source Codex home: {} ({})\n- Source native thread: {}\n- Source working directory: {}\n- Destination working directory: {}\n\n## Curated summary\n\n{}",
+            source_home.name,
+            source_home.id,
+            source_thread_id,
+            source.cwd.display(),
+            cwd.display(),
+            summary
+        );
+        let created = app.create_handoff_tab(
+            &workspace.id,
+            name,
+            &cwd,
+            destination_home,
+            profile,
+            &handoff,
+            &source_home.id,
+            source_thread_id,
+        )?;
+        serde_json::to_value(created).map_err(Into::into)
+    })();
+    match result {
+        Ok(structured) => manager_tool_result(
+            &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+            false,
+            Some(json!({ "handoff": structured })),
+        ),
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn history_path_permitted(scope: &ManagerContextScope, path: &Path) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    scope.permits(&canonical)
+}
+
+fn text_match_score(query: &str, searchable: &str) -> usize {
+    let query = query.to_ascii_lowercase();
+    let searchable = searchable.to_ascii_lowercase();
+    let phrase_score = usize::from(searchable.contains(query.trim())) * 100;
+    let mut terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.chars().count() > 1)
+        .collect::<Vec<_>>();
+    terms.sort_unstable();
+    terms.dedup();
+    phrase_score
+        + terms
+            .into_iter()
+            .filter(|term| searchable.contains(term))
+            .count()
+            * 10
+}
+
+fn select_history_turns(
+    turns: Vec<NativeCodexHistoryTurn>,
+    query: &str,
+    max_turns: usize,
+) -> (Vec<NativeCodexHistoryTurn>, bool) {
+    let mut scored = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            let searchable = turn
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (index, text_match_score(query, &searchable))
+        })
+        .collect::<Vec<_>>();
+    let query_matched = scored.iter().any(|(_, score)| *score > 0);
+    if query_matched {
+        scored.retain(|(_, score)| *score > 0);
+        scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+    } else {
+        scored.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+    }
+    scored.truncate(max_turns);
+    scored.sort_by_key(|(index, _)| *index);
+    let mut remaining = MAX_HISTORY_EXCERPT_CHARS;
+    let mut selected = Vec::new();
+    for (index, _) in scored {
+        let mut turn = turns[index].clone();
+        for message in &mut turn.messages {
+            message.text = redact_history_text(&message.text);
+            let limit = remaining.min(16_000);
+            message.text = truncate_chars(&message.text, limit);
+            remaining = remaining.saturating_sub(message.text.chars().count());
+        }
+        turn.messages
+            .retain(|message| !message.text.trim().is_empty());
+        if !turn.messages.is_empty() {
+            selected.push(turn);
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    (selected, query_matched)
+}
+
+fn redact_history_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let lowered = line.to_ascii_lowercase();
+            let obvious_token = lowered.contains("bearer ")
+                || lowered.contains("sk-")
+                || lowered.contains("ghp_")
+                || lowered.contains("github_pat_");
+            let assignment_start = [
+                "api_key",
+                "apikey",
+                "access_token",
+                "auth_token",
+                "password",
+                "secret",
+            ]
+            .iter()
+            .filter_map(|candidate| lowered.find(candidate))
+            .filter(|start| lowered[*start..].find(['=', ':']).is_some())
+            .min();
+            if obvious_token {
+                "[Wipsaw redacted a likely credential-bearing line]".to_string()
+            } else if let Some(start) = assignment_start {
+                let prefix = line[..start].trim_end();
+                if prefix.is_empty() {
+                    "[Wipsaw redacted a likely credential-bearing line]".to_string()
+                } else {
+                    format!("{prefix} [Wipsaw redacted a likely credential assignment]")
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn list_directory_tool(arguments: Option<&Value>) -> Value {
@@ -1121,6 +2050,12 @@ fn validate_manager_command(args: &[String]) -> std::result::Result<(), String> 
     }
     if (group, action) == ("thread", "delete") && !args.iter().any(|arg| arg == "--yes") {
         return Err("thread delete requires --yes after confirming the exact target".to_string());
+    }
+    if (group, action) == ("tab", "list") && args.get(3).is_none() {
+        return Err(
+            "tab list requires a workspace name or ID; prefer workspace_overview for manager reads"
+                .to_string(),
+        );
     }
     if (group, action) == ("workspace", "context")
         && !matches!(
@@ -1648,10 +2583,11 @@ mod tests {
     use super::{
         MANAGER_MODEL, MANAGER_REASONING_EFFORT, MANAGER_SKILL_NAMES, ManagerContextScope,
         ManagerProgressStatus, ManagerTurnRequest, command_spec, expand_prompt_references,
-        manager_mcp_response, manager_progress, prepare_runtime, read_manager_file,
-        search_manager_files, validate_manager_command,
+        list_legacy_threads, manager_mcp_response, manager_progress, prepare_runtime,
+        read_legacy_thread_history, read_manager_file, redact_history_text, search_manager_files,
+        select_history_turns, validate_manager_command,
     };
-    use crate::codex::codex_launch_path;
+    use crate::codex::{NativeCodexHistoryMessage, NativeCodexHistoryTurn, codex_launch_path};
     use crate::model::{CodexHome, ManagerKind, ManagerSession};
     use crate::paths::AppPaths;
 
@@ -1866,6 +2802,9 @@ mod tests {
             )
             .is_ok()
         );
+        let missing_workspace =
+            validate_manager_command(&["--json", "tab", "list"].map(str::to_string)).unwrap_err();
+        assert!(missing_workspace.contains("workspace name or ID"));
     }
 
     #[test]
@@ -1920,6 +2859,10 @@ mod tests {
             [
                 "manager_guide",
                 "context_list",
+                "workspace_overview",
+                "codex_history_search",
+                "codex_history_read",
+                "create_handoff_tab",
                 "list_directory",
                 "search_files",
                 "read_file",
@@ -1933,6 +2876,122 @@ mod tests {
             .find(|tool| tool["name"] == "run_wipsaw")
             .unwrap();
         assert_eq!(run_wipsaw["annotations"]["destructiveHint"], false);
+    }
+
+    #[test]
+    fn history_excerpt_selection_is_relevant_bounded_and_credential_safe() {
+        let turns = vec![
+            NativeCodexHistoryTurn {
+                turn_id: "irrelevant".to_string(),
+                status: "completed".to_string(),
+                messages: vec![NativeCodexHistoryMessage {
+                    role: "assistant".to_string(),
+                    text: "Unrelated dashboard work".to_string(),
+                }],
+            },
+            NativeCodexHistoryTurn {
+                turn_id: "stores".to_string(),
+                status: "completed".to_string(),
+                messages: vec![
+                    NativeCodexHistoryMessage {
+                        role: "user".to_string(),
+                        text: "Where did we publish Privacy Lens?".to_string(),
+                    },
+                    NativeCodexHistoryMessage {
+                        role: "assistant".to_string(),
+                        text: "Chrome and Edge. API_KEY=do-not-copy".to_string(),
+                    },
+                ],
+            },
+        ];
+        let (selected, matched) = select_history_turns(turns, "Privacy Lens browser stores", 4);
+        assert!(matched);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].turn_id, "stores");
+        assert!(selected[0].messages[1].text.contains("Chrome and Edge"));
+        assert!(!selected[0].messages[1].text.contains("do-not-copy"));
+        assert!(redact_history_text("Authorization: Bearer abc").contains("redacted"));
+    }
+
+    #[test]
+    fn legacy_rollouts_remain_searchable_when_app_server_state_is_too_old() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("legacy-home");
+        let session_dir = home_path.join("sessions/2026/08/09");
+        let project = root.path().join("privacy-lens");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let thread_id = "01900000-0000-7000-8000-000000000777";
+        let rollout = session_dir.join(format!("rollout-2026-08-09T00-00-00-{thread_id}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "cwd": project,
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Publish Privacy Lens"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Firefox approved it"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "tool output must stay out"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|line| serde_json::to_string(&line).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&rollout, lines).unwrap();
+        let home = CodexHome {
+            id: "local:test".to_string(),
+            name: "legacy".to_string(),
+            host_id: "host_local".to_string(),
+            account_id: "acct_test".to_string(),
+            account_alias: "test".to_string(),
+            path: home_path,
+            codex_binary: PathBuf::from("codex"),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        let listed = list_legacy_threads(&home, 20).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].native_thread_id, thread_id);
+        assert!(listed[0].preview.contains("Publish Privacy Lens"));
+        let history = read_legacy_thread_history(&home, thread_id).unwrap();
+        assert_eq!(history.turns.len(), 1);
+        assert_eq!(history.turns[0].messages.len(), 2);
+        assert!(
+            history.turns[0].messages[1]
+                .text
+                .contains("Firefox approved")
+        );
+        assert!(
+            history.turns[0]
+                .messages
+                .iter()
+                .all(|message| !message.text.contains("tool output"))
+        );
     }
 
     #[test]

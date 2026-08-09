@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::codex::{
     CodexHomeProbe, NativeCodexThreadInspection, archive_thread, codex_launch_path, delete_thread,
     inspect_thread as inspect_native_thread, probe_home, start_named_thread,
+    start_named_thread_with_handoff,
 };
 use crate::error::{Result, WipsawError};
 use crate::id::{EntityKind, WipsawId};
@@ -58,6 +59,17 @@ pub struct CodexThreadLaunch {
     pub codex_home_id: String,
     pub cwd: PathBuf,
     pub return_shell: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHandoffLaunch {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub tab: Tab,
+    pub thread: CodexThread,
+    pub launch: CodexThreadLaunch,
+    pub source_codex_home_id: String,
+    pub source_native_thread_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -868,6 +880,18 @@ impl WipsawApp {
         profile_ref: Option<&str>,
         tab_binding: Option<(&str, &str)>,
     ) -> Result<CodexThread> {
+        self.create_codex_thread_seeded(name, home_ref, cwd, profile_ref, tab_binding, None)
+    }
+
+    fn create_codex_thread_seeded(
+        &mut self,
+        name: &str,
+        home_ref: &str,
+        cwd: Option<&Path>,
+        profile_ref: Option<&str>,
+        tab_binding: Option<(&str, &str)>,
+        handoff: Option<&str>,
+    ) -> Result<CodexThread> {
         if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() && tab_binding.is_none() {
             return Err(WipsawError::InvalidInput {
                 field: "thread create",
@@ -954,7 +978,11 @@ impl WipsawApp {
             self.ensure_manager_path_scope(&workspace, &cwd, "thread working directory")?;
         }
 
-        let native = start_named_thread(&home, &cwd, &name, profile.as_ref())?;
+        let native = if handoff.is_some() {
+            start_named_thread_with_handoff(&home, &cwd, &name, profile.as_ref(), handoff)?
+        } else {
+            start_named_thread(&home, &cwd, &name, profile.as_ref())?
+        };
         let id = WipsawId::new(EntityKind::CodexThread);
         let inserted = self.registry.insert_codex_thread(NewCodexThread {
             id: id.as_str(),
@@ -975,6 +1003,109 @@ impl WipsawApp {
             let _ = archive_thread(&home, &native.native_thread_id);
         }
         inserted
+    }
+
+    /// Create, seed, bind, and launch a Codex tab as one manager operation.
+    /// Any resource created before a failure is removed on a best-effort basis
+    /// so a manager retry does not multiply empty tabs or orphan threads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_handoff_tab(
+        &mut self,
+        workspace_ref: &str,
+        name: &str,
+        cwd: &Path,
+        home_ref: Option<&str>,
+        profile_ref: Option<&str>,
+        handoff: &str,
+        source_codex_home_id: &str,
+        source_native_thread_id: &str,
+    ) -> Result<CodexHandoffLaunch> {
+        let handoff = handoff.trim();
+        if handoff.is_empty() || handoff.chars().count() > 48_000 {
+            return Err(WipsawError::InvalidInput {
+                field: "Codex handoff summary",
+                message: "must contain between 1 and 48,000 characters".to_string(),
+            });
+        }
+        let workspace = self.workspace(workspace_ref)?;
+        let tab = self.create_tab(
+            &workspace.id,
+            name,
+            Some(cwd),
+            TabLaunchSettings {
+                account: None,
+                codex_home: home_ref,
+                model_profile: profile_ref,
+            },
+        )?;
+        let home_id = tab
+            .codex_home_id
+            .clone()
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "Codex home",
+                message: "no Codex home is available for the handoff tab".to_string(),
+            });
+        let home_id = match home_id {
+            Ok(home_id) => home_id,
+            Err(error) => {
+                self.rollback_new_tab(&workspace, &tab);
+                return Err(error);
+            }
+        };
+        let thread = self.create_codex_thread_seeded(
+            name,
+            &home_id,
+            Some(&tab.cwd),
+            profile_ref,
+            Some((&workspace.id, &tab.id)),
+            Some(handoff),
+        );
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.rollback_new_tab(&workspace, &tab);
+                return Err(error);
+            }
+        };
+        let launch = self.resume_codex_thread(&thread.id, &workspace.id, &tab.id);
+        let launch = match launch {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.rollback_handoff(&workspace, &tab, &thread);
+                return Err(error);
+            }
+        };
+        let tab = self
+            .registry
+            .tab_by_ref(&workspace.id, &tab.id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab.id.clone(),
+            })?;
+        Ok(CodexHandoffLaunch {
+            workspace_id: workspace.id,
+            workspace_name: workspace.name,
+            tab,
+            thread,
+            launch,
+            source_codex_home_id: source_codex_home_id.to_string(),
+            source_native_thread_id: source_native_thread_id.to_string(),
+        })
+    }
+
+    fn rollback_new_tab(&mut self, workspace: &Workspace, tab: &Tab) {
+        let _ = self
+            .tmux
+            .kill_tab(&workspace.tmux_session, &tab.tmux_window_id);
+        let _ = self.registry.delete_tab(&tab.id);
+    }
+
+    fn rollback_handoff(&mut self, workspace: &Workspace, tab: &Tab, thread: &CodexThread) {
+        self.rollback_new_tab(workspace, tab);
+        if let Ok(Some(home)) = self.registry.codex_home_by_ref(&thread.codex_home_id) {
+            let _ = delete_thread(&home, &thread.native_thread_id);
+        }
+        let _ = self.registry.delete_codex_thread(&thread.id);
     }
 
     pub fn list_codex_threads(&self, home_ref: Option<&str>) -> Result<Vec<CodexThread>> {

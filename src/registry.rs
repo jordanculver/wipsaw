@@ -581,6 +581,19 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    pub fn delete_tab(&self, tab_id: &str) -> Result<()> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM tabs WHERE id = ?1", [tab_id])?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "tab",
+                value: tab_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Replace every persisted tmux target for a workspace in one transaction.
     ///
     /// Window IDs belong to a particular tmux server lifetime. When that

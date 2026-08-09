@@ -51,6 +51,16 @@ MCP surface for validated Wipsaw operations and scoped file browsing/search/read
 Personal MCPs, plugins, apps, unrelated skills, shell execution,
 image tools, and multi-agent tools are not loaded into manager sessions.
 
+Core manager workflows use typed tools instead of making the model assemble CLI
+positionals. `workspace_overview` returns workspaces with their tabs;
+`codex_history_search` and `codex_history_read` find query-focused excerpts from
+native sessions across registered homes and the standard local `~/.codex`
+history; and `create_handoff_tab` creates, seeds, binds, and launches a new
+Codex tab as one operation. Legacy rollout files are read only when an older
+home cannot initialize the current app-server. History handoffs include only
+user and final-assistant text, omit tool output and reasoning, redact likely
+credential assignments, and remain bounded before they reach a manager turn.
+
 The blank `λ` manager composer accepts multiline paste. `Enter` sends;
 `Shift+Enter` or `Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker
 and `$` for allowed skills. Lumbergh has machine-wide read access: type `@/` and

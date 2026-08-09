@@ -143,7 +143,14 @@ authentication but ignores inherited configuration and installs only the
 Wipsaw manager, `skill-creator`, and `skill-installer` skill directories. The
 installer is the manager's default lookup surface. A read-only manager process
 receives one required, private MCP server exposing `manager_guide`, a validated
-`run_wipsaw` capability, and scoped context/list/search/read tools. Lumbergh's
+`run_wipsaw` escape hatch, typed workspace/history/handoff operations, and
+scoped context/list/search/read tools. `workspace_overview` eliminates raw tab
+query positionals. Native Codex history search/read spans registered homes and
+the standard local Codex home; older homes that cannot initialize the current
+app-server use bounded, read-only rollout parsing. `create_handoff_tab` starts a
+new native thread, injects a curated summary into model-visible history without
+running a turn, binds the Wipsaw thread and tab, and launches Codex. Partial
+creation failures roll back the new resources. Lumbergh's
 file scope covers the local filesystem, while each Middle Manager is enforced
 against durable file/directory allowlist rows owned by its workspace. Known
 credential-bearing paths remain blocked. Shell, personal MCPs, plugins, apps,
