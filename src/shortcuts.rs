@@ -23,11 +23,11 @@ pub fn install(paths: &AppPaths, wipsaw_binary: &Path) -> Result<Vec<PathBuf>> {
         ),
         (
             "lumbergh",
-            format!("#!/bin/sh\nexec {executable} shortcut manager\n"),
+            format!("#!/bin/sh\nexec {executable} shortcut lumbergh\n"),
         ),
         (
             "lumberg",
-            format!("#!/bin/sh\nexec {executable} shortcut manager\n"),
+            format!("#!/bin/sh\nexec {executable} shortcut lumbergh\n"),
         ),
     ];
     let mut installed = Vec::with_capacity(definitions.len());

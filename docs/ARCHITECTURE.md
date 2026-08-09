@@ -12,8 +12,8 @@ Wipsaw is a Linux-only local control plane with two execution domains:
 
 It must support several local or remote hosts, Codex installations, Codex
 homes, ChatGPT/Codex accounts, API credentials, model profiles, shells, and
-scheduled jobs. Human TUI actions and Lumbergh agent actions must share the
-same typed application layer.
+scheduled jobs. Human TUI actions, the single dashboard Lumbergh, and each
+workspace's Middle Manager must share the same typed application layer.
 
 The first deployment target is an individual Linux workstation or server. The
 architecture should be comfortable with tens of workspaces, hundreds of tabs
@@ -50,11 +50,15 @@ the transplant:
 flowchart TB
     Human[Human operator] --> TUI[Wipsaw Ratatui UI]
     Human --> CLI[wipsaw CLI]
-    Lumbergh[Lumbergh Codex thread] --> MCP[Wipsaw MCP server]
+    TUI --> Lumbergh[One embedded Lumbergh]
+    TUI --> Middle[One Middle Manager per workspace]
+    Lumbergh --> ManagerExec[Resumable Codex exec JSONL]
+    Middle --> ManagerExec
+    ManagerExec --> ManagerMCP[Private Wipsaw manager MCP]
 
     TUI --> Core[Wipsaw host core]
     CLI --> Core
-    MCP --> Core
+    ManagerMCP --> CLI
     Core --> Audit[Audit policy]
     Core --> Registry[(Local SQLite registry)]
     Core --> Secrets[Secret-provider ports]
@@ -83,9 +87,10 @@ flowchart TB
 
 ```text
 Linux host
-├── wipsaw / wipsawd / wipsaw mcp-server
+├── wipsaw / wipsawd / private manager-mcp
 ├── private tmux socket and generated config
-├── one Codex app-server endpoint per active Codex home
+├── isolated manager homes + resumable Codex exec threads
+├── Codex app-server adapter for ordinary thread lifecycle
 ├── SQLite registry + audit index
 ├── Linux secret provider or encrypted headless fallback
 └── Docker Compose project: wipsaw-runtime
@@ -115,24 +120,39 @@ daemon port is required.
 | `hosts` | Local/SSH capability discovery and commands | Host capability cache | Host port |
 | `audit` | Append-only action records and policy outcomes | Local audit index | Audit port |
 | `ui` | Ratatui navigator, forms, settings, viewers | UI state only | Terminal UI |
-| `mcp` | Structured tools for Lumbergh | No independent state | MCP stdio server |
+| `manager` | Embedded Lumbergh/Middle Manager turns, isolation, JSONL event handling | Manager threads/messages in registry | Manager application port |
+| `mcp` | Two validated Wipsaw capabilities for embedded managers | No independent state | Private MCP stdio server |
 
 The local alpha implements `ui` as a responsive manager-first dashboard with
-Home, Sessions, Threads, and WIPs views. Home combines a prominent Lumbergh
-entry point, compact quick actions, selected-workspace activity, dependency
-health, and account/profile summaries. Wide terminals add navigation and
-status rails; compact terminals preserve the same primary manager action under
-a short header. Unimplemented runtime views are labeled rather than populated
-with simulated data.
+Home, Sessions, Threads, and WIPs views. Home embeds the one top-level Lumbergh
+transcript and composer alongside quick actions, selected-workspace activity,
+dependency health, and account/profile summaries. Every workspace owns a
+separate Middle Manager opened from its manager tab. Wide terminals add
+navigation and status rails; compact terminals preserve the same primary
+manager action under a short header. Unimplemented runtime views are labeled
+rather than populated with simulated data.
+
+Manager turns do not attach an interactive Codex TUI. Wipsaw runs resumable
+`codex exec --json` threads asynchronously, persists each exact native thread
+ID and transcript, and renders activity back into the existing Ratatui view.
+Both manager kinds are fixed initially to `gpt-5.6-terra` with medium reasoning.
+Each generated manager home references the selected account's existing
+authentication but ignores inherited configuration and installs only the
+Wipsaw manager skill. A read-only manager process receives one required,
+private MCP server exposing `manager_guide` and a validated `run_wipsaw`
+capability; shell, personal MCPs, plugins, apps, unrelated skills, image, and
+multi-agent capabilities are disabled.
 
 Workspace and tab rows are durable; tmux session/window IDs are runtime
 handles. Every mutating or activation path first checks the private tmux
-server. When a session is missing, Wipsaw recreates the manager and remaining
-windows from registry metadata, matches surviving windows by ID/name, and
-transactionally replaces every tab target to tolerate tmux ID reuse. Lumbergh
-is then resumed before attach. Active manager detection walks the Linux pane
-process tree for Wipsaw's thread environment marker because the return-to-shell
-wrapper can leave `pane_current_command` reporting zsh while Codex is active.
+server. When a session is missing, Wipsaw recreates the Middle Manager tab and
+remaining windows from registry metadata, matches surviving windows by
+ID/name, and transactionally replaces every tab target to tolerate tmux ID
+reuse. Its
+Middle Manager record and native thread mapping remain available independently
+of tmux. Ordinary interactive Codex tabs still use process-tree detection for
+Wipsaw's thread environment marker because the return-to-shell wrapper can
+leave `pane_current_command` reporting zsh while Codex is active.
 
 A generated shell launcher sits between tmux and Bash/Zsh: it sources the
 user's normal rc files, then defines Wipsaw's tab-aware shortcuts. This keeps
@@ -587,6 +607,25 @@ after the source transplant.
 - **Alternatives considered:** Put everything in Postgres; put scheduler state in
   host SQLite; allow both sides to write both databases.
 
+### ADR-009: Embed isolated managers through Codex exec and a private MCP
+
+- **Status:** Accepted; local top-level and workspace-scoped spikes passed.
+- **Context:** Attaching a raw Codex TUI replaced Wipsaw's interface, was
+  visually jarring, and inherited capabilities unrelated to Wipsaw management.
+  Nested general-purpose shell execution also failed under the host sandbox and
+  exposed more authority than manager operations require.
+- **Decision:** Keep exactly one Lumbergh in Home and one Middle Manager per
+  workspace. Run their turns with resumable `codex exec --json`, Terra at
+  medium reasoning, isolated generated homes, and one required private MCP
+  containing only a guide and a validated Wipsaw CLI capability.
+- **Consequences:** Managers stay inside the dashboard, preserve exact native
+  thread IDs, and receive a small auditable tool surface. New manager actions
+  must first become structured Wipsaw CLI/application operations and enter the
+  explicit capability allowlist.
+- **Alternatives considered:** Attach the interactive Codex TUI; give managers
+  a general shell; inherit the user's complete Codex home; use app-server turns
+  directly for the embedded chat path.
+
 ## Risks and mitigations
 
 | Risk | Impact | Likelihood | Mitigation |
@@ -601,3 +640,4 @@ after the source transplant.
 | Big-bang Wiphand rename breaks jobs | Capability regression | High | Compatibility API/repositories, contract tests, staged migration. |
 | Extension executes untrusted code | Host compromise | Medium later | Trust manifests, signatures/origin, explicit executable permission. |
 | Runtime stack unavailable | WIPs inaccessible | Medium | Host sessions remain usable; health UI and service recovery commands. |
+| Manager capability grows implicitly | Unexpected host authority | Medium | Isolated homes, disabled inherited tools, required private MCP, explicit CLI allowlist and tests. |

@@ -151,11 +151,11 @@ Home-to-manager prompt flow.
 
 Runtime recovery update, 2026-08-08: a stopped real workspace reproduced stale
 `display-message` and attach failures because persisted tmux window IDs outlived
-the private session. Activation now reconstructs all registered windows,
-transactionally reconciles reused targets, and resumes Lumbergh. The stopped
-workspace was restored with its existing native manager thread, a second live
-workspace received its default manager, and repeated starts retained the same
-manager pane PID. A live standalone Home-to-Lumbergh attach also passed.
+the private session. Activation now reconstructs all registered windows and
+transactionally reconciles reused targets. The stopped workspace recovered its
+Middle Manager entry point and existing native thread mapping, a second live
+workspace received its own Middle Manager, and repeated starts retained the
+same ordinary terminal processes.
 
 ### SPIKE-013: First-run Codex app-server recovery
 
@@ -172,6 +172,39 @@ error with a `wipsaw init` recovery path. Tests cover both a server that closes
 twice before succeeding and a persistent failure whose stderr must reach the
 operator. `wipsaw init` provides an idempotent first-run verification command,
 and new or previously unconfigured tabs inherit the preferred current home.
+
+### SPIKE-015: Embedded manager transport and capability isolation
+
+Status: Passed for the local alpha
+Decision: Supports ADR-009
+
+Tested locally with Codex CLI 0.147.0, the user's existing ChatGPT
+authentication, Ratatui, and the private Wipsaw MCP stdio server:
+
+- replaced raw Codex TUI attachment with asynchronous `codex exec --json` and
+  exact-ID `exec resume` turns rendered inside Wipsaw;
+- created one durable Lumbergh record for Home and a distinct Middle Manager
+  record for each registered workspace;
+- fixed both manager types to `gpt-5.6-terra` with medium reasoning;
+- generated private manager Codex homes that reference, rather than copy, the
+  selected home's `auth.json`, ignore user config/rules, and install only the
+  `wipsaw-manager` skill;
+- disabled personal MCPs, plugins, apps, unrelated skills, image, multi-agent,
+  and shell tools; and
+- exposed exactly `manager_guide` and `run_wipsaw` through a required private
+  MCP server whose CLI argument arrays are validated and cannot attach a TUI.
+
+The first general-shell prototype failed under nested Landlock/bwrap sandboxing.
+That result strengthened the boundary: the manager now calls a narrow Wipsaw
+capability instead of receiving a shell. A manual MCP initialize/list/call
+handshake returned only the two expected tools. Live dashboard and workspace
+turns both completed, persisted different native thread IDs, and showed the
+real registered workspace state without leaving the Ratatui UI.
+
+Limitations: the allowlist covers only currently implemented host commands.
+WIP CRUD, service operations, audit policy, cancellation, concurrent turns,
+and the public WIP/runtime MCP remain future work. This private manager MCP is
+not the public extension/runtime server planned for the WIP transplant.
 
 ## Priority spikes
 

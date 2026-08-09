@@ -13,6 +13,7 @@ pub enum EntityKind {
     CodexHome,
     ModelProfile,
     CodexThread,
+    ManagerSession,
 }
 
 impl EntityKind {
@@ -24,6 +25,7 @@ impl EntityKind {
             Self::CodexHome => "home",
             Self::ModelProfile => "profile",
             Self::CodexThread => "thread",
+            Self::ManagerSession => "manager",
         }
     }
 }

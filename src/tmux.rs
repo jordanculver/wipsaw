@@ -32,7 +32,7 @@ set-option -g mode-style 'bg=#0f766e,fg=#f8fafc'
 bind-key w if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} wipsaw"'
 bind-key c if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=new-tab wipsaw"'
 bind-key , if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=rename-tab wipsaw"'
-bind-key m run-shell 'manager'
+bind-key m if-shell -F '#{@wipsaw_navigator_open}' 'set-option -u @wipsaw_navigator_open; display-popup -C' 'set-option @wipsaw_navigator_open 1; run-shell -C "display-popup -E -w 92% -h 88% -e WIPSAW_PARENT_SESSION=#{session_name} -e WIPSAW_PARENT_WINDOW=#{window_id} -e WIPSAW_TUI_START=middle-manager -e WIPSAW_MANAGER_WORKSPACE=#{session_name} wipsaw"'
 "#;
 
 #[derive(Debug, Clone)]
@@ -156,7 +156,7 @@ impl TmuxBackend {
             OsString::from("-s"),
             OsString::from(session),
             OsString::from("-n"),
-            OsString::from("manager"),
+            OsString::from("middle-manager"),
             OsString::from("-c"),
             path_arg(cwd),
             OsString::from("-e"),

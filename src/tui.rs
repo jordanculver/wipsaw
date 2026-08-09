@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Stdout};
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
@@ -20,7 +21,10 @@ use ratatui::{Frame, Terminal};
 use crate::app::{TabLaunchSettings, WipsawApp};
 use crate::doctor::DoctorReport;
 use crate::error::{Result, WipsawError};
-use crate::model::{Account, CodexHome, CodexThread, ModelProfile, Tab, Workspace};
+use crate::manager::{MANAGER_MODEL, ManagerEvent};
+use crate::model::{
+    Account, CodexHome, CodexThread, ManagerMessage, ManagerSession, ModelProfile, Tab, Workspace,
+};
 use crate::tmux::TmuxWindow;
 
 const CYAN: Color = Color::Rgb(56, 220, 232);
@@ -59,6 +63,7 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
     let mut navigator = Navigator::load(app)?;
 
     loop {
+        navigator.poll_manager(app);
         session.terminal.draw(|frame| navigator.render(frame))?;
 
         if !event::poll(Duration::from_millis(250))? {
@@ -97,13 +102,8 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
                         if let Err(error) = navigator.refresh_selecting(app, Some(&workspace.id)) {
                             navigator.error(error);
                         }
-                        session.suspend()?;
-                        let result = app.activate_tab(&workspace.id, "manager");
-                        session.resume()?;
-                        match result {
-                            Ok(true) => break,
-                            Ok(false) => navigator.notice("detached; Lumbergh is still running"),
-                            Err(error) => navigator.error(error),
+                        if let Err(error) = navigator.open_middle_manager(app, &workspace.id) {
+                            navigator.error(error);
                         }
                     }
                     Err(error) => navigator.error(error),
@@ -207,15 +207,31 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
                     Err(error) => navigator.error(error),
                 }
             }
-            Action::OpenManager { workspace_id } => {
-                session.suspend()?;
-                let result = app.activate_tab(&workspace_id, "manager");
-                session.resume()?;
-                match result {
-                    Ok(true) => break,
-                    Ok(false) => navigator.notice("detached; Lumbergh is still running"),
-                    Err(error) => navigator.error(error),
+            Action::OpenLumbergh => {
+                if let Err(error) = navigator.open_lumbergh(app) {
+                    navigator.error(error);
                 }
+            }
+            Action::OpenMiddleManager { workspace_id } => {
+                if let Err(error) = navigator.open_middle_manager(app, &workspace_id) {
+                    navigator.error(error);
+                }
+            }
+            Action::CloseManager => {
+                if let Err(error) = navigator.close_middle_manager(app) {
+                    navigator.error(error);
+                }
+            }
+            Action::SendManagerMessage {
+                workspace_id,
+                prompt,
+            } => match app.start_manager_turn(workspace_id.as_deref(), &prompt) {
+                Ok(handle) => navigator.manager_turn_started(app, handle),
+                Err(error) => navigator.error(error),
+            },
+            Action::FocusManager => {
+                navigator.manager.focused = true;
+                navigator.message = None;
             }
         }
     }
@@ -367,6 +383,23 @@ impl SystemHealth {
     }
 }
 
+#[derive(Default)]
+struct ManagerChat {
+    session: Option<ManagerSession>,
+    messages: Vec<ManagerMessage>,
+    composer: String,
+    focused: bool,
+    overlay: bool,
+    activity: Option<String>,
+    turn: Option<ActiveManagerTurn>,
+    scroll: u16,
+}
+
+struct ActiveManagerTurn {
+    session_id: String,
+    receiver: std::sync::mpsc::Receiver<ManagerEvent>,
+}
+
 struct Navigator {
     workspaces: Vec<(Workspace, bool)>,
     tabs: Vec<Tab>,
@@ -375,6 +408,7 @@ struct Navigator {
     accounts: Vec<Account>,
     homes: Vec<CodexHome>,
     profiles: Vec<ModelProfile>,
+    managers: Vec<ManagerSession>,
     total_tabs: usize,
     workspace_state: ListState,
     tab_state: ListState,
@@ -387,6 +421,7 @@ struct Navigator {
     show_help: bool,
     prompt: Option<Prompt>,
     message: Option<(String, bool)>,
+    manager: ManagerChat,
 }
 
 impl Navigator {
@@ -394,6 +429,9 @@ impl Navigator {
         let mut navigator = Self::empty();
         navigator.is_popup = std::env::var_os("WIPSAW_PARENT_SESSION").is_some();
         navigator.refresh(app)?;
+        if let Err(error) = navigator.load_manager(app, None) {
+            navigator.error(error);
+        }
         if let Some((workspace, tab)) = app.current_managed_context()?
             && let Some(index) = navigator
                 .workspaces
@@ -414,6 +452,38 @@ impl Navigator {
                 navigator.active = Panel::Tabs;
                 navigator.begin_rename();
             }
+            Ok("middle-manager") => {
+                let requested = std::env::var("WIPSAW_MANAGER_WORKSPACE").ok();
+                let workspace_id = requested
+                    .as_deref()
+                    .and_then(|value| {
+                        navigator
+                            .workspaces
+                            .iter()
+                            .find(|(workspace, _)| {
+                                workspace.id == value
+                                    || workspace.name.eq_ignore_ascii_case(value)
+                                    || workspace.tmux_session == value
+                            })
+                            .map(|(workspace, _)| workspace.id.clone())
+                    })
+                    .or_else(|| {
+                        navigator
+                            .selected_workspace()
+                            .map(|workspace| workspace.id.clone())
+                    });
+                if let Some(workspace_id) = workspace_id {
+                    if let Err(error) = navigator.open_middle_manager(app, &workspace_id) {
+                        navigator.error(error);
+                    }
+                } else {
+                    navigator.error("create or select a workspace before opening a Middle Manager");
+                }
+            }
+            Ok("lumbergh") => {
+                navigator.view = View::Home;
+                navigator.manager.focused = true;
+            }
             _ => {}
         }
         Ok(navigator)
@@ -428,6 +498,7 @@ impl Navigator {
             accounts: Vec::new(),
             homes: Vec::new(),
             profiles: Vec::new(),
+            managers: Vec::new(),
             total_tabs: 0,
             workspace_state: ListState::default(),
             tab_state: ListState::default(),
@@ -440,6 +511,177 @@ impl Navigator {
             show_help: false,
             prompt: None,
             message: None,
+            manager: ManagerChat::default(),
+        }
+    }
+
+    fn load_manager(&mut self, app: &WipsawApp, workspace_ref: Option<&str>) -> Result<()> {
+        let (session, messages) = app.manager_messages(workspace_ref)?;
+        if let Some(existing) = self
+            .managers
+            .iter_mut()
+            .find(|manager| manager.id == session.id)
+        {
+            *existing = session.clone();
+        } else {
+            self.managers.push(session.clone());
+        }
+        self.manager.session = Some(session);
+        self.manager.messages = messages;
+        self.manager.scroll = u16::MAX;
+        self.manager.activity = None;
+        Ok(())
+    }
+
+    fn open_lumbergh(&mut self, app: &WipsawApp) -> Result<()> {
+        if self.manager.turn.is_some()
+            && self
+                .manager
+                .session
+                .as_ref()
+                .is_some_and(|session| session.workspace_id.is_some())
+        {
+            self.notice("the Middle Manager is still working; wait for this turn to finish");
+            return Ok(());
+        }
+        self.load_manager(app, None)?;
+        self.manager.overlay = false;
+        self.manager.focused = true;
+        self.view = View::Home;
+        self.message = None;
+        Ok(())
+    }
+
+    fn open_middle_manager(&mut self, app: &WipsawApp, workspace_ref: &str) -> Result<()> {
+        if self.manager.turn.is_some()
+            && self
+                .manager
+                .session
+                .as_ref()
+                .is_some_and(|session| session.workspace_id.as_deref() != Some(workspace_ref))
+        {
+            self.notice("another manager is still working; wait for this turn to finish");
+            return Ok(());
+        }
+        self.load_manager(app, Some(workspace_ref))?;
+        self.manager.overlay = true;
+        self.manager.focused = true;
+        self.manager.composer.clear();
+        self.message = None;
+        Ok(())
+    }
+
+    fn close_middle_manager(&mut self, app: &WipsawApp) -> Result<()> {
+        if self.manager.turn.is_some() {
+            self.notice("the Middle Manager is still working; wait for this turn to finish");
+            return Ok(());
+        }
+        self.manager.overlay = false;
+        self.manager.focused = false;
+        self.manager.composer.clear();
+        self.load_manager(app, None)?;
+        Ok(())
+    }
+
+    fn manager_turn_started(&mut self, app: &WipsawApp, handle: crate::app::ManagerTurnHandle) {
+        let session_id = handle.session.id.clone();
+        self.manager.session = Some(handle.session);
+        self.manager.turn = Some(ActiveManagerTurn {
+            session_id,
+            receiver: handle.receiver,
+        });
+        self.manager.activity = Some("thinking with Terra · medium".to_string());
+        self.manager.scroll = u16::MAX;
+        if let Some(session) = &self.manager.session {
+            match app.registry.list_manager_messages(&session.id, 200) {
+                Ok(messages) => self.manager.messages = messages,
+                Err(error) => self.error(error),
+            }
+        }
+    }
+
+    fn poll_manager(&mut self, app: &WipsawApp) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(turn) = self.manager.turn.as_ref() {
+            loop {
+                match turn.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected
+            && !events
+                .iter()
+                .any(|event| matches!(event, ManagerEvent::Finished(_)))
+        {
+            events.push(ManagerEvent::Finished(Err(
+                "manager worker stopped before reporting a result".to_string(),
+            )));
+        }
+        for event in events {
+            match event {
+                ManagerEvent::Started => {
+                    self.manager.activity = Some("thinking with Terra · medium".to_string());
+                }
+                ManagerEvent::Activity(activity) => {
+                    self.manager.activity = Some(activity);
+                }
+                ManagerEvent::Finished(result) => {
+                    let session_id = self
+                        .manager
+                        .turn
+                        .as_ref()
+                        .map(|turn| turn.session_id.clone())
+                        .unwrap_or_default();
+                    self.manager.turn = None;
+                    match result {
+                        Ok(result) => {
+                            if let Err(error) = app.complete_manager_turn(&result) {
+                                self.error(error);
+                            } else {
+                                self.manager.activity = result.usage.as_ref().map(|usage| {
+                                    format!(
+                                        "complete · {} in / {} cached / {} out",
+                                        usage.input_tokens,
+                                        usage.cached_input_tokens,
+                                        usage.output_tokens
+                                    )
+                                });
+                                self.notice("manager turn complete");
+                            }
+                        }
+                        Err(error) => {
+                            if let Err(registry_error) = app.fail_manager_turn(&session_id, &error)
+                            {
+                                self.error(registry_error);
+                            } else {
+                                self.manager.activity = Some("turn failed".to_string());
+                                self.error(error);
+                            }
+                        }
+                    }
+                    if let Ok(Some(session)) = app.registry.manager_session_by_id(&session_id) {
+                        if let Some(existing) = self
+                            .managers
+                            .iter_mut()
+                            .find(|manager| manager.id == session.id)
+                        {
+                            *existing = session.clone();
+                        }
+                        self.manager.session = Some(session);
+                    }
+                    if let Ok(messages) = app.registry.list_manager_messages(&session_id, 200) {
+                        self.manager.messages = messages;
+                    }
+                    self.manager.scroll = u16::MAX;
+                }
+            }
         }
     }
 
@@ -467,6 +709,7 @@ impl Navigator {
         self.accounts = app.registry.list_accounts()?;
         self.homes = app.registry.list_codex_homes()?;
         self.profiles = app.registry.list_model_profiles()?;
+        self.managers = app.registry.list_manager_sessions()?;
         self.health = SystemHealth::collect(app);
         select_id(
             &mut self.thread_state,
@@ -552,6 +795,24 @@ impl Navigator {
             }
             return Action::None;
         }
+        if self.manager.focused {
+            return self.handle_manager_key(key);
+        }
+        if self.manager.overlay {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Action::CloseManager,
+                KeyCode::Enter => Action::FocusManager,
+                KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
+                    self.manager.scroll = self.manager.scroll.saturating_sub(3);
+                    Action::None
+                }
+                KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
+                    self.manager.scroll = self.manager.scroll.saturating_add(3);
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
         if self.prefix_pending {
             self.prefix_pending = false;
             return self.handle_prefix_key(key.code);
@@ -629,7 +890,7 @@ impl Navigator {
                 self.begin_tab(false);
                 Action::None
             }
-            KeyCode::Char('m') => self.open_manager_action(),
+            KeyCode::Char('m') => Action::OpenLumbergh,
             KeyCode::Char(',') => {
                 self.begin_rename();
                 Action::None
@@ -649,12 +910,69 @@ impl Navigator {
             KeyCode::Char('n') => self.set_view(self.view.next()),
             KeyCode::Char('p') => self.set_view(self.view.previous()),
             KeyCode::Char('c') => self.begin_create(),
-            KeyCode::Char('m') => return self.open_manager_action(),
+            KeyCode::Char('m') => return Action::OpenLumbergh,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('q') => return Action::Quit,
             _ => self.notice("unknown prefix key; press ? for bindings"),
         }
         Action::None
+    }
+
+    fn handle_manager_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.manager.focused = false;
+                Action::None
+            }
+            KeyCode::Backspace => {
+                self.manager.composer.pop();
+                Action::None
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.manager.composer.clear();
+                Action::None
+            }
+            KeyCode::PageUp | KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.manager.scroll = self.manager.scroll.saturating_sub(3);
+                Action::None
+            }
+            KeyCode::PageDown | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.manager.scroll = self.manager.scroll.saturating_add(3);
+                Action::None
+            }
+            KeyCode::Enter => {
+                if self.manager.turn.is_some() {
+                    self.error("this manager is still working");
+                    return Action::None;
+                }
+                let prompt = self.manager.composer.trim().to_string();
+                if prompt.is_empty() {
+                    self.notice("type a message for the manager first");
+                    return Action::None;
+                }
+                self.manager.composer.clear();
+                let workspace_id = self
+                    .manager
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.workspace_id.clone());
+                Action::SendManagerMessage {
+                    workspace_id,
+                    prompt,
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if self.manager.composer.chars().count() < 12_000 {
+                    self.manager.composer.push(character);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) -> Action {
@@ -748,7 +1066,7 @@ impl Navigator {
 
     fn begin_tab(&mut self, start_codex: bool) {
         let Some(workspace) = self.selected_workspace() else {
-            self.error("create a workspace first · Enter on Home starts with Lumbergh");
+            self.error("create a workspace first with c, or ask Lumbergh from Home");
             return;
         };
         self.prompt = Some(Prompt::new(PromptKind::Tab {
@@ -756,17 +1074,6 @@ impl Navigator {
             start_codex,
         }));
         self.message = None;
-    }
-
-    fn open_manager_action(&mut self) -> Action {
-        let Some(workspace_id) = self
-            .selected_workspace()
-            .map(|workspace| workspace.id.clone())
-        else {
-            self.begin_workspace();
-            return Action::None;
-        };
-        Action::OpenManager { workspace_id }
     }
 
     fn begin_rename(&mut self) {
@@ -790,7 +1097,7 @@ impl Navigator {
 
     fn enter_action(&mut self) -> Action {
         match self.view {
-            View::Home => self.open_manager_action(),
+            View::Home => Action::FocusManager,
             View::Sessions if self.active == Panel::Workspaces => self
                 .selected_workspace()
                 .map(|workspace| Action::ActivateWorkspace(workspace.id.clone()))
@@ -798,9 +1105,17 @@ impl Navigator {
             View::Sessions => self
                 .selected_workspace()
                 .zip(self.selected_tab())
-                .map(|(workspace, tab)| Action::ActivateTab {
-                    workspace_id: workspace.id.clone(),
-                    tab_id: tab.id.clone(),
+                .map(|(workspace, tab)| {
+                    if is_manager_tab(tab) {
+                        Action::OpenMiddleManager {
+                            workspace_id: workspace.id.clone(),
+                        }
+                    } else {
+                        Action::ActivateTab {
+                            workspace_id: workspace.id.clone(),
+                            tab_id: tab.id.clone(),
+                        }
+                    }
                 })
                 .unwrap_or(Action::None),
             View::Threads => self
@@ -895,6 +1210,9 @@ impl Navigator {
         }
 
         self.render_footer(frame, rows[1]);
+        if self.manager.overlay {
+            self.render_manager_overlay(frame, area);
+        }
         if self.show_help {
             self.render_help(frame, area);
         }
@@ -997,7 +1315,7 @@ impl Navigator {
                 ]),
                 Line::from(vec![
                     Span::styled(" m", Style::default().fg(CYAN)),
-                    Span::styled("         manager", Style::default().fg(MUTED)),
+                    Span::styled("         Lumbergh", Style::default().fg(MUTED)),
                 ]),
                 Line::from(vec![
                     Span::styled(" ?", Style::default().fg(CYAN)),
@@ -1058,7 +1376,7 @@ impl Navigator {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9),
+                Constraint::Length(15),
                 Constraint::Length(6),
                 Constraint::Length(5),
                 Constraint::Min(5),
@@ -1142,16 +1460,18 @@ impl Navigator {
             .constraints(if compact {
                 [
                     Constraint::Length(3),
-                    Constraint::Length(7),
-                    Constraint::Length(3),
                     Constraint::Min(5),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(5),
                 ]
             } else {
                 [
                     Constraint::Length(4),
-                    Constraint::Length(8),
+                    Constraint::Min(10),
                     Constraint::Length(3),
-                    Constraint::Min(8),
+                    Constraint::Length(3),
+                    Constraint::Length(8),
                 ]
             })
             .split(area);
@@ -1169,74 +1489,168 @@ impl Navigator {
             ]),
             rows[0],
         );
-        self.render_manager_entry(frame, rows[1]);
-        self.render_quick_actions(frame, rows[2]);
-        self.render_home_activity(frame, rows[3]);
+        self.render_manager_transcript(frame, rows[1]);
+        self.render_manager_composer(frame, rows[2]);
+        self.render_quick_actions(frame, rows[3]);
+        self.render_home_activity(frame, rows[4]);
     }
 
-    fn render_manager_entry(&self, frame: &mut Frame<'_>, area: Rect) {
-        let ready = self.selected_workspace().is_some();
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Length(3),
-                Constraint::Min(1),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        "LUMBERGH",
-                        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" // CODEX MANAGER", Style::default().fg(INK)),
-                ]),
-                Line::styled(
-                    "Tell me what you want to set up, run, or inspect.",
-                    Style::default().fg(MUTED),
+    fn render_manager_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
+        let label = self.manager_label();
+        let activity = self.manager.activity.as_deref().unwrap_or("ready");
+        let block = Block::default()
+            .title(Line::from(vec![
+                Span::styled(
+                    format!(" {label} "),
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
                 ),
-            ]),
-            rows[0],
+                Span::styled("CODEX MANAGER · TERRA MEDIUM", Style::default().fg(MUTED)),
+                Span::styled(format!(" · {activity} "), Style::default().fg(AMBER)),
+            ]))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if self.manager.turn.is_some() {
+                AMBER
+            } else {
+                CYAN
+            }))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        let lines = manager_transcript_lines(
+            &self.manager.messages,
+            label,
+            inner.width.saturating_sub(1).max(12) as usize,
         );
+        let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+        let scroll = if self.manager.scroll == u16::MAX {
+            max_scroll
+        } else {
+            self.manager.scroll.min(max_scroll)
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .scroll((scroll, 0))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_manager_composer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let label = self.manager_label();
+        let prompt = if self.manager.turn.is_some() {
+            self.manager
+                .activity
+                .as_deref()
+                .unwrap_or("working…")
+                .to_string()
+        } else if self.manager.composer.is_empty() {
+            format!("Ask {label} to set up, run, or inspect something…")
+        } else {
+            tail_text(
+                &self.manager.composer,
+                area.width.saturating_sub(7) as usize,
+            )
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("› ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    if ready {
-                        "Ask Lumbergh anything…"
+                    prompt,
+                    Style::default().fg(if self.manager.composer.is_empty() {
+                        MUTED
                     } else {
-                        "Create a workspace and meet Lumbergh…"
+                        INK
+                    }),
+                ),
+                Span::styled(
+                    if self.manager.focused && self.manager.turn.is_none() {
+                        "█"
+                    } else {
+                        ""
                     },
-                    Style::default().fg(INK),
+                    Style::default().fg(CYAN),
                 ),
             ]))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CYAN))
-                    .style(Style::default().bg(PANEL)),
+                    .border_style(Style::default().fg(if self.manager.focused {
+                        CYAN
+                    } else {
+                        BORDER
+                    }))
+                    .style(Style::default().bg(DEEP)),
             ),
-            rows[1],
+            area,
         );
+    }
+
+    fn render_manager_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let popup = centered_rect(area, 104, area.height.saturating_sub(4));
+        frame.render_widget(Clear, popup);
+        frame.render_widget(Block::default().style(Style::default().bg(DEEP)), popup);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(6),
+                Constraint::Length(3),
+                Constraint::Length(2),
+            ])
+            .split(inset(popup, 1, 1));
+        let workspace = self
+            .manager
+            .session
+            .as_ref()
+            .and_then(|session| session.workspace_name.as_deref())
+            .unwrap_or("workspace");
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        "MIDDLE MANAGER",
+                        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  //  {workspace}"), Style::default().fg(INK)),
+                ]),
+                Line::styled(
+                    "Workspace-scoped · private Wipsaw MCP tools · escalates cross-workspace work to Lumbergh",
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            rows[0],
+        );
+        self.render_manager_transcript(frame, rows[1]);
+        self.render_manager_composer(frame, rows[2]);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
+                Span::styled("Enter", Style::default().fg(CYAN)),
+                Span::styled(" send  ·  ", Style::default().fg(MUTED)),
+                Span::styled("Esc", Style::default().fg(CYAN)),
                 Span::styled(
-                    "Enter",
-                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    if ready {
-                        "  talk to manager"
+                    if self.manager.focused {
+                        " leave composer"
                     } else {
-                        "  name a workspace, then talk to manager"
+                        " close Middle Manager"
                     },
                     Style::default().fg(MUTED),
                 ),
             ])),
-            rows[2],
+            rows[3],
         );
+    }
+
+    fn manager_label(&self) -> &'static str {
+        if self
+            .manager
+            .session
+            .as_ref()
+            .is_some_and(|session| session.workspace_id.is_some())
+        {
+            "MIDDLE MANAGER"
+        } else {
+            "LUMBERGH"
+        }
     }
 
     fn render_quick_actions(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1279,11 +1693,11 @@ impl Navigator {
                     ),
                     Line::raw(""),
                     Line::styled(
-                        "Press Enter. Wipsaw will use this directory and your current Codex home/auth.",
+                        "Press c to create one here, or tell Lumbergh what you want built.",
                         Style::default().fg(INK),
                     ),
                     Line::styled(
-                        "You can ask Lumbergh to organize everything else after it opens.",
+                        "The top manager is already available above with your current Codex auth.",
                         Style::default().fg(MUTED),
                     ),
                 ])
@@ -1330,17 +1744,21 @@ impl Navigator {
                     .codex_home_id
                     .as_deref()
                     .and_then(|id| self.homes.iter().find(|home| home.id == id));
-                let kind = if tab.name.eq_ignore_ascii_case("manager") {
-                    "manager"
+                let kind = if is_manager_tab(tab) {
+                    "middle manager"
                 } else if tab.codex_thread_id.is_some() {
                     "codex"
                 } else {
                     "shell"
                 };
-                let model = thread
-                    .map(|thread| thread.model.as_str())
-                    .or_else(|| profile.map(|profile| profile.model.as_str()))
-                    .unwrap_or("default");
+                let model = if is_manager_tab(tab) {
+                    MANAGER_MODEL
+                } else {
+                    thread
+                        .map(|thread| thread.model.as_str())
+                        .or_else(|| profile.map(|profile| profile.model.as_str()))
+                        .unwrap_or("default")
+                };
                 let account = thread
                     .map(|thread| thread.account_alias.as_str())
                     .or_else(|| home.map(|home| home.account_alias.as_str()))
@@ -1363,10 +1781,10 @@ impl Navigator {
         let table = Table::new(
             rows,
             [
-                Constraint::Percentage(28),
-                Constraint::Length(9),
-                Constraint::Percentage(24),
+                Constraint::Percentage(26),
+                Constraint::Length(15),
                 Constraint::Percentage(20),
+                Constraint::Percentage(16),
                 Constraint::Length(9),
             ],
         )
@@ -1471,8 +1889,8 @@ impl Navigator {
             self.tabs
                 .iter()
                 .map(|tab| {
-                    let kind = if tab.name.eq_ignore_ascii_case("manager") {
-                        "MANAGER"
+                    let kind = if is_manager_tab(tab) {
+                        "MIDDLE MANAGER"
                     } else if tab.codex_thread_id.is_some() {
                         "CODEX"
                     } else {
@@ -1539,6 +1957,40 @@ impl Navigator {
             .model_profile_id
             .as_deref()
             .and_then(|id| self.profiles.iter().find(|profile| profile.id == id));
+        if is_manager_tab(tab) {
+            let manager = self
+                .managers
+                .iter()
+                .find(|manager| manager.workspace_id.as_deref() == Some(&tab.workspace_id));
+            let manager_thread = manager
+                .and_then(|manager| manager.native_thread_id.as_deref())
+                .map(short_id)
+                .unwrap_or_else(|| "starts on first message".to_string());
+            let detail = vec![
+                detail_line("type", "Middle Manager"),
+                detail_line("model", "gpt-5.6-terra · medium"),
+                detail_line(
+                    "account",
+                    home.map(|home| home.account_alias.as_str())
+                        .unwrap_or("current"),
+                ),
+                detail_line("home", "Wipsaw isolated manager home"),
+                detail_line("thread", &manager_thread),
+                detail_line("scope", &tab.workspace_id),
+            ];
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(
+                        Block::default()
+                            .title(section_title("RESOLVED CONTEXT"))
+                            .borders(Borders::TOP)
+                            .border_style(Style::default().fg(BORDER)),
+                    )
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
         let detail = vec![
             detail_line("type", if thread.is_some() { "Codex" } else { "shell" }),
             detail_line(
@@ -1750,17 +2202,7 @@ impl Navigator {
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let (status, is_error) = self.message.clone().unwrap_or_else(|| {
             let text = match self.view {
-                View::Home => self
-                    .selected_workspace()
-                    .map(|workspace| {
-                        format!(
-                            "Enter opens Lumbergh for '{}' · j/k switches workspace",
-                            workspace.name
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        "Enter creates your first workspace and opens Lumbergh".to_string()
-                    }),
+                View::Home => "Enter writes to Lumbergh · c creates a workspace".to_string(),
                 View::Sessions if self.active == Panel::Workspaces => self
                     .selected_workspace()
                     .map(|workspace| {
@@ -1769,7 +2211,13 @@ impl Navigator {
                     .unwrap_or_else(|| "c creates a workspace".to_string()),
                 View::Sessions => self
                     .selected_tab()
-                    .map(|tab| format!("Enter opens '{}' · , renames it", tab.name))
+                    .map(|tab| {
+                        if is_manager_tab(tab) {
+                            "Enter talks to this workspace's Middle Manager".to_string()
+                        } else {
+                            format!("Enter opens '{}' · , renames it", tab.name)
+                        }
+                    })
                     .unwrap_or_else(|| "t creates a shell · n creates Codex".to_string()),
                 View::Threads => self
                     .selected_thread()
@@ -1780,11 +2228,11 @@ impl Navigator {
             (text, false)
         });
         let keys = if self.prefix_pending {
-            "PREFIX C-b · w home  s sessions  t threads  g WIPs  m manager  n/p views"
+            "PREFIX C-b · w home  s sessions  t threads  g WIPs  m Lumbergh  n/p views"
         } else if area.width < 92 {
-            "↑↓ move  Enter open  c workspace  n Codex  m manager  ? guide"
+            "↑↓ move  Enter open  c workspace  n Codex  m Lumbergh  ? guide"
         } else {
-            "↑↓ move   Enter open   c workspace   n Codex   t shell   m manager   / commands   ? guide"
+            "↑↓ move   Enter open   c workspace   n Codex   t shell   m Lumbergh   / commands   ? guide"
         };
         frame.render_widget(
             Paragraph::new(vec![
@@ -1818,9 +2266,11 @@ impl Navigator {
                 "START HERE",
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
-            Line::from("  1. Press Enter on Home to open Lumbergh, your persistent Codex manager."),
             Line::from(
-                "  2. Tell Lumbergh what you want: create tabs, choose models, or prepare a WIP.",
+                "  1. Lumbergh is always embedded on Home. Press Enter and describe what you need.",
+            ),
+            Line::from(
+                "  2. Each workspace also has a Middle Manager; open its manager tab from Sessions.",
             ),
             Line::from("  3. From any managed tab, press Ctrl-b w to return to this dashboard."),
             Line::from("  Stopped workspaces are rebuilt automatically when you open them."),
@@ -1838,7 +2288,7 @@ impl Navigator {
             Line::styled("TMUX-FAMILIAR PREFIX", Style::default().fg(AMBER)),
             Line::from("  C-b w          toggle this navigator"),
             Line::from("  C-b c / ,      create / rename a managed tab"),
-            Line::from("  C-b m          open Lumbergh"),
+            Line::from("  C-b m          open this workspace's Middle Manager from a terminal"),
             Line::from("  C-b n / p      next / previous tmux tab outside this popup"),
             Line::raw(""),
             Line::styled(
@@ -1906,7 +2356,7 @@ impl Prompt {
     fn label(&self) -> &'static str {
         match self.kind {
             PromptKind::Workspace => {
-                "Workspace name · Lumbergh starts next in the current directory"
+                "Workspace name · its Middle Manager starts in the current directory"
             }
             PromptKind::Tab {
                 start_codex: false, ..
@@ -1957,9 +2407,121 @@ enum Action {
         thread_id: String,
         workspace_id: Option<String>,
     },
-    OpenManager {
+    OpenLumbergh,
+    OpenMiddleManager {
         workspace_id: String,
     },
+    CloseManager,
+    FocusManager,
+    SendManagerMessage {
+        workspace_id: Option<String>,
+        prompt: String,
+    },
+}
+
+fn is_manager_tab(tab: &Tab) -> bool {
+    tab.name.eq_ignore_ascii_case("middle-manager") || tab.name.eq_ignore_ascii_case("manager")
+}
+
+fn manager_transcript_lines(
+    messages: &[ManagerMessage],
+    manager_label: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if messages.is_empty() {
+        return vec![
+            Line::styled(
+                format!("{manager_label} IS READY"),
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                if manager_label == "LUMBERGH" {
+                    "This is Wipsaw's one top manager. Ask for a workspace, Codex session, model setup, account, or WIP."
+                } else {
+                    "This manager owns the selected workspace. Ask it to organize sessions, choose models, inspect state, or prepare work."
+                },
+                Style::default().fg(INK),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "Only Wipsaw's manager skill and private MCP tools are loaded; shell, personal MCPs, plugins, apps, and other skills stay outside this session.",
+                Style::default().fg(MUTED),
+            ),
+        ];
+    }
+    let mut lines = Vec::new();
+    for message in messages {
+        let (label, color) = match message.role.as_str() {
+            "user" => ("YOU", AMBER),
+            "assistant" => (manager_label, CYAN),
+            _ => ("WIPSAW", RED),
+        };
+        lines.push(Line::styled(
+            label.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        for line in wrap_text(&message.content, width.saturating_sub(2).max(8)) {
+            lines.push(Line::styled(format!("  {line}"), Style::default().fg(INK)));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for source_line in value.lines() {
+        if source_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for source_word in source_line.split_whitespace() {
+            let mut word = source_word.to_string();
+            loop {
+                let separator = usize::from(!line.is_empty());
+                let available = width.saturating_sub(line.chars().count() + separator);
+                let word_len = word.chars().count();
+                if word_len <= available {
+                    if !line.is_empty() {
+                        line.push(' ');
+                    }
+                    line.push_str(&word);
+                    break;
+                }
+                if !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    continue;
+                }
+                let chunk = word.chars().take(width).collect::<String>();
+                word = word.chars().skip(width).collect();
+                lines.push(chunk);
+                if word.is_empty() {
+                    break;
+                }
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn tail_text(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .skip(count.saturating_sub(max_chars))
+        .collect()
 }
 
 fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
@@ -2108,7 +2670,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::{Action, Navigator, PromptKind};
+    use super::{Action, Navigator, wrap_text};
+
+    #[test]
+    fn transcript_wraps_unbroken_ids_without_overflowing() {
+        let lines = wrap_text("manager_019fe42934a67d13b2dd6e8cb949d034 ready", 12);
+        assert!(lines.iter().all(|line| line.chars().count() <= 12));
+        assert!(lines.last().is_some_and(|line| line.ends_with("ready")));
+    }
 
     #[test]
     fn empty_navigator_renders_manager_first_dashboard() {
@@ -2156,14 +2725,11 @@ mod tests {
     }
 
     #[test]
-    fn home_enter_starts_first_workspace_manager_flow() {
+    fn home_enter_focuses_the_embedded_lumbergh_composer() {
         let mut navigator = Navigator::empty();
 
-        assert!(matches!(navigator.enter_action(), Action::None));
-        assert!(matches!(
-            navigator.prompt.as_ref().map(|prompt| &prompt.kind),
-            Some(PromptKind::Workspace)
-        ));
+        assert!(matches!(navigator.enter_action(), Action::FocusManager));
+        assert!(navigator.prompt.is_none());
     }
 
     #[test]

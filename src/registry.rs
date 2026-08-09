@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Result, WipsawError};
 use crate::model::{
-    Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ModelProfile,
-    ModelProfileSettings, Tab, Workspace,
+    Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ManagerKind,
+    ManagerMessage, ManagerSession, ModelProfile, ModelProfileSettings, Tab, Workspace,
 };
 
 const LOCAL_HOST_ID: &str = "host_local";
@@ -58,6 +58,16 @@ pub struct NewCodexThread<'a> {
     /// If present, bind the thread and its resolved home/profile to this tab in
     /// the same transaction as the thread insert.
     pub bind_tab_id: Option<&'a str>,
+}
+
+pub struct NewManagerSession<'a> {
+    pub id: &'a str,
+    pub kind: ManagerKind,
+    pub workspace_id: Option<&'a str>,
+    pub source_codex_home_id: &'a str,
+    pub cwd: &'a Path,
+    pub model: &'a str,
+    pub reasoning_effort: &'a str,
 }
 
 pub struct NewModelProfile<'a> {
@@ -247,6 +257,66 @@ impl Registry {
             transaction.commit()?;
         }
 
+        if version < 4 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS manager_sessions (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK(kind IN ('lumbergh', 'middle-manager')),
+                    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+                    source_codex_home_id TEXT NOT NULL REFERENCES codex_homes(id) ON DELETE RESTRICT,
+                    native_thread_id TEXT,
+                    cwd TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    last_error TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    CHECK (
+                        (kind = 'lumbergh' AND workspace_id IS NULL) OR
+                        (kind = 'middle-manager' AND workspace_id IS NOT NULL)
+                    )
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_manager_sessions_workspace
+                    ON manager_sessions(workspace_id)
+                    WHERE workspace_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_manager_sessions_lumbergh
+                    ON manager_sessions(kind)
+                    WHERE kind = 'lumbergh';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_manager_sessions_native_thread
+                    ON manager_sessions(source_codex_home_id, native_thread_id)
+                    WHERE native_thread_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS manager_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manager_session_id TEXT NOT NULL REFERENCES manager_sessions(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_manager_messages_session
+                    ON manager_messages(manager_session_id, id);
+
+                UPDATE tabs AS manager_tab
+                SET name = 'middle-manager',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE lower(manager_tab.name) = 'manager'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tabs AS existing
+                      WHERE existing.workspace_id = manager_tab.workspace_id
+                        AND lower(existing.name) = 'middle-manager'
+                  );
+
+                PRAGMA user_version = 4;
+                "#,
+            )?;
+            transaction.commit()?;
+        }
+
         self.connection.execute(
             "INSERT OR IGNORE INTO hosts (id, name, kind) VALUES (?1, 'local', 'local')",
             [LOCAL_HOST_ID],
@@ -273,7 +343,7 @@ impl Registry {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO tabs (id, workspace_id, name, tmux_window_id, tmux_window_index, cwd, account_id, codex_home_id) VALUES (?1, ?2, 'manager', ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tabs (id, workspace_id, name, tmux_window_id, tmux_window_index, cwd, account_id, codex_home_id) VALUES (?1, ?2, 'middle-manager', ?3, ?4, ?5, ?6, ?7)",
             params![
                 input.manager_tab_id,
                 input.id,
@@ -566,6 +636,194 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    pub fn insert_manager_session(&self, input: NewManagerSession<'_>) -> Result<ManagerSession> {
+        self.connection.execute(
+            "INSERT INTO manager_sessions (id, kind, workspace_id, source_codex_home_id, cwd, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                input.id,
+                input.kind.to_string(),
+                input.workspace_id,
+                input.source_codex_home_id,
+                path_text(input.cwd),
+                input.model,
+                input.reasoning_effort,
+            ],
+        )?;
+        self.manager_session_by_id(input.id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "manager session",
+                value: input.id.to_string(),
+            })
+    }
+
+    pub fn manager_session_for_workspace(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<ManagerSession>> {
+        let sql = match workspace_id {
+            Some(_) => format!("{MANAGER_SESSION_SELECT} WHERE m.workspace_id = ?1 LIMIT 1"),
+            None => format!(
+                "{MANAGER_SESSION_SELECT} WHERE m.kind = 'lumbergh' AND m.workspace_id IS NULL LIMIT 1"
+            ),
+        };
+        if let Some(workspace_id) = workspace_id {
+            self.connection
+                .query_row(&sql, [workspace_id], manager_session_from_row)
+                .optional()
+                .map_err(Into::into)
+        } else {
+            self.connection
+                .query_row(&sql, [], manager_session_from_row)
+                .optional()
+                .map_err(Into::into)
+        }
+    }
+
+    pub fn manager_session_by_id(&self, id: &str) -> Result<Option<ManagerSession>> {
+        self.connection
+            .query_row(
+                &format!("{MANAGER_SESSION_SELECT} WHERE m.id = ?1 LIMIT 1"),
+                [id],
+                manager_session_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_manager_sessions(&self) -> Result<Vec<ManagerSession>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{MANAGER_SESSION_SELECT} ORDER BY CASE m.kind WHEN 'lumbergh' THEN 0 ELSE 1 END, w.name COLLATE NOCASE"
+        ))?;
+        let rows = statement.query_map([], manager_session_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn append_manager_message(
+        &self,
+        manager_session_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<ManagerMessage> {
+        if !["user", "assistant", "system"].contains(&role) {
+            return Err(WipsawError::InvalidInput {
+                field: "manager message role",
+                message: format!("'{role}' must be user, assistant, or system"),
+            });
+        }
+        if content.trim().is_empty() {
+            return Err(WipsawError::InvalidInput {
+                field: "manager message",
+                message: "must not be empty".to_string(),
+            });
+        }
+        self.connection.execute(
+            "INSERT INTO manager_messages (manager_session_id, role, content) VALUES (?1, ?2, ?3)",
+            params![manager_session_id, role, content],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        self.connection
+            .query_row(
+                &format!("{MANAGER_MESSAGE_SELECT} WHERE id = ?1"),
+                [id],
+                manager_message_from_row,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn list_manager_messages(
+        &self,
+        manager_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ManagerMessage>> {
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT * FROM ({MANAGER_MESSAGE_SELECT} WHERE manager_session_id = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id"
+        ))?;
+        let rows = statement.query_map(
+            params![manager_session_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            manager_message_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_manager_working(&self, manager_session_id: &str) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE manager_sessions SET status = 'working', last_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            [manager_session_id],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "manager session",
+                value: manager_session_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn complete_manager_turn(
+        &self,
+        manager_session_id: &str,
+        native_thread_id: &str,
+        message: &str,
+    ) -> Result<ManagerMessage> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE manager_sessions SET native_thread_id = ?2, status = 'idle', last_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![manager_session_id, native_thread_id],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "manager session",
+                value: manager_session_id.to_string(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO manager_messages (manager_session_id, role, content) VALUES (?1, 'assistant', ?2)",
+            params![manager_session_id, message],
+        )?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        self.connection
+            .query_row(
+                &format!("{MANAGER_MESSAGE_SELECT} WHERE id = ?1"),
+                [id],
+                manager_message_from_row,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn fail_manager_turn(
+        &self,
+        manager_session_id: &str,
+        error: &str,
+    ) -> Result<ManagerMessage> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE manager_sessions SET status = 'error', last_error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![manager_session_id, error],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "manager session",
+                value: manager_session_id.to_string(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO manager_messages (manager_session_id, role, content) VALUES (?1, 'system', ?2)",
+            params![manager_session_id, error],
+        )?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        self.connection
+            .query_row(
+                &format!("{MANAGER_MESSAGE_SELECT} WHERE id = ?1"),
+                [id],
+                manager_message_from_row,
+            )
+            .map_err(Into::into)
+    }
+
     pub fn insert_model_profile(&self, input: NewModelProfile<'_>) -> Result<ModelProfile> {
         if self.model_profile_by_ref(input.name)?.is_some() {
             return Err(WipsawError::AlreadyExists {
@@ -789,6 +1047,9 @@ const CODEX_HOME_SELECT: &str = "SELECT h.id, h.name, h.host_id, h.account_id, a
 const TAB_SELECT: &str = "SELECT id, workspace_id, name, tmux_window_id, tmux_window_index, cwd, account_id, codex_home_id, model_profile_id, codex_thread_id, created_at, updated_at FROM tabs";
 const MODEL_PROFILE_SELECT: &str = "SELECT id, name, provider, model, reasoning_effort, search, sandbox, approval_policy, created_at, updated_at FROM model_profiles";
 const CODEX_THREAD_SELECT: &str = "SELECT t.id, t.codex_home_id, h.account_id, a.alias, t.native_thread_id, t.name, t.cwd, t.model_profile_id, t.model, t.model_provider, t.reasoning_effort, t.status, t.rollout_path, t.native_created_at, t.created_at, t.updated_at FROM codex_threads t JOIN codex_homes h ON h.id = t.codex_home_id JOIN accounts a ON a.id = h.account_id";
+const MANAGER_SESSION_SELECT: &str = "SELECT m.id, m.kind, m.workspace_id, w.name, m.source_codex_home_id, m.native_thread_id, m.cwd, m.model, m.reasoning_effort, m.status, m.last_error, m.created_at, m.updated_at FROM manager_sessions m LEFT JOIN workspaces w ON w.id = m.workspace_id";
+const MANAGER_MESSAGE_SELECT: &str =
+    "SELECT id, manager_session_id, role, content, created_at FROM manager_messages";
 
 fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     Ok(Workspace {
@@ -838,6 +1099,35 @@ fn codex_thread_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodexThrea
         native_created_at: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+    })
+}
+
+fn manager_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerSession> {
+    let kind = row.get::<_, String>(1)?.parse().map_err(conversion_error)?;
+    Ok(ManagerSession {
+        id: row.get(0)?,
+        kind,
+        workspace_id: row.get(2)?,
+        workspace_name: row.get(3)?,
+        source_codex_home_id: row.get(4)?,
+        native_thread_id: row.get(5)?,
+        cwd: PathBuf::from(row.get::<_, String>(6)?),
+        model: row.get(7)?,
+        reasoning_effort: row.get(8)?,
+        status: row.get(9)?,
+        last_error: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn manager_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagerMessage> {
+    Ok(ManagerMessage {
+        id: row.get(0)?,
+        manager_session_id: row.get(1)?,
+        role: row.get(2)?,
+        content: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
@@ -899,10 +1189,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        NewAccount, NewCodexHome, NewCodexThread, NewCurrentCodex, NewModelProfile, NewTab,
-        NewWorkspace, Registry,
+        NewAccount, NewCodexHome, NewCodexThread, NewCurrentCodex, NewManagerSession,
+        NewModelProfile, NewTab, NewWorkspace, Registry,
     };
-    use crate::model::{AccountAuthKind, AccountOwnerKind, ModelProfileSettings};
+    use crate::model::{AccountAuthKind, AccountOwnerKind, ManagerKind, ModelProfileSettings};
 
     fn registry() -> (tempfile::TempDir, Registry) {
         let root = tempdir().unwrap();
@@ -929,7 +1219,7 @@ mod tests {
         assert_eq!(workspace.name, "development");
         let tabs = registry.list_tabs(&workspace.id).unwrap();
         assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].name, "manager");
+        assert_eq!(tabs[0].name, "middle-manager");
         assert_eq!(
             registry
                 .workspace_by_tmux_session("wipsaw-01900000")
@@ -944,7 +1234,94 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .name,
-            "manager"
+            "middle-manager"
+        );
+    }
+
+    #[test]
+    fn lumbergh_and_middle_managers_keep_separate_threads_and_history() {
+        let (_root, mut registry) = registry();
+        registry
+            .bootstrap_current_codex(NewCurrentCodex {
+                account_id: "acct_01900000000070008000000000000000",
+                home_id: "home_01900000000070008000000000000000",
+                path: Path::new("/tmp/current-codex-home"),
+                codex_binary: Path::new("/usr/bin/codex"),
+            })
+            .unwrap();
+        let workspace = registry
+            .insert_workspace_with_manager(NewWorkspace {
+                id: "ws_01900000000070008000000000000000",
+                name: "development",
+                tmux_session: "wipsaw-01900000",
+                cwd: Path::new("/tmp/development"),
+                manager_tab_id: "tab_01900000000070008000000000000000",
+                manager_window_id: "@1",
+                manager_window_index: 0,
+                manager_account_id: Some("acct_01900000000070008000000000000000"),
+                manager_codex_home_id: Some("home_01900000000070008000000000000000"),
+            })
+            .unwrap();
+        let lumbergh = registry
+            .insert_manager_session(NewManagerSession {
+                id: "manager_01900000000070008000000000000000",
+                kind: ManagerKind::Lumbergh,
+                workspace_id: None,
+                source_codex_home_id: "home_01900000000070008000000000000000",
+                cwd: Path::new("/tmp"),
+                model: "gpt-5.6-terra",
+                reasoning_effort: "medium",
+            })
+            .unwrap();
+        let middle = registry
+            .insert_manager_session(NewManagerSession {
+                id: "manager_01900000000070008000000000000001",
+                kind: ManagerKind::MiddleManager,
+                workspace_id: Some(&workspace.id),
+                source_codex_home_id: "home_01900000000070008000000000000000",
+                cwd: &workspace.cwd,
+                model: "gpt-5.6-terra",
+                reasoning_effort: "medium",
+            })
+            .unwrap();
+        registry
+            .append_manager_message(&lumbergh.id, "user", "list everything")
+            .unwrap();
+        registry.mark_manager_working(&lumbergh.id).unwrap();
+        registry
+            .complete_manager_turn(
+                &lumbergh.id,
+                "01900000-0000-7000-8000-000000000001",
+                "Here is the overview.",
+            )
+            .unwrap();
+
+        let messages = registry.list_manager_messages(&lumbergh.id, 10).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        let updated = registry
+            .manager_session_by_id(&lumbergh.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "idle");
+        assert_eq!(
+            updated.native_thread_id.as_deref(),
+            Some("01900000-0000-7000-8000-000000000001")
+        );
+        assert_eq!(
+            registry
+                .manager_session_for_workspace(Some(&workspace.id))
+                .unwrap()
+                .unwrap()
+                .id,
+            middle.id
+        );
+        assert!(
+            registry
+                .list_manager_messages(&middle.id, 10)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1062,7 +1439,7 @@ mod tests {
             1
         );
         let manager = registry
-            .tab_by_ref("ws_01900000000070008000000000000000", "manager")
+            .tab_by_ref("ws_01900000000070008000000000000000", "middle-manager")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1111,7 +1488,7 @@ mod tests {
         let tabs = registry.list_tabs(&workspace.id).unwrap();
         assert_eq!(
             tabs.iter().map(|tab| tab.name.as_str()).collect::<Vec<_>>(),
-            ["manager", "api"]
+            ["middle-manager", "api"]
         );
     }
 
@@ -1163,7 +1540,7 @@ mod tests {
         let tabs = registry.list_tabs(&workspace.id).unwrap();
         assert_eq!(tabs[0].name, "api");
         assert_eq!(tabs[0].tmux_window_id, "@1");
-        assert_eq!(tabs[1].name, "manager");
+        assert_eq!(tabs[1].name, "middle-manager");
         assert_eq!(tabs[1].tmux_window_id, "@2");
     }
 

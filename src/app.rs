@@ -16,15 +16,19 @@ use crate::codex::{
 };
 use crate::error::{Result, WipsawError};
 use crate::id::{EntityKind, WipsawId};
+use crate::manager::{
+    MANAGER_MODEL, MANAGER_REASONING_EFFORT, ManagerEvent, ManagerTurnRequest, ManagerTurnResult,
+    prepare_runtime, spawn_turn,
+};
 use crate::model::{
-    Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ModelProfile,
-    ModelProfileSettings, Tab, Workspace, validate_credential_ref, validate_display_name,
-    validate_model_name, validate_profile_settings,
+    Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ManagerKind,
+    ManagerMessage, ManagerSession, ModelProfile, ModelProfileSettings, Tab, Workspace,
+    validate_credential_ref, validate_display_name, validate_model_name, validate_profile_settings,
 };
 use crate::paths::AppPaths;
 use crate::registry::{
-    NewAccount, NewCodexHome, NewCodexThread, NewCurrentCodex, NewModelProfile, NewTab,
-    NewWorkspace, Registry,
+    NewAccount, NewCodexHome, NewCodexThread, NewCurrentCodex, NewManagerSession, NewModelProfile,
+    NewTab, NewWorkspace, Registry,
 };
 use crate::shell;
 use crate::shortcuts;
@@ -67,8 +71,13 @@ pub struct WipsawInitialization {
 pub struct WorkspaceStart {
     pub workspace: Workspace,
     pub restored: bool,
-    pub manager_thread_id: String,
-    pub native_manager_thread_id: String,
+    pub manager_session_id: String,
+    pub native_manager_thread_id: Option<String>,
+}
+
+pub struct ManagerTurnHandle {
+    pub session: ManagerSession,
+    pub receiver: std::sync::mpsc::Receiver<ManagerEvent>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -108,6 +117,10 @@ impl WipsawApp {
         if let Some(home) = app.registry.preferred_codex_home(None)? {
             app.registry
                 .apply_default_codex_home_to_unconfigured_tabs(&home)?;
+            app.ensure_lumbergh()?;
+            for workspace in app.registry.list_workspaces()? {
+                app.ensure_middle_manager(&workspace.id)?;
+            }
         }
         Ok(app)
     }
@@ -191,16 +204,16 @@ impl WipsawApp {
     }
 
     /// Ensure the workspace has a live tmux session, reconcile every durable
-    /// tab with a real window, and keep its persistent manager Codex process
-    /// running. A stopped workspace is reconstructed from registry metadata.
+    /// tab with a real window, and make its embedded Middle Manager available.
+    /// A stopped workspace is reconstructed from registry metadata.
     pub fn start_workspace(&mut self, reference: &str) -> Result<WorkspaceStart> {
         let workspace = self.workspace(reference)?;
         let restored = self.ensure_workspace_runtime(&workspace)?;
-        let manager = self.start_tab_codex(&workspace.id, "manager")?;
+        let manager = self.ensure_middle_manager(&workspace.id)?;
         Ok(WorkspaceStart {
             workspace,
             restored,
-            manager_thread_id: manager.id,
+            manager_session_id: manager.id,
             native_manager_thread_id: manager.native_thread_id,
         })
     }
@@ -307,16 +320,13 @@ impl WipsawApp {
             });
         }
         let mut tabs = self.registry.list_tabs(&workspace.id)?;
-        if !tabs
-            .iter()
-            .any(|tab| tab.name.eq_ignore_ascii_case("manager"))
-        {
+        if !tabs.iter().any(is_manager_tab) {
             return Err(WipsawError::NotFound {
                 entity: "manager tab",
                 value: workspace.name.clone(),
             });
         }
-        tabs.sort_by_key(|tab| !tab.name.eq_ignore_ascii_case("manager"));
+        tabs.sort_by_key(|tab| !is_manager_tab(tab));
 
         let was_running = self.tmux.session_exists(&workspace.tmux_session)?;
         let mut restored = !was_running;
@@ -663,6 +673,175 @@ impl WipsawApp {
         self.registry.list_codex_threads(home_id.as_deref())
     }
 
+    pub fn ensure_lumbergh(&self) -> Result<ManagerSession> {
+        if let Some(session) = self.registry.manager_session_for_workspace(None)? {
+            return Ok(session);
+        }
+        let home = self.manager_source_home(None)?;
+        let cwd = env::current_dir()?;
+        let id = WipsawId::new(EntityKind::ManagerSession);
+        self.registry.insert_manager_session(NewManagerSession {
+            id: id.as_str(),
+            kind: ManagerKind::Lumbergh,
+            workspace_id: None,
+            source_codex_home_id: &home.id,
+            cwd: &cwd,
+            model: MANAGER_MODEL,
+            reasoning_effort: MANAGER_REASONING_EFFORT,
+        })
+    }
+
+    pub fn ensure_middle_manager(&self, workspace_ref: &str) -> Result<ManagerSession> {
+        let workspace = self.workspace(workspace_ref)?;
+        if let Some(session) = self
+            .registry
+            .manager_session_for_workspace(Some(&workspace.id))?
+        {
+            return Ok(session);
+        }
+        let home = self.manager_source_home(Some(&workspace))?;
+        let id = WipsawId::new(EntityKind::ManagerSession);
+        self.registry.insert_manager_session(NewManagerSession {
+            id: id.as_str(),
+            kind: ManagerKind::MiddleManager,
+            workspace_id: Some(&workspace.id),
+            source_codex_home_id: &home.id,
+            cwd: &workspace.cwd,
+            model: MANAGER_MODEL,
+            reasoning_effort: MANAGER_REASONING_EFFORT,
+        })
+    }
+
+    pub fn manager_messages(
+        &self,
+        workspace_ref: Option<&str>,
+    ) -> Result<(ManagerSession, Vec<ManagerMessage>)> {
+        let session = match workspace_ref {
+            Some(workspace) => self.ensure_middle_manager(workspace)?,
+            None => self.ensure_lumbergh()?,
+        };
+        let messages = self.registry.list_manager_messages(&session.id, 200)?;
+        Ok((session, messages))
+    }
+
+    pub fn start_manager_turn(
+        &self,
+        workspace_ref: Option<&str>,
+        prompt: &str,
+    ) -> Result<ManagerTurnHandle> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(WipsawError::InvalidInput {
+                field: "manager message",
+                message: "must not be empty".to_string(),
+            });
+        }
+        if prompt.chars().count() > 12_000 {
+            return Err(WipsawError::InvalidInput {
+                field: "manager message",
+                message: "must be 12,000 characters or fewer".to_string(),
+            });
+        }
+        let session = match workspace_ref {
+            Some(workspace) => self.ensure_middle_manager(workspace)?,
+            None => self.ensure_lumbergh()?,
+        };
+        let source_home = self
+            .registry
+            .codex_home_by_ref(&session.source_codex_home_id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex home",
+                value: session.source_codex_home_id.clone(),
+            })?;
+        let launcher_home = BaseDirs::new()
+            .map(|base| base.home_dir().to_path_buf())
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "home directory",
+                message: "could not resolve the Codex launcher home".to_string(),
+            })?;
+        let runtime = prepare_runtime(&self.paths, &source_home, &session, &launcher_home)?;
+        let executable = env::current_exe()?;
+        let environment = vec![
+            (
+                OsString::from("WIPSAW_MANAGER_EXECUTABLE"),
+                executable.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("WIPSAW_CONFIG_DIR"),
+                self.paths.config_dir.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("WIPSAW_STATE_DIR"),
+                self.paths.state_dir.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("WIPSAW_DATA_DIR"),
+                self.paths.data_dir.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("WIPSAW_RUNTIME_DIR"),
+                self.paths.runtime_dir.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("WIPSAW_TMUX_SOCKET"),
+                OsString::from(self.tmux.socket_name()),
+            ),
+            (
+                OsString::from("WIPSAW_TMUX_BIN"),
+                self.tmux.binary().as_os_str().to_owned(),
+            ),
+        ];
+        self.registry
+            .append_manager_message(&session.id, "user", prompt)?;
+        self.registry.mark_manager_working(&session.id)?;
+        let receiver = spawn_turn(ManagerTurnRequest {
+            session_id: session.id.clone(),
+            native_thread_id: session.native_thread_id.clone(),
+            codex_binary: source_home.codex_binary,
+            runtime,
+            prompt: prompt.to_string(),
+            environment,
+        });
+        Ok(ManagerTurnHandle { session, receiver })
+    }
+
+    pub fn complete_manager_turn(&self, result: &ManagerTurnResult) -> Result<()> {
+        self.registry.complete_manager_turn(
+            &result.session_id,
+            &result.native_thread_id,
+            &result.message,
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_manager_turn(&self, session_id: &str, error: &str) -> Result<()> {
+        self.registry.fail_manager_turn(session_id, error)?;
+        Ok(())
+    }
+
+    fn manager_source_home(&self, workspace: Option<&Workspace>) -> Result<CodexHome> {
+        if let Some(workspace) = workspace
+            && let Some(tab) = self.manager_tab(&workspace.id)?
+            && let Some(home_id) = tab.codex_home_id
+            && let Some(home) = self.registry.codex_home_by_ref(&home_id)?
+        {
+            return Ok(home);
+        }
+        self.registry
+            .preferred_codex_home(None)?
+            .ok_or_else(|| WipsawError::InvalidInput {
+                field: "Codex home",
+                message: "no Codex home is available for the manager".to_string(),
+            })
+    }
+
+    fn manager_tab(&self, workspace_id: &str) -> Result<Option<Tab>> {
+        if let Some(tab) = self.registry.tab_by_ref(workspace_id, "middle-manager")? {
+            return Ok(Some(tab));
+        }
+        self.registry.tab_by_ref(workspace_id, "manager")
+    }
+
     pub fn inspect_codex_thread(&self, reference: &str) -> Result<CodexThreadInspection> {
         let managed = self
             .registry
@@ -811,38 +990,30 @@ impl WipsawApp {
     /// the shortcut process with the real Codex CLI.
     pub fn run_codex_shortcut(&mut self, args: &[OsString]) -> Result<()> {
         let (workspace, tab) = self.current_tab()?;
-        let thread_name = if tab.name.eq_ignore_ascii_case("manager") {
-            format!("Lumbergh - {}", workspace.name)
-        } else {
-            tab.name.clone()
-        };
+        if is_manager_tab(&tab) {
+            if !args.is_empty() {
+                return Err(WipsawError::InvalidInput {
+                    field: "Middle Manager command",
+                    message: "manager tabs use the embedded Wipsaw composer and do not accept raw Codex arguments"
+                        .to_string(),
+                });
+            }
+            return self.exec_navigator("middle-manager", Some(&workspace.id));
+        }
+        let thread_name = tab.name.clone();
         let thread = self.ensure_tab_thread(&workspace, &tab, &thread_name)?;
         self.exec_codex_thread(&thread, args)
     }
 
-    /// Select the persistent manager tab. Its named Codex thread is created on
-    /// first use and resumed only when the tab is sitting at a shell prompt.
+    /// Open the current workspace's embedded Middle Manager.
     pub fn run_manager_shortcut(&mut self) -> Result<()> {
-        let (workspace, current_tab) = self.current_tab()?;
-        let manager_tab = self
-            .registry
-            .tab_by_ref(&workspace.id, "manager")?
-            .ok_or_else(|| WipsawError::NotFound {
-                entity: "manager tab",
-                value: workspace.name.clone(),
-            })?;
-        let name = format!("Lumbergh - {}", workspace.name);
-        let thread = self.ensure_tab_thread(&workspace, &manager_tab, &name)?;
+        let (workspace, _) = self.current_tab()?;
+        self.exec_navigator("middle-manager", Some(&workspace.id))
+    }
 
-        if current_tab.id == manager_tab.id {
-            return self.exec_codex_thread(&thread, &[]);
-        }
-
-        if self.tab_should_start_thread(&workspace, &manager_tab, &thread)? {
-            self.resume_codex_thread(&thread.id, &workspace.id, &manager_tab.id)?;
-        }
-        self.tmux
-            .select_tab(&workspace.tmux_session, &manager_tab.tmux_window_id)
+    /// Open the single top-level Lumbergh manager on the dashboard.
+    pub fn run_lumbergh_shortcut(&self) -> Result<()> {
+        self.exec_navigator("lumbergh", None)
     }
 
     /// Lazily create the named Codex thread for a tab and launch it when the
@@ -857,16 +1028,31 @@ impl WipsawApp {
                 entity: "tab",
                 value: tab_ref.to_string(),
             })?;
-        let name = if tab.name.eq_ignore_ascii_case("manager") {
-            format!("Lumbergh - {}", workspace.name)
-        } else {
-            tab.name.clone()
-        };
+        if is_manager_tab(&tab) {
+            return Err(WipsawError::InvalidInput {
+                field: "Middle Manager tab",
+                message:
+                    "open it inside Wipsaw; manager turns run through resumable `codex exec --json`"
+                        .to_string(),
+            });
+        }
+        let name = tab.name.clone();
         let thread = self.ensure_tab_thread(&workspace, &tab, &name)?;
         if self.tab_should_start_thread(&workspace, &tab, &thread)? {
             self.resume_codex_thread(&thread.id, &workspace.id, &tab.id)?;
         }
         Ok(thread)
+    }
+
+    fn exec_navigator(&self, start: &str, workspace_id: Option<&str>) -> Result<()> {
+        let executable = env::current_exe()?;
+        let mut command = Command::new(&executable);
+        command.env("WIPSAW_TUI_START", start);
+        if let Some(workspace_id) = workspace_id {
+            command.env("WIPSAW_MANAGER_WORKSPACE", workspace_id);
+        }
+        let error = command.exec();
+        Err(error.into())
     }
 
     /// Open a managed thread from the navigator. An unbound thread receives a
@@ -1258,6 +1444,10 @@ fn return_shell_path() -> PathBuf {
         .or_else(|| env::var_os("SHELL").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+fn is_manager_tab(tab: &Tab) -> bool {
+    tab.name.eq_ignore_ascii_case("middle-manager") || tab.name.eq_ignore_ascii_case("manager")
 }
 
 fn truncate_display_name(value: &str, max_chars: usize) -> String {

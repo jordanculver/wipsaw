@@ -46,6 +46,9 @@ pub enum Command {
     /// Internal entry points used by Wipsaw-managed shell shortcuts.
     #[command(hide = true)]
     Shortcut(ShortcutArgs),
+    /// Private MCP server used by embedded Wipsaw managers.
+    #[command(hide = true)]
+    ManagerMcp,
 }
 
 #[derive(Debug, Args)]
@@ -61,8 +64,10 @@ pub enum ShortcutCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    /// Select or create this workspace's persistent manager thread.
+    /// Open this workspace's embedded Middle Manager.
     Manager,
+    /// Open the single top-level Lumbergh manager in the dashboard.
+    Lumbergh,
 }
 
 #[derive(Debug, Args)]
@@ -73,7 +78,7 @@ pub struct WorkspaceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCommand {
-    /// Create a private tmux session with a manager tab.
+    /// Create a private tmux session with a Middle Manager tab.
     Create {
         name: String,
         #[arg(long, default_value = ".")]
@@ -84,7 +89,7 @@ pub enum WorkspaceCommand {
     },
     /// List registered workspaces.
     List,
-    /// Start or reconstruct a stopped workspace and its manager.
+    /// Start or reconstruct a stopped workspace and its Middle Manager.
     Start { workspace: String },
     /// Attach to a workspace by name or ID.
     Attach { workspace: String },
@@ -243,6 +248,9 @@ pub enum ThreadCommand {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    if matches!(&cli.command, Some(Command::ManagerMcp)) {
+        return crate::manager::run_manager_mcp_server();
+    }
     let mut app = WipsawApp::from_env()?;
     match cli.command {
         None => crate::tui::run(&mut app)?,
@@ -291,7 +299,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     print_json(&workspace)?;
                 } else {
                     println!(
-                        "created workspace '{}' ({}) with Lumbergh ready on tmux session {}",
+                        "created workspace '{}' ({}) with its Middle Manager ready on tmux session {}",
                         workspace.name, workspace.id, workspace.tmux_session
                     );
                 }
@@ -326,12 +334,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 output(cli.json, &started, || {
                     if started.restored {
                         format!(
-                            "restored workspace '{}' with Lumbergh ready",
+                            "restored workspace '{}' with its Middle Manager ready",
                             started.workspace.name
                         )
                     } else {
                         format!(
-                            "workspace '{}' is running with Lumbergh ready",
+                            "workspace '{}' is running with its Middle Manager ready",
                             started.workspace.name
                         )
                     }
@@ -628,7 +636,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Shortcut(args)) => match args.command {
             ShortcutCommand::Codex { args } => app.run_codex_shortcut(&args)?,
             ShortcutCommand::Manager => app.run_manager_shortcut()?,
+            ShortcutCommand::Lumbergh => app.run_lumbergh_shortcut()?,
         },
+        Some(Command::ManagerMcp) => unreachable!("manager MCP is handled before app startup"),
     }
     Ok(())
 }

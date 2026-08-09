@@ -55,6 +55,65 @@ pub struct CodexThread {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagerKind {
+    Lumbergh,
+    MiddleManager,
+}
+
+impl Display for ManagerKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Lumbergh => "lumbergh",
+            Self::MiddleManager => "middle-manager",
+        })
+    }
+}
+
+impl FromStr for ManagerKind {
+    type Err = WipsawError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "lumbergh" => Ok(Self::Lumbergh),
+            "middle-manager" => Ok(Self::MiddleManager),
+            _ => Err(WipsawError::InvalidInput {
+                field: "manager kind",
+                message: format!("'{value}' must be lumbergh or middle-manager"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerSession {
+    /// Stable Wipsaw-managed ID. The native Codex thread is created on the
+    /// first message and resumed for every later turn.
+    pub id: String,
+    pub kind: ManagerKind,
+    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub source_codex_home_id: String,
+    pub native_thread_id: Option<String>,
+    pub cwd: PathBuf,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerMessage {
+    pub id: i64,
+    pub manager_session_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub id: String,

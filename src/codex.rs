@@ -375,7 +375,10 @@ impl AppServerClient {
         send(
             &mut self.stdin,
             &json!({"method": method, "id": request_id, "params": params}),
-        )?;
+        )
+        .map_err(|error| {
+            WipsawError::CodexProtocol(with_diagnostics(error.to_string(), &self.diagnostics))
+        })?;
         wait_for_response(&self.receiver, &self.diagnostics, request_id, method)
     }
 
@@ -384,6 +387,9 @@ impl AppServerClient {
             &mut self.stdin,
             &json!({"method": method, "params": params}),
         )
+        .map_err(|error| {
+            WipsawError::CodexProtocol(with_diagnostics(error.to_string(), &self.diagnostics))
+        })
     }
 }
 
