@@ -19,7 +19,7 @@ use crate::codex::{
     read_native_thread_history,
 };
 use crate::error::{Result, WipsawError};
-use crate::model::{CodexHome, ManagerKind, ManagerSession, Tab, Workspace};
+use crate::model::{Account, CodexHome, ManagerKind, ManagerSession, Tab, Workspace};
 use crate::paths::AppPaths;
 use crate::registry::Registry;
 use crate::tmux::TmuxBackend;
@@ -51,11 +51,13 @@ description: Manage Wipsaw workspaces, tabs, Codex sessions, identities, model p
 Use only the tools from the `wipsaw` MCP server for Wipsaw operations.
 
 - Call `manager_guide` before the first operation in a session.
-- Prefer purpose-built tools over `run_wipsaw`. Use `workspace_overview` for workspaces and tabs, `create_codex_tab` for a new tab with a running Codex session, `start_codex_session` to create or restart a session in an existing tab, `codex_history_search` plus `codex_history_read` for prior sessions, and `create_handoff_tab` for an atomic summary-based session handoff.
+- Prefer purpose-built tools over `run_wipsaw`. Use `workspace_overview` for workspaces and tabs, `create_codex_tab` for a new tab with a running Codex session, `start_codex_session` to create or restart a session in an existing tab, `codex_history_search` plus `codex_history_read` for prior sessions, `import_codex_session` to open an exact existing conversation, and `create_handoff_tab` only for a new summary-based handoff.
 - Use `run_wipsaw` only when no purpose-built tool covers the operation. Always begin its `args` array with `--json`.
 - Inspect current state before changing it. Pass exact IDs returned by inspection tools into mutations.
 - `tab create` creates a shell-only tab. If the user says Codex, session, thread, or asks for a tab like an existing Codex tab, never use raw `tab create`; use `create_codex_tab`. A successful Codex result must contain a non-null `tab.codex_thread_id`, a Wipsaw thread ID, a native Codex thread ID, and a launch result. Never claim that a shell tab will gain a session later unless the user explicitly requested lazy startup.
 - Use `start_codex_session` for an existing tab whose `codex_thread_id` is null or whose Codex process stopped. Report `running: false` as a failure, not as a ready session.
+- When the user wants the original conversation and its full history, call `import_codex_session` with the exact home and native thread ID returned by history search. This adopts and resumes that native ID; it does not create a replacement conversation. If the destination tab already contains a disposable handoff session, set `replaceExisting=true` only after the user has clearly asked to replace it; the old Wipsaw thread is retained unbound.
+- If `import_codex_session` returns a non-null `deferred_reason`, report that the exact mapping is saved but the tab cannot open until the same native session is closed in its other Codex terminal. Never claim a deferred import is already open.
 - Wipsaw nouns are singular CLI groups. For example, list workspaces with `args: ["--json", "workspace", "list"]`.
 - Delete a workspace only after confirming the exact ID and the user's intent, then call `args: ["--json", "workspace", "delete", "<id>", "--yes"]`.
 - Lumbergh can manage a Middle Manager's explicit file scope with `workspace context list|add|remove`. A Middle Manager may list but cannot broaden or remove its own scope.
@@ -67,7 +69,7 @@ Use only the tools from the `wipsaw` MCP server for Wipsaw operations.
 - Do not attach to a tmux client or launch an interactive TUI from this non-interactive manager session.
 - Explain destructive or externally visible operations before doing them.
 - Never invent a command result. A read-only validation error may be corrected and retried once using the tool schema or returned usage. Continue independent work after a harmless read failure. Stop on a mutation failure or if the same read fails twice.
-- To create a tab from another Codex session, search native history, read query-focused excerpts, write a factual handoff summary, then call `create_handoff_tab`. Do not claim facts that were absent from the source excerpts.
+- Use `create_handoff_tab` only when the user explicitly wants a separate new conversation initialized from a curated summary. Search native history, read query-focused excerpts, write a factual handoff summary, then call it. Do not substitute a handoff when the user asked to resume the original session.
 - If Wipsaw does not expose a requested operation yet, say so plainly and suggest the smallest safe next step.
 "#;
 
@@ -775,6 +777,9 @@ fn manager_mcp_response(request: &Value) -> Option<Value> {
                 "codex_history_read" => {
                     codex_history_read_tool(request.pointer("/params/arguments"))
                 }
+                "import_codex_session" => {
+                    import_codex_session_tool(request.pointer("/params/arguments"))
+                }
                 "create_handoff_tab" => {
                     create_handoff_tab_tool(request.pointer("/params/arguments"))
                 }
@@ -925,6 +930,29 @@ fn manager_mcp_tools() -> Value {
                     "maxTurns": { "type": "integer", "minimum": 1, "maximum": 24 }
                 },
                 "required": ["home", "nativeThreadId", "query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "import_codex_session",
+            "description": "Adopt one exact existing native Codex conversation into Wipsaw, persist its home/thread/tab mapping, and open its full original history in a workspace tab. If another Codex process owns the session writer, the mapping succeeds and launch is explicitly deferred until that process closes. Use the exact home and nativeThreadId from codex_history_search. This does not create a summary handoff or a new native thread.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "minLength": 1, "maxLength": 256 },
+                    "sourceHome": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "nativeThreadId": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "tab": { "type": "string", "maxLength": 256 },
+                    "name": { "type": "string", "maxLength": 96 },
+                    "replaceExisting": { "type": "boolean", "default": false },
+                    "account": { "type": "string", "maxLength": 256 }
+                },
+                "required": ["workspace", "sourceHome", "nativeThreadId"],
                 "additionalProperties": false
             }
         },
@@ -1196,6 +1224,92 @@ fn transient_history_home(app: &WipsawApp, path: &Path) -> Result<CodexHome> {
         codex_binary: template.codex_binary,
         created_at: String::new(),
         updated_at: String::new(),
+    })
+}
+
+fn persist_history_home_for_import(
+    app: &WipsawApp,
+    transient: &CodexHome,
+    requested_account: Option<&str>,
+) -> Result<CodexHome> {
+    if let Some(existing) = app.registry.codex_home_by_path(&transient.path)? {
+        return Ok(existing);
+    }
+    if std::env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() {
+        return Err(WipsawError::InvalidInput {
+            field: "Codex history home import",
+            message: "a Middle Manager cannot register a machine-wide Codex home; ask Lumbergh to import this session first"
+                .to_string(),
+        });
+    }
+    let account = import_home_account(app, &transient.path, requested_account)?;
+    let base = transient
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("imported {name}"))
+        .unwrap_or_else(|| "imported Codex home".to_string());
+    let mut name = base.clone();
+    for suffix in 1..=999 {
+        if app.registry.codex_home_by_ref(&name)?.is_none() {
+            return app.add_codex_home(
+                &name,
+                &account.id,
+                &transient.path,
+                &transient.codex_binary,
+                false,
+            );
+        }
+        name = format!("{base} {}", suffix + 1);
+    }
+    Err(WipsawError::InvalidInput {
+        field: "Codex history home import",
+        message: "could not derive a unique managed home name".to_string(),
+    })
+}
+
+fn import_home_account(
+    app: &WipsawApp,
+    path: &Path,
+    requested_account: Option<&str>,
+) -> Result<Account> {
+    if let Some(reference) = requested_account {
+        return app
+            .registry
+            .account_by_ref(reference)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "account",
+                value: reference.to_string(),
+            });
+    }
+
+    // Compare auth files only inside this process and never return their
+    // contents. This lets an unregistered legacy home inherit the correct
+    // account identity without exposing or duplicating credentials.
+    if let Ok(source_auth) = fs::read(path.join("auth.json")) {
+        let mut matching_accounts = HashSet::new();
+        for home in app.registry.list_codex_homes()? {
+            if fs::read(home.path.join("auth.json")).is_ok_and(|auth| auth == source_auth) {
+                matching_accounts.insert(home.account_id);
+            }
+        }
+        if matching_accounts.len() == 1 {
+            let account_id = matching_accounts.into_iter().next().unwrap_or_default();
+            if let Some(account) = app.registry.account_by_ref(&account_id)? {
+                return Ok(account);
+            }
+        }
+    }
+
+    let mut accounts = app.registry.list_accounts()?;
+    if accounts.len() == 1 {
+        return Ok(accounts.remove(0));
+    }
+    Err(WipsawError::InvalidInput {
+        field: "Codex history home account",
+        message: "this unregistered home could not be matched to exactly one account; pass its Wipsaw account name or ID"
+            .to_string(),
     })
 }
 
@@ -1791,6 +1905,88 @@ fn codex_history_read_tool(arguments: Option<&Value>) -> Value {
             "selectedTurns": turns.len(),
             "truncated": turns.len() < total_turns,
             "turns": turns
+        }))
+    })();
+    match result {
+        Ok(structured) => manager_tool_result(
+            &serde_json::to_string_pretty(&structured).unwrap_or_default(),
+            false,
+            Some(structured),
+        ),
+        Err(error) => manager_tool_result(&error.to_string(), true, None),
+    }
+}
+
+fn import_codex_session_tool(arguments: Option<&Value>) -> Value {
+    let workspace = arguments
+        .and_then(|arguments| arguments.get("workspace"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let source_home_ref = arguments
+        .and_then(|arguments| arguments.get("sourceHome"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let native_thread_id = arguments
+        .and_then(|arguments| arguments.get("nativeThreadId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (Some(workspace), Some(source_home_ref), Some(native_thread_id)) =
+        (workspace, source_home_ref, native_thread_id)
+    else {
+        return manager_tool_result(
+            "workspace, sourceHome, and nativeThreadId are required",
+            true,
+            None,
+        );
+    };
+    let target_tab = arguments
+        .and_then(|arguments| arguments.get("tab"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let name = arguments
+        .and_then(|arguments| arguments.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let account = arguments
+        .and_then(|arguments| arguments.get("account"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let replace_existing = arguments
+        .and_then(|arguments| arguments.get("replaceExisting"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let result = (|| -> Result<Value> {
+        let _scope = manager_scope_from_env()?;
+        let mut app = open_manager_app()?;
+        let workspace = app.workspace(workspace)?;
+        let (source_home, registered) = resolve_history_home(&app, source_home_ref)?;
+        let managed_home = if registered {
+            source_home
+        } else {
+            persist_history_home_for_import(&app, &source_home, account)?
+        };
+        let imported = app.import_codex_session(
+            &workspace.id,
+            &managed_home.id,
+            native_thread_id,
+            target_tab,
+            name,
+            replace_existing,
+        )?;
+        let opened_now = imported.launch.is_some();
+        Ok(json!({
+            "import": imported,
+            "sourceHome": managed_home,
+            "sourceHomeRegisteredNow": !registered,
+            "originalHistoryPreserved": true,
+            "openedNow": opened_now
         }))
     })();
     match result {
@@ -3051,6 +3247,7 @@ mod tests {
                 "start_codex_session",
                 "codex_history_search",
                 "codex_history_read",
+                "import_codex_session",
                 "create_handoff_tab",
                 "list_directory",
                 "search_files",

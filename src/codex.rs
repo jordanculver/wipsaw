@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -199,6 +200,117 @@ pub fn start_named_thread_with_handoff(
         rollout_path: optional_string(thread, "path").map(PathBuf::from),
         native_created_at: thread.get("createdAt").and_then(Value::as_i64),
     })
+}
+
+/// Load an existing native Codex thread without starting a turn.
+///
+/// App-server documents `thread/resume` as returning the same runtime metadata
+/// as `thread/start`. Wipsaw uses that response to adopt a pre-existing
+/// conversation under its durable ID while leaving the conversation history
+/// and native thread ID unchanged.
+pub fn resume_native_thread(home: &CodexHome, native_thread_id: &str) -> Result<NativeCodexThread> {
+    let mut client = AppServerClient::connect(home)?;
+    let response = client.request("thread/resume", json!({"threadId": native_thread_id}))?;
+    let result = response.get("result").ok_or_else(|| {
+        WipsawError::CodexProtocol("thread/resume response did not contain a result".to_string())
+    })?;
+    let thread = result.get("thread").ok_or_else(|| {
+        WipsawError::CodexProtocol(
+            "thread/resume response did not contain result.thread".to_string(),
+        )
+    })?;
+    let returned_id = required_string(thread, "id", "thread/resume result.thread.id")?;
+    if returned_id != native_thread_id {
+        return Err(WipsawError::CodexProtocol(format!(
+            "thread/resume returned ID '{returned_id}' while '{native_thread_id}' was requested"
+        )));
+    }
+    let cwd = optional_string(result, "cwd")
+        .or_else(|| optional_string(thread, "cwd"))
+        .ok_or_else(|| {
+            WipsawError::CodexProtocol(
+                "thread/resume response did not contain a working directory".to_string(),
+            )
+        })?;
+    let model_provider = optional_string(result, "modelProvider")
+        .or_else(|| optional_string(thread, "modelProvider"))
+        .ok_or_else(|| {
+            WipsawError::CodexProtocol(
+                "thread/resume response did not contain a model provider".to_string(),
+            )
+        })?;
+    let name = optional_string(thread, "name")
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            optional_string(thread, "preview").and_then(|preview| {
+                preview
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| format!("Codex {}", short_native_id(native_thread_id)));
+
+    Ok(NativeCodexThread {
+        native_thread_id: returned_id,
+        name,
+        cwd: PathBuf::from(cwd),
+        // Older app-server builds can omit the resolved model on resume. The
+        // CLI still restores the model from the rollout; this value is display
+        // metadata and never becomes a command-line override.
+        model: optional_string(result, "model")
+            .or_else(|| optional_string(thread, "model"))
+            .unwrap_or_else(|| "saved-session".to_string()),
+        model_provider,
+        reasoning_effort: optional_string(result, "reasoningEffort")
+            .or_else(|| optional_string(thread, "reasoningEffort")),
+        status: thread_status(thread),
+        rollout_path: optional_string(thread, "path").map(PathBuf::from),
+        native_created_at: thread.get("createdAt").and_then(Value::as_i64),
+    })
+}
+
+/// Return whether another Codex process currently owns the native thread's
+/// Linux writer lock. A conversation may be read from multiple processes, but
+/// Codex intentionally permits only one writer at a time.
+pub fn native_thread_has_active_writer(home: &CodexHome, native_thread_id: &str) -> Result<bool> {
+    if native_thread_id.is_empty()
+        || !native_thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(WipsawError::InvalidInput {
+            field: "native Codex thread ID",
+            message: "must contain only ASCII letters, numbers, hyphens, or underscores"
+                .to_string(),
+        });
+    }
+    let lock_path = home
+        .path
+        .join("thread-writer-locks")
+        .join(format!("{native_thread_id}.lock"));
+    if !lock_path.is_file() {
+        return Ok(false);
+    }
+    let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    // SAFETY: `lock` owns a valid file descriptor for the duration of both
+    // calls. LOCK_NB ensures this check never waits behind another Codex TUI.
+    let acquired = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if acquired == 0 {
+        // SAFETY: this descriptor acquired the advisory lock immediately above.
+        let unlocked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        if unlocked != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error();
+    if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+        Ok(true)
+    } else {
+        Err(error.into())
+    }
 }
 
 /// List native Codex threads, including histories Wipsaw has not imported.
@@ -466,6 +578,10 @@ fn required_string(value: &Value, field: &str, description: &str) -> Result<Stri
 
 fn optional_string(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_string)
+}
+
+fn short_native_id(native_thread_id: &str) -> &str {
+    native_thread_id.get(..8).unwrap_or(native_thread_id)
 }
 
 fn thread_status(thread: &Value) -> String {
@@ -797,14 +913,16 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
 
     use serde_json::Value;
     use tempfile::tempdir;
 
     use super::{
-        delete_thread, inspect_thread, list_native_threads, probe_home, read_native_thread_history,
-        start_named_thread, start_named_thread_with_handoff,
+        delete_thread, inspect_thread, list_native_threads, native_thread_has_active_writer,
+        probe_home, read_native_thread_history, resume_native_thread, start_named_thread,
+        start_named_thread_with_handoff,
     };
     use crate::model::{CodexHome, ModelProfile};
 
@@ -995,6 +1113,9 @@ case "$request" in
   *thread/read*)
     printf '{"id":2,"result":{"thread":{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/history.jsonl","cwd":"%s/project","turns":[{"id":"turn-1","status":"completed","items":[{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"Which browser stores did we publish to?"}]},{"id":"comment-1","type":"agentMessage","phase":"commentary","text":"Checking now"},{"id":"agent-1","type":"agentMessage","phase":"final_answer","text":"The release notes list the Chrome and Edge stores."},{"id":"tool-1","type":"commandExecution","command":"secret","commandActions":[],"cwd":"/tmp","status":"completed","aggregatedOutput":"must not leak"}]}]}}}\n' "$CODEX_HOME" "$CODEX_HOME"
     ;;
+  *thread/resume*)
+    printf '{"id":2,"result":{"thread":{"id":"history-1","name":"Privacy Lens extension","preview":"Published browser extension work","modelProvider":"openai","createdAt":1700000000,"status":{"type":"idle"},"path":"%s/history.jsonl","cwd":"%s/project"},"model":"gpt-saved","modelProvider":"openai","cwd":"%s/project","reasoningEffort":"high"}}\n' "$CODEX_HOME" "$CODEX_HOME" "$CODEX_HOME"
+    ;;
   *thread/start*)
     printf '{"id":2,"result":{"thread":{"id":"seeded-1","createdAt":1700000002,"status":{"type":"idle"},"path":"%s/seeded.jsonl"},"model":"gpt-test","modelProvider":"openai","cwd":"%s/project","reasoningEffort":"medium"}}\n' "$CODEX_HOME" "$CODEX_HOME"
     IFS= read -r set_name
@@ -1029,6 +1150,13 @@ esac
             !message.text.contains("must not leak") && message.text != "Checking now"
         }));
 
+        let resumed = resume_native_thread(&home, "history-1").unwrap();
+        assert_eq!(resumed.native_thread_id, "history-1");
+        assert_eq!(resumed.name, "Privacy Lens extension");
+        assert_eq!(resumed.model, "gpt-saved");
+        assert_eq!(resumed.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(resumed.status, "idle");
+
         let seeded = start_named_thread_with_handoff(
             &home,
             &project_path,
@@ -1049,6 +1177,30 @@ esac
             inject["params"]["items"][0]["content"][0]["text"],
             "Curated source facts"
         );
+    }
+
+    #[test]
+    fn active_native_writer_lock_is_detected_without_waiting() {
+        let root = tempdir().unwrap();
+        let home_path = root.path().join("codex-home");
+        let lock_dir = home_path.join("thread-writer-locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("history-1.lock");
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: the test owns `held` until the lock is explicitly released.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let home = test_home(root.path().join("unused-codex"), home_path);
+        assert!(native_thread_has_active_writer(&home, "history-1").unwrap());
+        // SAFETY: `held` acquired this lock above.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert!(!native_thread_has_active_writer(&home, "history-1").unwrap());
+        assert!(native_thread_has_active_writer(&home, "../outside").is_err());
     }
 
     #[test]

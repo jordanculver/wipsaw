@@ -157,6 +157,16 @@ Middle Manager entry point and existing native thread mapping, a second live
 workspace received its own Middle Manager, and repeated starts retained the
 same ordinary terminal processes.
 
+Exact-session recovery follow-up, 2026-08-09: Wipsaw now adopts a supplied
+native Codex ID without creating a summary replacement, persists the owning
+home, tab, and working directory, and reopens every bound conversation when a
+workspace is reconstructed. Linux writer locks prevent a conversation from
+being opened twice; an active outside writer produces a durable deferred import
+instead of a false success. An isolated fake-Codex smoke test killed the private
+tmux server, started the workspace again, reconstructed both windows, and
+launched the same native ID a second time with one reported reopen and zero
+failures.
+
 ### SPIKE-013: First-run Codex app-server recovery
 
 Status: Passed for the local alpha
@@ -220,8 +230,9 @@ Manager UX/capability follow-up, 2026-08-09: manager homes now copy the complete
 `$` picker advertises all three while unrelated skills remain disabled. The
 composer uses a blank `λ` prompt. JSONL reasoning, MCP calls, completion,
 failure, and token usage are upserted in the response box. Idle screens no
-longer repaint continuously, and a transcript-only selection view freezes
-manager redraws for native terminal copying. The validated manager command
+longer repaint continuously, and a transcript-only copy view selects exact
+source offsets with mouse or keyboard even when IDs visually wrap. The
+validated manager command
 surface now includes `workspace delete <exact-id> --yes`; application guards
 stop the live tmux session, reject self-deletion or a working Middle Manager,
 and cascade only the target workspace's tabs and manager history. Unit tests

@@ -326,6 +326,23 @@ impl TmuxBackend {
         self.run(&args).map(|_| ())
     }
 
+    /// Stop the current foreground process and return a managed tab to its
+    /// configured interactive shell. Used when an imported Codex conversation
+    /// is safely mapped but still has an active writer in another terminal.
+    pub fn reset_tab_to_shell(&self, session: &str, window_id: &str, cwd: &Path) -> Result<()> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args(vec![
+            OsString::from("respawn-pane"),
+            OsString::from("-k"),
+            OsString::from("-t"),
+            OsString::from(target),
+            OsString::from("-c"),
+            path_arg(cwd),
+            OsString::from(shell_quote(self.shell_launcher.as_os_str())),
+        ]);
+        self.run(&args).map(|_| ())
+    }
+
     pub fn list_windows(&self, session: &str) -> Result<Vec<TmuxWindow>> {
         let args = self.base_args([
             "list-windows",

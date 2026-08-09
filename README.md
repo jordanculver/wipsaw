@@ -58,11 +58,15 @@ positionals. `workspace_overview` returns workspaces with their tabs;
 process is running; raw `tab create` is explicitly shell-only;
 `codex_history_search` and `codex_history_read` find query-focused excerpts from
 native sessions across registered homes and the standard local `~/.codex`
-history; and `create_handoff_tab` creates, seeds, binds, and launches a new
-Codex tab as one operation. Legacy rollout files are read only when an older
-home cannot initialize the current app-server. History handoffs include only
-user and final-assistant text, omit tool output and reasoning, redact likely
-credential assignments, and remain bounded before they reach a manager turn.
+history; `import_codex_session` adopts the exact native session ID and opens its
+full original conversation in a durable tab; and `create_handoff_tab` creates a
+separate, summary-seeded conversation only when that is what the user asks for.
+An unregistered local history home is persisted during a Lumbergh import after
+its account is resolved, so the mapping remains restartable. Legacy rollout
+files are read only when an older home cannot initialize the current app-server.
+History handoffs include only user and final-assistant text, omit tool output
+and reasoning, redact likely credential assignments, and remain bounded before
+they reach a manager turn.
 
 The blank `λ` manager composer is a real multiline editor: arrows move the
 caret, Home/End move within a line, Ctrl-Left/Ctrl-Right move by word, Delete
@@ -77,13 +81,15 @@ targets for the manager's private tools. Credential-like and out-of-scope paths
 are rejected. Codex
 reasoning, tool calls, completion state, failures, and token usage appear in
 the same response box as the final answer. Outside the composer, `v` opens a
-manager-only, redraw-stable selection view for native terminal copying, `y`
+manager-only exact-text copy view, `y`
 copies the latest manager response, and `Y` copies the transcript; `Ctrl-O`
 opens the selection view and `Ctrl-Y` copies the latest response while
 composing. Page Up/Page Down or the mouse wheel scroll the conversation without
 leaving the composer; progress updates preserve the user's history position.
-Up/Down, Page Up/Page Down, Home, and End scroll in the manager-only selection
-view, where mouse capture is disabled so native terminal selection still works.
+Copy mode is an in-app exact-text view: mouse-drag or Shift+arrows selects only
+the manager transcript—even when a session ID visually wraps—and `y` or Enter
+copies the selection. `Ctrl-A` selects all, `Y` copies the whole transcript,
+Page Up/Page Down scroll, and Esc returns to the dashboard.
 
 Middle Manager authority is enforced by workspace ID as well: it sees and
 manages only its own workspace, tabs, and threads; cannot create or delete
@@ -100,8 +106,11 @@ terminal widths.
 
 Opening any stopped workspace or one of its tabs automatically reconstructs
 the private tmux session from Wipsaw's registry, reconciles new tmux window
-IDs, and restores its Middle Manager entry point. To repair or warm one without
-attaching, run:
+IDs, restores its Middle Manager entry point, and reopens every bound Codex TUI
+at its exact native session ID and saved working directory. One unavailable
+home or missing directory is reported for that tab without blocking recovery of
+the workspace's other conversations. To repair or warm one without attaching,
+run:
 
 ```bash
 wipsaw workspace start "workspace name"
@@ -173,6 +182,11 @@ wipsaw thread create "API implementation" \
 
 wipsaw thread list --home company-home
 wipsaw thread inspect thread_...
+wipsaw thread import 019fab4e-fc47-75c1-9be8-66050a58add7 \
+  --home company-home \
+  --workspace development \
+  --name "Existing API session" \
+  --attach
 wipsaw thread delete thread_... --yes
 wipsaw thread resume thread_... \
   --workspace development \
@@ -180,9 +194,16 @@ wipsaw thread resume thread_... \
   --attach
 ```
 
-`thread resume` replaces the target tab's shell process with the Codex TUI,
-using the thread's owning Codex home and existing authentication. When Codex
-exits, Wipsaw starts the managed shell again in that tab.
+`thread import` creates no new native conversation: it validates the supplied
+session in its source home, records the exact native ID, creates or rebinds a
+tab, and opens the original history. Add `--tab <tab> --replace-existing` to
+replace a disposable tab binding while retaining its old conversation as an
+unbound Wipsaw thread. If the same native session is already open in another
+Codex terminal, Wipsaw safely saves the exact mapping and reports a deferred
+launch; opening the workspace after that outside writer closes starts it in the
+mapped tab automatically. `thread resume` opens an already managed thread in
+its target tab. Both use the owning Codex home and existing authentication;
+when Codex exits, Wipsaw starts the managed shell again in that tab.
 
 Every Wipsaw shell preserves the user's Bash or Zsh configuration, including
 Oh My Zsh, and then installs tab-aware commands without changing global shell
@@ -265,8 +286,10 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - Codex app-server home probing plus native thread create/name/inspect with the
   native ID, rollout path, resolved model, and Wipsaw ID persisted atomically
   with an optional tab binding.
-- Exact-ID Codex TUI resume inside a mapped tmux tab, with account/home
-  compatibility checks and shell restoration after exit.
+- Exact native-session adoption and Codex TUI resume inside mapped tmux tabs,
+  with one-writer safety, account/home compatibility checks, persistent
+  tab/thread/cwd mappings, and automatic conversation reopen during workspace
+  reconstruction.
 - One persistent Lumbergh on the dashboard and one separate Middle Manager per
   workspace, all embedded in Wipsaw instead of attaching a raw Codex TUI.
 - Resumable manager turns through `codex exec --json`, fixed to Terra/medium,
@@ -274,8 +297,8 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   transcript history, and exact native thread IDs.
 - A blank `λ` multiline manager composer with bracketed paste, scoped `@` file
   and `$` skill completion, working transcript scrolling, response/transcript
-  clipboard actions, and a manager-only native-selection view that freezes
-  redraws while copying.
+  clipboard actions, and a manager-only in-app copy view whose exact selection
+  remains intact across visual line wrapping.
 - Codex launch and health-check PATH repair that selects the Node runtime
   belonging to a registered npm Codex installation instead of inheriting stale
   tmux state.

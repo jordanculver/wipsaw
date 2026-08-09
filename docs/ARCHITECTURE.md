@@ -182,8 +182,9 @@ Directory context explicitly directs the manager to its scoped browse/search/rea
 tools. The composer renders an empty `λ`
 input instead of placeholder or activity text. Clipboard actions copy only the
 latest response or manager transcript through tmux and OSC 52. A separate
-transcript-only view removes adjacent dashboard columns, disables mouse capture,
-and pauses redraws so native terminal selection remains stable. Conversation
+transcript-only view removes adjacent dashboard columns and maps mouse/keyboard
+selection to byte offsets in the original transcript, so visually wrapped IDs
+copy exactly without capturing dashboard chrome. Conversation
 scrolling is stored as an offset from the live bottom; Page Up/Page Down and the
 mouse wheel work while composing, and progress does not reset an explicit
 history position. Completed manager mutations reconcile workspace, tab, thread,
@@ -436,7 +437,8 @@ Representative CLI operations:
 ```text
 wipsaw workspace list
 wipsaw tab create --workspace dev --name api --profile company
-wipsaw thread resume <thread-id> --tab api
+wipsaw thread import <native-thread-id> --home company --workspace dev --name api
+wipsaw thread resume <thread-id> --workspace dev --tab api
 wipsaw account doctor company
 wipsaw wip create --file morning-briefing.toml
 wipsaw wip trigger <wip-id> --model <configured-model>

@@ -249,6 +249,26 @@ pub enum ThreadCommand {
         #[arg(long)]
         tab: Option<String>,
     },
+    /// Adopt and open an exact existing native Codex session without creating a new conversation.
+    Import {
+        native_thread_id: String,
+        #[arg(long)]
+        home: String,
+        #[arg(long)]
+        workspace: String,
+        /// Existing destination tab. Omit to create a durable tab.
+        #[arg(long)]
+        tab: Option<String>,
+        /// Name for a newly created tab. Defaults to the native session name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace a different thread currently bound to --tab without deleting its history.
+        #[arg(long)]
+        replace_existing: bool,
+        /// Attach to the imported session after opening it.
+        #[arg(long)]
+        attach: bool,
+    },
     /// List Wipsaw-managed Codex threads, optionally for one home.
     List {
         #[arg(long)]
@@ -361,7 +381,7 @@ pub fn run(cli: Cli) -> Result<()> {
             WorkspaceCommand::Start { workspace } => {
                 let started = app.start_workspace(&workspace)?;
                 output(cli.json, &started, || {
-                    if started.restored {
+                    let mut message = if started.restored {
                         format!(
                             "restored workspace '{}' with its Middle Manager ready",
                             started.workspace.name
@@ -371,7 +391,20 @@ pub fn run(cli: Cli) -> Result<()> {
                             "workspace '{}' is running with its Middle Manager ready",
                             started.workspace.name
                         )
+                    };
+                    if !started.reopened_threads.is_empty() {
+                        message.push_str(&format!(
+                            "; reopened {} Codex conversation(s)",
+                            started.reopened_threads.len()
+                        ));
                     }
+                    if !started.reopen_failures.is_empty() {
+                        message.push_str(&format!(
+                            "; {} conversation(s) need attention",
+                            started.reopen_failures.len()
+                        ));
+                    }
+                    message
                 })?;
             }
             WorkspaceCommand::Delete { workspace, yes } => {
@@ -605,6 +638,37 @@ pub fn run(cli: Cli) -> Result<()> {
                     )
                 })?;
             }
+            ThreadCommand::Import {
+                native_thread_id,
+                home,
+                workspace,
+                tab,
+                name,
+                replace_existing,
+                attach,
+            } => {
+                let imported = app.import_codex_session(
+                    &workspace,
+                    &home,
+                    &native_thread_id,
+                    tab.as_deref(),
+                    name.as_deref(),
+                    replace_existing,
+                )?;
+                output(cli.json, &imported, || {
+                    let mut message = format!(
+                        "imported native Codex session '{}' as thread '{}' in tab '{}'",
+                        imported.thread.native_thread_id, imported.thread.id, imported.tab.name
+                    );
+                    if let Some(reason) = &imported.deferred_reason {
+                        message.push_str(&format!("; launch deferred: {reason}"));
+                    }
+                    message
+                })?;
+                if attach && imported.launch.is_some() {
+                    app.activate_tab(&imported.workspace_id, &imported.tab.id)?;
+                }
+            }
             ThreadCommand::List { home } => {
                 let threads = app.list_codex_threads(home.as_deref())?;
                 if cli.json {
@@ -681,7 +745,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     )
                 })?;
                 if attach {
-                    app.attach_workspace(&launch.workspace_id)?;
+                    app.activate_tab(&launch.workspace_id, &launch.tab_id)?;
                 }
             }
         },

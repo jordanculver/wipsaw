@@ -143,6 +143,10 @@ policy checks even when invoked by Lumbergh.
 ### Codex sessions
 
 - Create, name, list, search, resume, fork, archive, and inspect threads.
+- Adopt an exact existing native thread from any registered local Codex home,
+  bind it to one durable tab, and retain its original history and ID. If that
+  thread already has a writer in another terminal, persist the mapping and
+  defer launch rather than starting a competing writer.
 - Track thread ID together with host, Codex home, account, working directory,
   Codex version, model profile, and originating tab or run.
 - Use the Codex app-server protocol when compatible and a versioned CLI adapter
@@ -289,12 +293,13 @@ nonexistent implementation.
 - Codex reasoning, tool calls, completion/failure state, and usage render in
   order inside the manager response box before the final answer.
 - Copy actions target the latest manager response or its transcript. A
-  redraw-stable, manager-only selection view also supports native terminal copy
-  without selecting the surrounding dashboard.
+  manager-only exact-text view supports mouse and keyboard selection without
+  selecting the surrounding dashboard or inserting visual-wrap newlines.
 - Long manager conversations scroll relative to the live bottom. Composer mode
   keeps prompt arrows for editing while Page Up/Down and the mouse wheel move
   history without progress snapping it back. The transcript-only view supports
-  arrows, Page Up/Down, Home, and End with mouse capture disabled for selection.
+  mouse drag, Shift+arrows, Page Up/Down, Home/End, select-all, and explicit
+  clipboard copy.
 - Manager mutations trigger inventory reconciliation so tabs, Codex bindings,
   thread details, and dashboard counts update without a manual refresh.
 - Human TUI, CLI, and MCP actions call the same application services.

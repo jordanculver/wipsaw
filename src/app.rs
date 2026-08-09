@@ -11,8 +11,9 @@ use directories::BaseDirs;
 use serde::Serialize;
 
 use crate::codex::{
-    CodexHomeProbe, NativeCodexThreadInspection, archive_thread, codex_launch_path, delete_thread,
-    inspect_thread as inspect_native_thread, probe_home, start_named_thread,
+    CodexHomeProbe, NativeCodexThread, NativeCodexThreadInspection, archive_thread,
+    codex_launch_path, delete_thread, inspect_thread as inspect_native_thread,
+    native_thread_has_active_writer, probe_home, resume_native_thread, start_named_thread,
     start_named_thread_with_handoff,
 };
 use crate::error::{Result, WipsawError};
@@ -60,6 +61,9 @@ pub struct CodexThreadLaunch {
     pub codex_home_id: String,
     pub cwd: PathBuf,
     pub return_shell: PathBuf,
+    /// True when this call started the Codex process. False means the exact
+    /// managed/native thread was already running in the tab.
+    pub launched: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +87,21 @@ pub struct CodexHandoffLaunch {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CodexSessionImport {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub tab: Tab,
+    pub thread: CodexThread,
+    pub launch: Option<CodexThreadLaunch>,
+    /// Present when the exact conversation was adopted but Codex would not
+    /// allow a second writer while it remained open in another terminal.
+    pub deferred_reason: Option<String>,
+    pub thread_imported: bool,
+    pub tab_created: bool,
+    pub replaced_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct WipsawInitialization {
     pub status: String,
     pub codex: CodexHomeProbe,
@@ -94,8 +113,25 @@ pub struct WipsawInitialization {
 pub struct WorkspaceStart {
     pub workspace: Workspace,
     pub restored: bool,
+    pub reopened_threads: Vec<CodexThreadLaunch>,
+    pub reopen_failures: Vec<WorkspaceThreadReopenFailure>,
     pub manager_session_id: String,
     pub native_manager_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceThreadReopenFailure {
+    pub tab_id: String,
+    pub tab_name: String,
+    pub thread_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceRuntime {
+    restored: bool,
+    reopened_threads: Vec<CodexThreadLaunch>,
+    reopen_failures: Vec<WorkspaceThreadReopenFailure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -524,11 +560,13 @@ impl WipsawApp {
     /// A stopped workspace is reconstructed from registry metadata.
     pub fn start_workspace(&mut self, reference: &str) -> Result<WorkspaceStart> {
         let workspace = self.workspace(reference)?;
-        let restored = self.ensure_workspace_runtime(&workspace)?;
+        let runtime = self.ensure_workspace_runtime(&workspace, true)?;
         let manager = self.ensure_middle_manager(&workspace.id)?;
         Ok(WorkspaceStart {
             workspace,
-            restored,
+            restored: runtime.restored,
+            reopened_threads: runtime.reopened_threads,
+            reopen_failures: runtime.reopen_failures,
             manager_session_id: manager.id,
             native_manager_thread_id: manager.native_thread_id,
         })
@@ -625,7 +663,11 @@ impl WipsawApp {
         Ok((workspace, tabs, live_windows))
     }
 
-    fn ensure_workspace_runtime(&self, workspace: &Workspace) -> Result<bool> {
+    fn ensure_workspace_runtime(
+        &self,
+        workspace: &Workspace,
+        reopen_bound_threads: bool,
+    ) -> Result<WorkspaceRuntime> {
         if !workspace.cwd.is_dir() {
             return Err(WipsawError::InvalidInput {
                 field: "workspace working directory",
@@ -711,7 +753,77 @@ impl WipsawApp {
         }
         self.registry
             .replace_workspace_tab_targets(&workspace.id, &targets)?;
-        Ok(restored)
+        let (reopened_threads, reopen_failures) = if reopen_bound_threads {
+            self.reopen_workspace_threads(workspace)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(WorkspaceRuntime {
+            restored,
+            reopened_threads,
+            reopen_failures,
+        })
+    }
+
+    /// Reopen every durable, bound Codex conversation whose pane is back at a
+    /// shell. One broken historical session must not prevent the workspace or
+    /// its other tabs from recovering after a reboot.
+    fn reopen_workspace_threads(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<(Vec<CodexThreadLaunch>, Vec<WorkspaceThreadReopenFailure>)> {
+        let mut reopened = Vec::new();
+        let mut failures = Vec::new();
+        for tab in self.registry.list_tabs(&workspace.id)? {
+            let Some(thread_id) = tab.codex_thread_id.as_deref() else {
+                continue;
+            };
+            if is_manager_tab(&tab) {
+                continue;
+            }
+            let result = (|| -> Result<Option<CodexThreadLaunch>> {
+                let thread = self
+                    .registry
+                    .codex_thread_by_ref(thread_id)?
+                    .ok_or_else(|| WipsawError::NotFound {
+                        entity: "Codex thread",
+                        value: thread_id.to_string(),
+                    })?;
+                let home = self
+                    .registry
+                    .codex_home_by_ref(&thread.codex_home_id)?
+                    .ok_or_else(|| WipsawError::NotFound {
+                        entity: "Codex home",
+                        value: thread.codex_home_id.clone(),
+                    })?;
+                if self.tmux.window_has_managed_thread(
+                    &workspace.tmux_session,
+                    &tab.tmux_window_id,
+                    &thread.id,
+                )? {
+                    return Ok(None);
+                }
+                if !self.tab_is_at_shell(workspace, &tab)? {
+                    return Err(WipsawError::InvalidInput {
+                        field: "workspace recovery",
+                        message: "the tab pane is busy with another foreground process".to_string(),
+                    });
+                }
+                self.launch_codex_thread(&thread, &home, workspace, &tab, false)
+                    .map(Some)
+            })();
+            match result {
+                Ok(Some(launch)) => reopened.push(launch),
+                Ok(None) => {}
+                Err(error) => failures.push(WorkspaceThreadReopenFailure {
+                    tab_id: tab.id,
+                    tab_name: tab.name,
+                    thread_id: thread_id.to_string(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+        Ok((reopened, failures))
     }
 
     pub fn rename_tab(&mut self, workspace_ref: &str, tab_ref: &str, name: &str) -> Result<Tab> {
@@ -1142,6 +1254,273 @@ impl WipsawApp {
         })
     }
 
+    /// Adopt an existing native Codex conversation into Wipsaw and open that
+    /// exact session in a durable tab. No new Codex thread is created and no
+    /// history is summarized or copied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_codex_session(
+        &mut self,
+        workspace_ref: &str,
+        source_home_ref: &str,
+        native_thread_id: &str,
+        target_tab_ref: Option<&str>,
+        new_tab_name: Option<&str>,
+        replace_existing: bool,
+    ) -> Result<CodexSessionImport> {
+        let native_thread_id = native_thread_id.trim();
+        if native_thread_id.is_empty() || native_thread_id.len() > 128 {
+            return Err(WipsawError::InvalidInput {
+                field: "native Codex thread ID",
+                message: "must contain between 1 and 128 characters".to_string(),
+            });
+        }
+        let workspace = self.workspace(workspace_ref)?;
+        self.ensure_workspace_runtime(&workspace, false)?;
+        let home = self
+            .registry
+            .codex_home_by_ref(source_home_ref)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex home",
+                value: source_home_ref.to_string(),
+            })?;
+        let active_elsewhere = native_thread_has_active_writer(&home, native_thread_id)?;
+        let mut native = if active_elsewhere {
+            imported_native_metadata(inspect_native_thread(&home, native_thread_id)?)
+        } else {
+            resume_native_thread(&home, native_thread_id)?
+        };
+        if !native.cwd.is_dir() {
+            return Err(WipsawError::InvalidInput {
+                field: "imported session working directory",
+                message: format!(
+                    "'{}' no longer exists; restore it before importing session '{}'",
+                    native.cwd.display(),
+                    native_thread_id
+                ),
+            });
+        }
+        self.ensure_manager_path_scope(
+            &workspace,
+            &native.cwd,
+            "imported session working directory",
+        )?;
+        native.name = validate_display_name(
+            "imported Codex thread name",
+            &truncate_display_name(&native.name, 96),
+        )?;
+
+        let existing_thread = self
+            .registry
+            .codex_thread_by_native_id(&home.id, native_thread_id)?;
+        let existing_binding = existing_thread
+            .as_ref()
+            .map(|thread| self.registry.tab_by_codex_thread(&thread.id))
+            .transpose()?
+            .flatten();
+
+        let (tab, tab_created) = if let Some(tab_ref) = target_tab_ref {
+            let tab = self
+                .registry
+                .tab_by_ref(&workspace.id, tab_ref)?
+                .ok_or_else(|| WipsawError::NotFound {
+                    entity: "tab",
+                    value: tab_ref.to_string(),
+                })?;
+            (tab, false)
+        } else if let Some(tab) = existing_binding.clone() {
+            if tab.workspace_id != workspace.id {
+                let existing_workspace = self.workspace(&tab.workspace_id)?;
+                return Err(WipsawError::InvalidInput {
+                    field: "session import",
+                    message: format!(
+                        "native session '{}' is already tracked in workspace '{}' tab '{}' ({}); open that tab or explicitly choose a replacement target",
+                        native_thread_id, existing_workspace.name, tab.name, tab.id
+                    ),
+                });
+            }
+            (tab, false)
+        } else {
+            let requested_name = new_tab_name.unwrap_or(&native.name);
+            let requested_name = validate_display_name("imported tab name", requested_name)?;
+            let tab_name = if new_tab_name.is_some() {
+                requested_name
+            } else {
+                self.available_tab_name(&workspace.id, &requested_name)?
+            };
+            let tab = self.create_tab(
+                &workspace.id,
+                &tab_name,
+                Some(&native.cwd),
+                TabLaunchSettings {
+                    account: Some(&home.account_id),
+                    codex_home: Some(&home.id),
+                    model_profile: None,
+                },
+            )?;
+            (tab, true)
+        };
+
+        if is_manager_tab(&tab) {
+            if tab_created {
+                self.rollback_new_tab(&workspace, &tab);
+            }
+            return Err(WipsawError::InvalidInput {
+                field: "session import tab",
+                message: "manager tabs cannot host an interactive Codex session".to_string(),
+            });
+        }
+        if let Some(bound) = &existing_binding
+            && bound.id != tab.id
+        {
+            if tab_created {
+                self.rollback_new_tab(&workspace, &tab);
+            }
+            return Err(WipsawError::InvalidInput {
+                field: "session import",
+                message: format!(
+                    "native session '{}' is already bound to tab '{}' ({}); Wipsaw will not run one conversation in two tabs",
+                    native_thread_id, bound.name, bound.id
+                ),
+            });
+        }
+
+        let replaced_thread_id = tab
+            .codex_thread_id
+            .as_ref()
+            .filter(|thread_id| {
+                existing_thread
+                    .as_ref()
+                    .is_none_or(|thread| thread_id.as_str() != thread.id)
+            })
+            .cloned();
+        if replaced_thread_id.is_some() && !replace_existing {
+            if tab_created {
+                self.rollback_new_tab(&workspace, &tab);
+            }
+            return Err(WipsawError::InvalidInput {
+                field: "session import tab",
+                message: format!(
+                    "tab '{}' already has a different Codex thread; pass replaceExisting=true to retain that old thread unbound and open the imported session here",
+                    tab.name
+                ),
+            });
+        }
+
+        let previous_thread_name = existing_thread
+            .as_ref()
+            .filter(|thread| thread.name != tab.name)
+            .map(|thread| thread.name.clone());
+        let thread_result = (|| -> Result<(CodexThread, bool)> {
+            if let Some(thread) = existing_thread {
+                let thread = if thread.name == tab.name {
+                    thread
+                } else {
+                    self.registry.rename_codex_thread(&thread.id, &tab.name)?
+                };
+                Ok((thread, false))
+            } else {
+                let id = WipsawId::new(EntityKind::CodexThread);
+                let thread = self.registry.insert_codex_thread(NewCodexThread {
+                    id: id.as_str(),
+                    codex_home_id: &home.id,
+                    native_thread_id: &native.native_thread_id,
+                    // The tab is Wipsaw's durable, user-controlled label. Native
+                    // sessions often have no name and expose an entire first prompt
+                    // as their preview, which is poor navigator chrome.
+                    name: &tab.name,
+                    cwd: &native.cwd,
+                    model_profile_id: None,
+                    model: &native.model,
+                    model_provider: &native.model_provider,
+                    reasoning_effort: native.reasoning_effort.as_deref(),
+                    status: &native.status,
+                    rollout_path: native.rollout_path.as_deref(),
+                    native_created_at: native.native_created_at,
+                    bind_tab_id: None,
+                })?;
+                Ok((thread, true))
+            }
+        })();
+        let (thread, thread_imported) = match thread_result {
+            Ok(result) => result,
+            Err(error) => {
+                if tab_created {
+                    self.rollback_new_tab(&workspace, &tab);
+                }
+                return Err(error);
+            }
+        };
+
+        let original_tab = tab.clone();
+        let result = (|| -> Result<(Tab, Option<CodexThreadLaunch>, Option<String>)> {
+            let tab = self.registry.bind_tab_to_codex_thread(&tab.id, &thread)?;
+            let already_running_here = self.tmux.window_has_managed_thread(
+                &workspace.tmux_session,
+                &tab.tmux_window_id,
+                &thread.id,
+            )?;
+            if active_elsewhere && !already_running_here {
+                if replaced_thread_id.is_some() {
+                    self.tmux.reset_tab_to_shell(
+                        &workspace.tmux_session,
+                        &tab.tmux_window_id,
+                        &tab.cwd,
+                    )?;
+                } else if !self.tab_is_at_shell(&workspace, &tab)? {
+                    return Err(WipsawError::InvalidInput {
+                        field: "session import tab",
+                        message: format!(
+                            "tab '{}' is busy and the imported conversation already has an active writer elsewhere",
+                            tab.name
+                        ),
+                    });
+                }
+                let reason = format!(
+                    "native session '{}' is currently open in another Codex process; its exact mapping is saved and Wipsaw will open it automatically the next time this workspace or tab is opened after that writer closes",
+                    thread.native_thread_id
+                );
+                Ok((tab, None, Some(reason)))
+            } else {
+                let launch = self.launch_codex_thread(
+                    &thread,
+                    &home,
+                    &workspace,
+                    &tab,
+                    replaced_thread_id.is_some(),
+                )?;
+                Ok((tab, Some(launch), None))
+            }
+        })();
+        let (tab, launch, deferred_reason) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if tab_created {
+                    self.rollback_new_tab(&workspace, &original_tab);
+                } else {
+                    let _ = self.registry.restore_tab_binding(&original_tab);
+                }
+                if thread_imported {
+                    let _ = self.registry.delete_codex_thread(&thread.id);
+                } else if let Some(previous_name) = &previous_thread_name {
+                    let _ = self.registry.rename_codex_thread(&thread.id, previous_name);
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(CodexSessionImport {
+            workspace_id: workspace.id,
+            workspace_name: workspace.name,
+            tab,
+            thread,
+            launch,
+            deferred_reason,
+            thread_imported,
+            tab_created,
+            replaced_thread_id,
+        })
+    }
+
     fn rollback_new_tab(&mut self, workspace: &Workspace, tab: &Tab) {
         let _ = self
             .tmux
@@ -1428,7 +1807,7 @@ impl WipsawApp {
                 value: thread.codex_home_id.clone(),
             })?;
         let workspace = self.workspace(workspace_ref)?;
-        self.ensure_workspace_runtime(&workspace)?;
+        self.ensure_workspace_runtime(&workspace, false)?;
         let tab = self
             .registry
             .tab_by_ref(&workspace.id, tab_ref)?
@@ -1484,6 +1863,18 @@ impl WipsawApp {
                 ),
             });
         }
+        let tab = self.registry.bind_tab_to_codex_thread(&tab.id, &thread)?;
+        self.launch_codex_thread(&thread, &home, &workspace, &tab, false)
+    }
+
+    fn launch_codex_thread(
+        &self,
+        thread: &CodexThread,
+        home: &CodexHome,
+        workspace: &Workspace,
+        tab: &Tab,
+        replace_foreground: bool,
+    ) -> Result<CodexThreadLaunch> {
         if !thread.cwd.is_dir() {
             return Err(WipsawError::InvalidInput {
                 field: "thread working directory",
@@ -1506,28 +1897,53 @@ impl WipsawApp {
             });
         }
 
-        self.registry.bind_tab_to_codex_thread(&tab.id, &thread)?;
         let return_shell = return_shell_path();
-        self.tmux.launch_codex_in_tab(CodexTabLaunch {
-            session: &workspace.tmux_session,
-            window_id: &tab.tmux_window_id,
-            cwd: &thread.cwd,
-            codex_home: &home.path,
-            codex_binary: &home.codex_binary,
-            managed_thread_id: &thread.id,
-            native_thread_id: &thread.native_thread_id,
-            return_shell: &return_shell,
-        })?;
+        let already_running = self.tmux.window_has_managed_thread(
+            &workspace.tmux_session,
+            &tab.tmux_window_id,
+            &thread.id,
+        )?;
+        if !already_running {
+            if native_thread_has_active_writer(home, &thread.native_thread_id)? {
+                return Err(WipsawError::InvalidInput {
+                    field: "Codex session writer",
+                    message: format!(
+                        "native session '{}' is already open in another Codex process; close that process and reopen this tab so Wipsaw can resume it safely",
+                        thread.native_thread_id
+                    ),
+                });
+            }
+            if !replace_foreground && !self.tab_is_at_shell(workspace, tab)? {
+                return Err(WipsawError::InvalidInput {
+                    field: "Codex tab",
+                    message: format!(
+                        "tab '{}' is busy; stop its foreground process before reopening thread '{}'",
+                        tab.name, thread.name
+                    ),
+                });
+            }
+            self.tmux.launch_codex_in_tab(CodexTabLaunch {
+                session: &workspace.tmux_session,
+                window_id: &tab.tmux_window_id,
+                cwd: &thread.cwd,
+                codex_home: &home.path,
+                codex_binary: &home.codex_binary,
+                managed_thread_id: &thread.id,
+                native_thread_id: &thread.native_thread_id,
+                return_shell: &return_shell,
+            })?;
+        }
         Ok(CodexThreadLaunch {
-            thread_id: thread.id,
-            native_thread_id: thread.native_thread_id,
-            workspace_id: workspace.id,
-            tab_id: tab.id,
-            tmux_session: workspace.tmux_session,
-            tmux_window_id: tab.tmux_window_id,
-            codex_home_id: home.id,
-            cwd: thread.cwd,
+            thread_id: thread.id.clone(),
+            native_thread_id: thread.native_thread_id.clone(),
+            workspace_id: workspace.id.clone(),
+            tab_id: tab.id.clone(),
+            tmux_session: workspace.tmux_session.clone(),
+            tmux_window_id: tab.tmux_window_id.clone(),
+            codex_home_id: home.id.clone(),
+            cwd: thread.cwd.clone(),
             return_shell,
+            launched: !already_running,
         })
     }
 
@@ -1566,7 +1982,7 @@ impl WipsawApp {
     /// pane is currently at a shell prompt.
     pub fn start_tab_codex(&mut self, workspace_ref: &str, tab_ref: &str) -> Result<CodexThread> {
         let workspace = self.workspace(workspace_ref)?;
-        self.ensure_workspace_runtime(&workspace)?;
+        self.ensure_workspace_runtime(&workspace, true)?;
         let tab = self
             .registry
             .tab_by_ref(&workspace.id, tab_ref)?
@@ -1994,6 +2410,41 @@ fn return_shell_path() -> PathBuf {
         .or_else(|| env::var_os("SHELL").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+fn imported_native_metadata(inspection: NativeCodexThreadInspection) -> NativeCodexThread {
+    let name = inspection
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            inspection
+                .preview
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Codex {}",
+                inspection
+                    .native_thread_id
+                    .get(..8)
+                    .unwrap_or(&inspection.native_thread_id)
+            )
+        });
+    NativeCodexThread {
+        native_thread_id: inspection.native_thread_id,
+        name,
+        cwd: inspection.cwd,
+        // `thread/read` intentionally omits resolved model settings. The CLI
+        // restores them from the original rollout when Wipsaw opens the tab.
+        model: "saved-session".to_string(),
+        model_provider: inspection.model_provider,
+        reasoning_effort: None,
+        status: inspection.status,
+        rollout_path: inspection.rollout_path,
+        native_created_at: inspection.native_created_at,
+    }
 }
 
 fn is_manager_tab(tab: &Tab) -> bool {

@@ -650,10 +650,28 @@ impl Registry {
     }
 
     pub fn bind_tab_to_codex_thread(&self, tab_id: &str, thread: &CodexThread) -> Result<Tab> {
+        if let Some(existing_tab) = self
+            .connection
+            .query_row(
+                "SELECT id FROM tabs WHERE codex_thread_id = ?1 AND id != ?2 LIMIT 1",
+                params![thread.id, tab_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "tab binding",
+                message: format!(
+                    "Codex thread '{}' is already bound to tab '{}'; one conversation cannot run in two Wipsaw tabs",
+                    thread.id, existing_tab
+                ),
+            });
+        }
         let changed = self.connection.execute(
-            "UPDATE tabs SET account_id = ?2, codex_home_id = ?3, model_profile_id = ?4, codex_thread_id = ?5, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            "UPDATE tabs SET cwd = ?2, account_id = ?3, codex_home_id = ?4, model_profile_id = ?5, codex_thread_id = ?6, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
             params![
                 tab_id,
+                path_text(&thread.cwd),
                 thread.account_id,
                 thread.codex_home_id,
                 thread.model_profile_id,
@@ -670,6 +688,36 @@ impl Registry {
             .query_row(
                 &format!("{TAB_SELECT} WHERE id = ?1"),
                 [tab_id],
+                tab_from_row,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Restore every field that a thread binding can replace. This is used by
+    /// rollback-safe session adoption when launching the imported native
+    /// conversation fails after an existing tab was rebound.
+    pub fn restore_tab_binding(&self, tab: &Tab) -> Result<Tab> {
+        let changed = self.connection.execute(
+            "UPDATE tabs SET cwd = ?2, account_id = ?3, codex_home_id = ?4, model_profile_id = ?5, codex_thread_id = ?6, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![
+                tab.id,
+                path_text(&tab.cwd),
+                tab.account_id,
+                tab.codex_home_id,
+                tab.model_profile_id,
+                tab.codex_thread_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "tab",
+                value: tab.id.clone(),
+            });
+        }
+        self.connection
+            .query_row(
+                &format!("{TAB_SELECT} WHERE id = ?1"),
+                [&tab.id],
                 tab_from_row,
             )
             .map_err(Into::into)
@@ -696,8 +744,14 @@ impl Registry {
         )?;
         if let Some(tab_id) = input.bind_tab_id {
             let changed = transaction.execute(
-                "UPDATE tabs SET account_id = (SELECT account_id FROM codex_homes WHERE id = ?2), codex_home_id = ?2, model_profile_id = ?3, codex_thread_id = ?4, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-                params![tab_id, input.codex_home_id, input.model_profile_id, input.id],
+                "UPDATE tabs SET cwd = ?2, account_id = (SELECT account_id FROM codex_homes WHERE id = ?3), codex_home_id = ?3, model_profile_id = ?4, codex_thread_id = ?5, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![
+                    tab_id,
+                    path_text(input.cwd),
+                    input.codex_home_id,
+                    input.model_profile_id,
+                    input.id
+                ],
             )?;
             if changed == 0 {
                 return Err(WipsawError::NotFound {
@@ -744,6 +798,41 @@ impl Registry {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn codex_thread_by_native_id(
+        &self,
+        codex_home_id: &str,
+        native_thread_id: &str,
+    ) -> Result<Option<CodexThread>> {
+        self.connection
+            .query_row(
+                &format!(
+                    "{CODEX_THREAD_SELECT} WHERE t.codex_home_id = ?1 AND t.native_thread_id = ?2 LIMIT 1"
+                ),
+                params![codex_home_id, native_thread_id],
+                codex_thread_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn rename_codex_thread(&self, thread_id: &str, name: &str) -> Result<CodexThread> {
+        let changed = self.connection.execute(
+            "UPDATE codex_threads SET name = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![thread_id, name],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "Codex thread",
+                value: thread_id.to_string(),
+            });
+        }
+        self.codex_thread_by_ref(thread_id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex thread",
+                value: thread_id.to_string(),
+            })
     }
 
     pub fn list_workspace_codex_threads(&self, workspace_id: &str) -> Result<Vec<CodexThread>> {
@@ -1193,7 +1282,7 @@ impl Registry {
             .map_err(Into::into)
     }
 
-    fn codex_home_by_path(&self, path: &Path) -> Result<Option<CodexHome>> {
+    pub fn codex_home_by_path(&self, path: &Path) -> Result<Option<CodexHome>> {
         self.connection
             .query_row(
                 &format!("{CODEX_HOME_SELECT} WHERE h.host_id = ?1 AND h.path = ?2 LIMIT 1"),
@@ -1859,7 +1948,7 @@ mod tests {
                 codex_home_id: &home.id,
                 native_thread_id: "01900000-0000-7000-8000-000000000000",
                 name: "API implementation",
-                cwd: Path::new("/tmp"),
+                cwd: Path::new("/tmp/company-project"),
                 model_profile_id: Some(&profile.id),
                 model: "gpt-test",
                 model_provider: "openai",
@@ -1883,6 +1972,21 @@ mod tests {
         assert_eq!(rebound.account_id.as_deref(), Some(account.id.as_str()));
         assert_eq!(rebound.codex_home_id.as_deref(), Some(home.id.as_str()));
         assert_eq!(rebound.codex_thread_id.as_deref(), Some(thread.id.as_str()));
+        assert_eq!(rebound.cwd, Path::new("/tmp/company-project"));
+        assert_eq!(
+            registry
+                .codex_thread_by_native_id(&home.id, &thread.native_thread_id)
+                .unwrap()
+                .map(|found| found.id),
+            Some(thread.id.clone())
+        );
+
+        let restored = registry.restore_tab_binding(&tab).unwrap();
+        assert_eq!(restored.cwd, Path::new("/tmp"));
+        assert!(restored.account_id.is_none());
+        assert!(restored.codex_home_id.is_none());
+        assert!(restored.model_profile_id.is_none());
+        assert!(restored.codex_thread_id.is_none());
 
         let second_tab = registry
             .insert_tab(NewTab {
@@ -1891,7 +1995,7 @@ mod tests {
                 name: "review",
                 tmux_window_id: "@3",
                 tmux_window_index: 2,
-                cwd: Path::new("/tmp"),
+                cwd: Path::new("/var/tmp"),
                 account_id: None,
                 codex_home_id: None,
                 model_profile_id: None,
@@ -1908,6 +2012,15 @@ mod tests {
         assert_eq!(
             second_binding.model_profile_id.as_deref(),
             Some(profile.id.as_str())
+        );
+        assert_eq!(second_binding.cwd, Path::new("/tmp/company-project"));
+        let duplicate = registry
+            .bind_tab_to_codex_thread(&tab.id, &thread)
+            .unwrap_err();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("cannot run in two Wipsaw tabs")
         );
         assert_eq!(
             registry

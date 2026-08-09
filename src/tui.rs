@@ -74,7 +74,9 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
 
     loop {
         navigator.poll_manager(app);
-        session.set_mouse_capture(!navigator.manager.copy_view)?;
+        // Copy mode performs its own text selection so it works consistently
+        // inside tmux, popups, and alternate-screen terminals.
+        session.set_mouse_capture(true)?;
         session.terminal.draw(|frame| navigator.render(frame))?;
 
         let input = if navigator.manager.turn.is_some() && !navigator.manager.copy_view {
@@ -83,8 +85,8 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
             }
             event::read()?
         } else {
-            // Avoid repainting an idle dashboard. Besides saving work, this keeps
-            // native terminal selections stable while the user copies text.
+            // Avoid repainting an idle dashboard. Copy mode keeps its own exact
+            // selection offsets, so redraws are needed only after user input.
             event::read()?
         };
         let old_workspace = navigator.selected_workspace().map(|item| item.id.clone());
@@ -473,6 +475,20 @@ struct ManagerChat {
     reference_dismissed: bool,
     progress: Vec<ManagerProgress>,
     copy_view: bool,
+    copy_cursor: usize,
+    copy_anchor: Option<usize>,
+    copy_dragging: bool,
+    copy_drag_origin: usize,
+    copy_drag_origin_end: usize,
+    copy_view_top: usize,
+    copy_view_height: usize,
+    copy_view_width: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagerCopyLine {
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1343,34 +1359,189 @@ impl Navigator {
         self.manager.copy_view = true;
         self.manager.focused = false;
         self.manager.scroll = 0;
+        let document = self.manager_copy_document();
+        self.manager.copy_cursor = document.len();
+        self.manager.copy_anchor = None;
+        self.manager.copy_dragging = false;
+        self.manager.copy_drag_origin = self.manager.copy_cursor;
+        self.manager.copy_drag_origin_end = self.manager.copy_cursor;
+        self.manager.copy_view_top = usize::MAX;
         self.message = None;
     }
 
     fn handle_manager_copy_view_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 self.manager.copy_view = false;
+                self.manager.copy_dragging = false;
                 Action::None
             }
-            KeyCode::Char('y') => self.copy_latest_manager_message(),
+            KeyCode::Char('v') => {
+                self.manager.copy_anchor = if self.manager.copy_anchor.is_some() {
+                    None
+                } else {
+                    Some(self.manager.copy_cursor)
+                };
+                Action::None
+            }
+            KeyCode::Char('y') | KeyCode::Enter => self.copy_manager_selection(),
             KeyCode::Char('Y') => self.copy_manager_transcript(),
-            KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
-                self.manager.scroll = self.manager.scroll.saturating_add(3);
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let document = self.manager_copy_document();
+                self.manager.copy_anchor = Some(0);
+                self.manager.copy_cursor = document.len();
+                self.ensure_manager_copy_cursor_visible();
                 Action::None
             }
-            KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
-                self.manager.scroll = self.manager.scroll.saturating_sub(3);
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.move_manager_copy_horizontal(
+                    false,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+                Action::None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.move_manager_copy_horizontal(
+                    true,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_manager_copy_vertical(-1, key.modifiers.contains(KeyModifiers::SHIFT));
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_manager_copy_vertical(1, key.modifiers.contains(KeyModifiers::SHIFT));
+                Action::None
+            }
+            KeyCode::PageUp => {
+                let amount = self.manager.copy_view_height.max(1) as isize;
+                self.move_manager_copy_vertical(
+                    -amount,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+                Action::None
+            }
+            KeyCode::PageDown => {
+                let amount = self.manager.copy_view_height.max(1) as isize;
+                self.move_manager_copy_vertical(
+                    amount,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                );
                 Action::None
             }
             KeyCode::Home => {
-                self.manager.scroll = u16::MAX;
+                self.set_manager_copy_cursor(0, key.modifiers.contains(KeyModifiers::SHIFT));
                 Action::None
             }
             KeyCode::End | KeyCode::Char('G') => {
-                self.manager.scroll = 0;
+                let end = self.manager_copy_document().len();
+                self.set_manager_copy_cursor(end, key.modifiers.contains(KeyModifiers::SHIFT));
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    fn manager_copy_document(&self) -> String {
+        manager_transcript_text(
+            &self.manager.messages,
+            &self.manager.progress,
+            self.manager_label(),
+        )
+    }
+
+    fn set_manager_copy_cursor(&mut self, cursor: usize, extend: bool) {
+        let document = self.manager_copy_document();
+        let cursor = clamp_char_boundary(&document, cursor.min(document.len()));
+        if extend {
+            self.manager
+                .copy_anchor
+                .get_or_insert(self.manager.copy_cursor.min(document.len()));
+        } else {
+            self.manager.copy_anchor = None;
+        }
+        self.manager.copy_cursor = cursor;
+        self.ensure_manager_copy_cursor_visible();
+    }
+
+    fn move_manager_copy_horizontal(&mut self, forwards: bool, extend: bool) {
+        let document = self.manager_copy_document();
+        let cursor = clamp_char_boundary(&document, self.manager.copy_cursor.min(document.len()));
+        let next = if forwards {
+            next_char_boundary(&document, cursor)
+        } else {
+            previous_char_boundary(&document, cursor)
+        };
+        self.set_manager_copy_cursor(next, extend);
+    }
+
+    fn move_manager_copy_vertical(&mut self, rows: isize, extend: bool) {
+        let document = self.manager_copy_document();
+        let width = self.manager.copy_view_width.max(1);
+        let lines = manager_copy_lines(&document, width);
+        let current = manager_copy_line_at(&lines, self.manager.copy_cursor.min(document.len()));
+        let column = document
+            [lines[current].start..self.manager.copy_cursor.min(lines[current].end)]
+            .chars()
+            .count();
+        let target = current
+            .saturating_add_signed(rows)
+            .min(lines.len().saturating_sub(1));
+        let cursor =
+            byte_at_character_column(&document, lines[target].start, lines[target].end, column);
+        self.set_manager_copy_cursor(cursor, extend);
+    }
+
+    fn ensure_manager_copy_cursor_visible(&mut self) {
+        let document = self.manager_copy_document();
+        let lines = manager_copy_lines(&document, self.manager.copy_view_width.max(1));
+        let cursor_line =
+            manager_copy_line_at(&lines, self.manager.copy_cursor.min(document.len()));
+        let height = self.manager.copy_view_height.max(1);
+        let max_top = lines.len().saturating_sub(height);
+        if self.manager.copy_view_top == usize::MAX {
+            self.manager.copy_view_top = max_top;
+        }
+        if cursor_line < self.manager.copy_view_top {
+            self.manager.copy_view_top = cursor_line;
+        } else if cursor_line >= self.manager.copy_view_top.saturating_add(height) {
+            self.manager.copy_view_top = cursor_line.saturating_sub(height - 1);
+        }
+        self.manager.copy_view_top = self.manager.copy_view_top.min(max_top);
+    }
+
+    fn copy_manager_selection(&self) -> Action {
+        let document = self.manager_copy_document();
+        if document.is_empty() {
+            return Action::None;
+        }
+        let cursor = clamp_char_boundary(&document, self.manager.copy_cursor.min(document.len()));
+        let selected = self
+            .manager
+            .copy_anchor
+            .map(|anchor| clamp_char_boundary(&document, anchor.min(document.len())))
+            .filter(|anchor| *anchor != cursor)
+            .map(|anchor| {
+                let (start, end) = if anchor < cursor {
+                    (anchor, cursor)
+                } else {
+                    (cursor, anchor)
+                };
+                document[start..end].to_string()
+            })
+            .unwrap_or_else(|| {
+                let lines = manager_copy_lines(&document, self.manager.copy_view_width.max(1));
+                let line = lines[manager_copy_line_at(&lines, cursor)];
+                document[line.start..line.end].to_string()
+            });
+        if selected.is_empty() {
+            return Action::None;
+        }
+        Action::CopyManager {
+            text: selected,
+            description: "the selected manager text",
         }
     }
 
@@ -1383,6 +1554,9 @@ impl Navigator {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if self.manager.copy_view {
+            return self.handle_manager_copy_view_mouse(mouse);
+        }
         let over_transcript = self
             .manager
             .transcript_area
@@ -1420,6 +1594,84 @@ impl Navigator {
             _ => {}
         }
         Action::None
+    }
+
+    fn handle_manager_copy_view_mouse(&mut self, mouse: MouseEvent) -> Action {
+        let Some(area) = self.manager.transcript_area else {
+            return Action::None;
+        };
+        let document = self.manager_copy_document();
+        let lines = manager_copy_lines(&document, self.manager.copy_view_width.max(1));
+        let max_top = lines
+            .len()
+            .saturating_sub(self.manager.copy_view_height.max(1));
+        match mouse.kind {
+            MouseEventKind::ScrollUp if rect_contains(area, mouse.column, mouse.row) => {
+                self.manager.copy_view_top =
+                    self.manager.copy_view_top.min(max_top).saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown if rect_contains(area, mouse.column, mouse.row) => {
+                self.manager.copy_view_top = self
+                    .manager
+                    .copy_view_top
+                    .min(max_top)
+                    .saturating_add(3)
+                    .min(max_top);
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if rect_contains(area, mouse.column, mouse.row) =>
+            {
+                let (start, end) = manager_copy_cell_from_mouse(
+                    &document,
+                    &lines,
+                    self.manager.copy_view_top.min(max_top),
+                    area,
+                    mouse.column,
+                    mouse.row,
+                );
+                self.manager.copy_drag_origin = start;
+                self.manager.copy_drag_origin_end = end;
+                self.manager.copy_anchor = Some(start);
+                self.manager.copy_cursor = end;
+                self.manager.copy_dragging = true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.manager.copy_dragging => {
+                let (start, end) = manager_copy_cell_from_mouse(
+                    &document,
+                    &lines,
+                    self.manager.copy_view_top.min(max_top),
+                    area,
+                    mouse.column,
+                    mouse.row,
+                );
+                self.set_manager_mouse_selection(start, end, &document);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.manager.copy_dragging => {
+                let (start, end) = manager_copy_cell_from_mouse(
+                    &document,
+                    &lines,
+                    self.manager.copy_view_top.min(max_top),
+                    area,
+                    mouse.column,
+                    mouse.row,
+                );
+                self.set_manager_mouse_selection(start, end, &document);
+                self.manager.copy_dragging = false;
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn set_manager_mouse_selection(&mut self, start: usize, end: usize, document: &str) {
+        let origin = self.manager.copy_drag_origin.min(document.len());
+        if start < origin {
+            self.manager.copy_anchor = Some(self.manager.copy_drag_origin_end.min(document.len()));
+            self.manager.copy_cursor = start;
+        } else {
+            self.manager.copy_anchor = Some(origin);
+            self.manager.copy_cursor = end;
+        }
     }
 
     fn insert_manager_text(&mut self, value: &str) {
@@ -2319,7 +2571,7 @@ impl Navigator {
                     Style::default().fg(MUTED),
                 ),
                 Span::styled(
-                    "  ·  v select / y latest / Y transcript",
+                    "  ·  v copy mode / y latest / Y transcript",
                     Style::default().fg(MUTED),
                 ),
             ])),
@@ -2327,7 +2579,7 @@ impl Navigator {
         );
     }
 
-    fn render_manager_copy_view(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_manager_copy_view(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2340,34 +2592,79 @@ impl Navigator {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    format!("{label} OUTPUT"),
+                    format!("{label} SELECT & COPY"),
                     Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(
-                    "Drag to select only this transcript, then use your terminal's copy shortcut.",
+                    "Mouse-drag or use Shift+arrows to select exact transcript text; press y to copy it.",
                     Style::default().fg(MUTED),
                 ),
             ]),
             rows[0],
         );
-        let lines = manager_transcript_lines(
-            &self.manager.messages,
-            &self.manager.progress,
-            label,
-            rows[1].width.saturating_sub(1).max(12) as usize,
-        );
-        let scroll = manager_scroll_position(lines.len(), rows[1].height, self.manager.scroll);
+        self.manager.transcript_area = Some(rows[1]);
+        self.manager.copy_view_width = rows[1].width.max(1) as usize;
+        self.manager.copy_view_height = rows[1].height.max(1) as usize;
+        let document = self.manager_copy_document();
+        self.manager.copy_cursor =
+            clamp_char_boundary(&document, self.manager.copy_cursor.min(document.len()));
+        if let Some(anchor) = self.manager.copy_anchor.as_mut() {
+            *anchor = clamp_char_boundary(&document, (*anchor).min(document.len()));
+        }
+        let copy_lines = manager_copy_lines(&document, self.manager.copy_view_width);
+        let max_top = copy_lines
+            .len()
+            .saturating_sub(self.manager.copy_view_height);
+        if self.manager.copy_view_top == usize::MAX {
+            self.manager.copy_view_top = max_top;
+        }
+        self.manager.copy_view_top = self.manager.copy_view_top.min(max_top);
+        let cursor_line = manager_copy_line_at(&copy_lines, self.manager.copy_cursor);
+        let selection = self
+            .manager
+            .copy_anchor
+            .filter(|anchor| *anchor != self.manager.copy_cursor)
+            .map(|anchor| {
+                if anchor < self.manager.copy_cursor {
+                    (anchor, self.manager.copy_cursor)
+                } else {
+                    (self.manager.copy_cursor, anchor)
+                }
+            });
+        let rendered = copy_lines
+            .iter()
+            .enumerate()
+            .skip(self.manager.copy_view_top)
+            .take(self.manager.copy_view_height)
+            .map(|(index, line)| {
+                render_manager_copy_line(
+                    &document,
+                    *line,
+                    index == cursor_line,
+                    self.manager.copy_cursor,
+                    selection,
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(rendered), rows[1]);
+        let selected_chars = selection
+            .map(|(start, end)| document[start..end].chars().count())
+            .unwrap_or(0);
         frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((scroll, 0))
-                .wrap(Wrap { trim: false }),
-            rows[1],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "Esc/v return · ↑↓ scroll · y copy latest · Y copy transcript",
-                Style::default().fg(MUTED),
-            ))
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if selected_chars > 0 {
+                        format!(" {selected_chars} selected ")
+                    } else {
+                        " cursor ".to_string()
+                    },
+                    Style::default().fg(if selected_chars > 0 { CYAN } else { MUTED }),
+                ),
+                Span::styled(
+                    "· drag/Shift+arrows select · y/Enter copy · Ctrl+A all · Y transcript · Esc return",
+                    Style::default().fg(MUTED),
+                ),
+            ]))
             .block(
                 Block::default()
                     .borders(Borders::TOP)
@@ -2967,7 +3264,7 @@ impl Navigator {
         let keys = if self.manager.focused {
             "←→↑↓ edit   Enter send   Ctrl+J newline   PgUp/PgDn history   @ files   $ skills"
         } else if self.manager.overlay || self.view == View::Home {
-            "Enter compose   v select output   y latest   Y transcript   ↑↓ scroll   ? guide"
+            "Enter compose   v copy mode   y latest   Y transcript   ↑↓ scroll   ? guide"
         } else if self.prefix_pending {
             "PREFIX C-b · w home  s sessions  t threads  g WIPs  m Lumbergh  n/p views"
         } else if area.width < 92 {
@@ -3641,6 +3938,7 @@ fn manager_progress_changes_inventory(progress: &ManagerProgress) -> bool {
             "wipsaw/run_wipsaw",
             "wipsaw/create_codex_tab",
             "wipsaw/start_codex_session",
+            "wipsaw/import_codex_session",
             "wipsaw/create_handoff_tab",
         ]
         .iter()
@@ -3725,6 +4023,123 @@ fn manager_transcript_text(
         blocks.push(progress);
     }
     blocks.join("\n\n")
+}
+
+fn manager_copy_lines(value: &str, width: usize) -> Vec<ManagerCopyLine> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut logical_start = 0;
+    loop {
+        let newline = value[logical_start..]
+            .find('\n')
+            .map(|offset| logical_start + offset);
+        let logical_end = newline.unwrap_or(value.len());
+        let logical = &value[logical_start..logical_end];
+        lines.extend(
+            editor_rows(logical, width)
+                .into_iter()
+                .map(|row| ManagerCopyLine {
+                    start: logical_start + row.start,
+                    end: logical_start + row.end,
+                }),
+        );
+        let Some(newline) = newline else {
+            break;
+        };
+        logical_start = newline + 1;
+        if logical_start > value.len() {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        lines.push(ManagerCopyLine { start: 0, end: 0 });
+    }
+    lines
+}
+
+fn manager_copy_line_at(lines: &[ManagerCopyLine], offset: usize) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, line)| offset >= line.start && offset <= line.end)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| lines.len().saturating_sub(1))
+}
+
+fn manager_copy_cell_from_mouse(
+    document: &str,
+    lines: &[ManagerCopyLine],
+    top: usize,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> (usize, usize) {
+    let visual_row = row
+        .saturating_sub(area.y)
+        .min(area.height.saturating_sub(1)) as usize;
+    let line = lines[(top + visual_row).min(lines.len().saturating_sub(1))];
+    let visual_column = column
+        .saturating_sub(area.x)
+        .min(area.width.saturating_sub(1)) as usize;
+    let start = byte_at_character_column(document, line.start, line.end, visual_column);
+    let end = next_char_boundary(document, start).min(line.end);
+    (start, end)
+}
+
+fn render_manager_copy_line(
+    document: &str,
+    line: ManagerCopyLine,
+    cursor_line: bool,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+) -> Line<'static> {
+    let source = &document[line.start..line.end];
+    let color = match source {
+        "YOU" => AMBER,
+        "LUMBERGH" | "MIDDLE MANAGER" => CYAN,
+        "CODEX" => STEEL,
+        "WIPSAW" => RED,
+        _ => INK,
+    };
+    let normal = Style::default().fg(color);
+    let selected = Style::default()
+        .fg(DEEP)
+        .bg(CYAN)
+        .add_modifier(Modifier::BOLD);
+    let cursor_style = Style::default().fg(DEEP).bg(AMBER);
+
+    if let Some((selection_start, selection_end)) = selection {
+        let start = selection_start.max(line.start).min(line.end);
+        let end = selection_end.max(line.start).min(line.end);
+        if start < end {
+            return Line::from(vec![
+                Span::styled(document[line.start..start].to_string(), normal),
+                Span::styled(document[start..end].to_string(), selected),
+                Span::styled(document[end..line.end].to_string(), normal),
+            ]);
+        }
+        if source.is_empty() && selection_start <= line.start && selection_end > line.start {
+            return Line::from(Span::styled(" ".to_string(), selected));
+        }
+    }
+
+    if cursor_line {
+        let cursor = clamp_char_boundary(document, cursor.clamp(line.start, line.end));
+        if cursor < line.end {
+            let next = next_char_boundary(document, cursor).min(line.end);
+            return Line::from(vec![
+                Span::styled(document[line.start..cursor].to_string(), normal),
+                Span::styled(document[cursor..next].to_string(), cursor_style),
+                Span::styled(document[next..line.end].to_string(), normal),
+            ]);
+        }
+        return Line::from(vec![
+            Span::styled(source.to_string(), normal),
+            Span::styled(" ".to_string(), cursor_style),
+        ]);
+    }
+    Line::from(Span::styled(source.to_string(), normal))
 }
 
 fn manager_editor_lines(
@@ -4018,8 +4433,8 @@ mod tests {
 
     use super::{
         Action, Navigator, active_manager_reference, base64_encode, editor_cursor_from_position,
-        manager_progress_changes_inventory, manager_reference_catalog, manager_scroll_position,
-        wrap_editor_text, wrap_text,
+        manager_copy_lines, manager_progress_changes_inventory, manager_reference_catalog,
+        manager_scroll_position, wrap_editor_text, wrap_text,
     };
     use crate::manager::{ManagerContextScope, ManagerProgress, ManagerProgressStatus};
     use crate::model::ManagerMessage;
@@ -4169,6 +4584,45 @@ mod tests {
     }
 
     #[test]
+    fn manager_copy_selection_preserves_an_exact_id_across_visual_wraps() {
+        let native_id = "019fab4e-fc47-75c1-9be8-66050a58add7";
+        let mut navigator = Navigator::empty();
+        navigator.manager.messages = vec![ManagerMessage {
+            id: 1,
+            manager_session_id: "manager_test".to_string(),
+            role: "assistant".to_string(),
+            content: format!("Resume native session {native_id} now."),
+            created_at: String::new(),
+        }];
+        navigator.open_manager_copy_view();
+        navigator.manager.copy_view_width = 12;
+        let document = navigator.manager_copy_document();
+        let start = document.find(native_id).unwrap();
+        let end = start + native_id.len();
+        assert!(manager_copy_lines(&document, 12).len() > document.lines().count());
+
+        navigator.manager.copy_drag_origin = start;
+        navigator.manager.copy_drag_origin_end = super::next_char_boundary(&document, start);
+        navigator.set_manager_mouse_selection(end - 1, end, &document);
+        match navigator.copy_manager_selection() {
+            Action::CopyManager { text, .. } => assert_eq!(text, native_id),
+            _ => panic!("expected selected text to be copied"),
+        }
+
+        navigator.manager.copy_drag_origin = end - 1;
+        navigator.manager.copy_drag_origin_end = end;
+        navigator.set_manager_mouse_selection(
+            start,
+            super::next_char_boundary(&document, start),
+            &document,
+        );
+        match navigator.copy_manager_selection() {
+            Action::CopyManager { text, .. } => assert_eq!(text, native_id),
+            _ => panic!("expected reverse-selected text to be copied"),
+        }
+    }
+
+    #[test]
     fn empty_navigator_renders_manager_first_dashboard() {
         let backend = TestBackend::new(144, 42);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4262,7 +4716,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("LUMBERGH OUTPUT"));
+        assert!(content.contains("LUMBERGH SELECT & COPY"));
         assert!(content.contains("MCP · wipsaw/run_wipsaw"));
         assert!(content.contains("There are two workspaces."));
         assert!(!content.contains("Ready to cut?"));
