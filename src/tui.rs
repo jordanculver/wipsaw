@@ -87,7 +87,7 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
                 Ok(()) => navigator.notice("table of contents refreshed"),
                 Err(error) => navigator.error(error),
             },
-            Action::CreateWorkspace { name, open_manager } => {
+            Action::CreateWorkspace { name } => {
                 let result = std::env::current_dir()
                     .map_err(WipsawError::from)
                     .and_then(|cwd| app.create_workspace(&name, &cwd));
@@ -97,19 +97,13 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
                         if let Err(error) = navigator.refresh_selecting(app, Some(&workspace.id)) {
                             navigator.error(error);
                         }
-                        if open_manager {
-                            session.suspend()?;
-                            let result = app
-                                .start_tab_codex(&workspace.id, "manager")
-                                .and_then(|_| app.activate_tab(&workspace.id, "manager"));
-                            session.resume()?;
-                            match result {
-                                Ok(true) => break,
-                                Ok(false) => {
-                                    navigator.notice("detached; Lumbergh is still running")
-                                }
-                                Err(error) => navigator.error(error),
-                            }
+                        session.suspend()?;
+                        let result = app.activate_tab(&workspace.id, "manager");
+                        session.resume()?;
+                        match result {
+                            Ok(true) => break,
+                            Ok(false) => navigator.notice("detached; Lumbergh is still running"),
+                            Err(error) => navigator.error(error),
                         }
                     }
                     Err(error) => navigator.error(error),
@@ -215,9 +209,7 @@ pub fn run(app: &mut WipsawApp) -> Result<()> {
             }
             Action::OpenManager { workspace_id } => {
                 session.suspend()?;
-                let result = app
-                    .start_tab_codex(&workspace_id, "manager")
-                    .and_then(|_| app.activate_tab(&workspace_id, "manager"));
+                let result = app.activate_tab(&workspace_id, "manager");
                 session.resume()?;
                 match result {
                     Ok(true) => break,
@@ -705,9 +697,7 @@ impl Navigator {
                     return Action::None;
                 }
                 match prompt.kind {
-                    PromptKind::Workspace { open_manager } => {
-                        Action::CreateWorkspace { name, open_manager }
-                    }
+                    PromptKind::Workspace => Action::CreateWorkspace { name },
                     PromptKind::Tab {
                         workspace_id,
                         start_codex,
@@ -732,15 +722,15 @@ impl Navigator {
 
     fn begin_create(&mut self) {
         match self.view {
-            View::Home => self.begin_workspace(false),
+            View::Home => self.begin_workspace(),
             View::Sessions if self.active == Panel::Tabs => self.begin_tab(false),
-            View::Sessions => self.begin_workspace(false),
+            View::Sessions => self.begin_workspace(),
             View::Threads => self.begin_tab(true),
             View::Wips => self.notice("WIP creation arrives with the scheduler runtime next slice"),
         }
     }
 
-    fn begin_workspace(&mut self, open_manager: bool) {
+    fn begin_workspace(&mut self) {
         let suggested_name = std::env::current_dir()
             .ok()
             .and_then(|cwd| {
@@ -750,7 +740,7 @@ impl Navigator {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "workspace".to_string());
         self.prompt = Some(Prompt {
-            kind: PromptKind::Workspace { open_manager },
+            kind: PromptKind::Workspace,
             value: suggested_name,
         });
         self.message = None;
@@ -773,7 +763,7 @@ impl Navigator {
             .selected_workspace()
             .map(|workspace| workspace.id.clone())
         else {
-            self.begin_workspace(true);
+            self.begin_workspace();
             return Action::None;
         };
         Action::OpenManager { workspace_id }
@@ -1833,6 +1823,7 @@ impl Navigator {
                 "  2. Tell Lumbergh what you want: create tabs, choose models, or prepare a WIP.",
             ),
             Line::from("  3. From any managed tab, press Ctrl-b w to return to this dashboard."),
+            Line::from("  Stopped workspaces are rebuilt automatically when you open them."),
             Line::raw(""),
             Line::styled("DASHBOARD", Style::default().fg(AMBER)),
             Line::from("  1 / 2 / 3 / 4  Home / Sessions / Threads / WIPs"),
@@ -1914,12 +1905,9 @@ impl Prompt {
 
     fn label(&self) -> &'static str {
         match self.kind {
-            PromptKind::Workspace { open_manager: true } => {
-                "Name your first workspace · Lumbergh opens next in the current directory"
+            PromptKind::Workspace => {
+                "Workspace name · Lumbergh starts next in the current directory"
             }
-            PromptKind::Workspace {
-                open_manager: false,
-            } => "Workspace name · working directory is the current directory",
             PromptKind::Tab {
                 start_codex: false, ..
             } => "Shell tab name · inherits the selected workspace directory",
@@ -1932,9 +1920,7 @@ impl Prompt {
 }
 
 enum PromptKind {
-    Workspace {
-        open_manager: bool,
-    },
+    Workspace,
     Tab {
         workspace_id: String,
         start_codex: bool,
@@ -1951,7 +1937,6 @@ enum Action {
     Refresh,
     CreateWorkspace {
         name: String,
-        open_manager: bool,
     },
     CreateTab {
         workspace_id: String,
@@ -2177,7 +2162,7 @@ mod tests {
         assert!(matches!(navigator.enter_action(), Action::None));
         assert!(matches!(
             navigator.prompt.as_ref().map(|prompt| &prompt.kind),
-            Some(PromptKind::Workspace { open_manager: true })
+            Some(PromptKind::Workspace)
         ));
     }
 

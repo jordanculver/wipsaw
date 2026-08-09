@@ -119,7 +119,9 @@ policy checks even when invoked by Lumbergh.
 
 - Create, rename, reorder, move, detach, reattach, archive, and delete tabs.
 - Restore Wipsaw after its TUI or daemon restarts; tmux remains the durable PTY
-  owner.
+  owner. If the private tmux session itself is gone, opening the workspace must
+  reconstruct registered tabs, reconcile ephemeral window IDs, and resume the
+  manager automatically rather than requiring manual database repair.
 - Support bash and zsh initially, including user-selected rc files and
   Oh My Zsh configuration.
 - Inject Wipsaw shortcuts without editing the user's global shell files.

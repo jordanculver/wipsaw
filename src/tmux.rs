@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -244,6 +245,36 @@ impl TmuxBackend {
         self.run(&args)
     }
 
+    /// Detect the managed Codex process beneath a pane shell. The launch
+    /// wrapper intentionally keeps a shell as the pane leader so it can return
+    /// to an interactive prompt when Codex exits; `pane_current_command` alone
+    /// therefore cannot distinguish that active Codex child from an idle zsh.
+    pub fn window_has_managed_thread(
+        &self,
+        session: &str,
+        window_id: &str,
+        managed_thread_id: &str,
+    ) -> Result<bool> {
+        let target = format!("{session}:{window_id}");
+        let args = self.base_args([
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "#{pane_pid}",
+        ]);
+        let output = self.run(&args)?;
+        let pane_pid = output
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| WipsawError::MalformedTmuxOutput(output))?;
+        Ok(process_tree_has_environment(
+            pane_pid,
+            "WIPSAW_THREAD_ID",
+            managed_thread_id,
+        ))
+    }
+
     pub fn current_context(&self) -> Result<TmuxPaneContext> {
         let pane_id = env::var("TMUX_PANE")
             .ok()
@@ -391,6 +422,32 @@ fn successful_output(program: &Path, args: &[OsString], output: Output) -> Resul
     })
 }
 
+fn process_tree_has_environment(root_pid: u32, name: &str, value: &str) -> bool {
+    let expected = format!("{name}={value}").into_bytes();
+    let mut pending = vec![root_pid];
+    let mut visited = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        let environment = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == expected.as_slice())
+        {
+            return true;
+        }
+        let children =
+            fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+        pending.extend(
+            children
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok()),
+        );
+    }
+    false
+}
+
 fn args_text(args: &[OsString]) -> String {
     args.iter()
         .map(|arg| arg.to_string_lossy())
@@ -457,8 +514,11 @@ fn tmux_fields(line: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
 
-    use super::{TMUX_CONFIG, codex_launch_command, parse_window};
+    use super::{TMUX_CONFIG, codex_launch_command, parse_window, process_tree_has_environment};
 
     #[test]
     fn popup_bindings_expand_the_parent_context_before_launch() {
@@ -499,5 +559,31 @@ mod tests {
         assert!(command.contains("CODEX_HOME='/tmp/codex home'"));
         assert!(command.contains("'/opt/Codex CLI/codex' resume 'native-123'"));
         assert!(command.ends_with("exec '/bin/zsh'"));
+    }
+
+    #[test]
+    fn managed_codex_child_is_detected_beneath_its_pane_shell() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 10")
+            .env("WIPSAW_THREAD_ID", "thread_managed")
+            .spawn()
+            .unwrap();
+        let detected = (0..20).any(|_| {
+            let detected =
+                process_tree_has_environment(child.id(), "WIPSAW_THREAD_ID", "thread_managed");
+            if !detected {
+                thread::sleep(Duration::from_millis(10));
+            }
+            detected
+        });
+        assert!(detected);
+        assert!(!process_tree_has_environment(
+            child.id(),
+            "WIPSAW_THREAD_ID",
+            "thread_other"
+        ));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

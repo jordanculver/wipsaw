@@ -149,6 +149,14 @@ center notch and saw cutout as Unicode full/half-block art; the compact layout
 uses a one-cell badge. Ratatui backend tests cover both sizes and the first-run
 Home-to-manager prompt flow.
 
+Runtime recovery update, 2026-08-08: a stopped real workspace reproduced stale
+`display-message` and attach failures because persisted tmux window IDs outlived
+the private session. Activation now reconstructs all registered windows,
+transactionally reconciles reused targets, and resumes Lumbergh. The stopped
+workspace was restored with its existing native manager thread, a second live
+workspace received its default manager, and repeated starts retained the same
+manager pane PID. A live standalone Home-to-Lumbergh attach also passed.
+
 ### SPIKE-013: First-run Codex app-server recovery
 
 Status: Passed for the local alpha

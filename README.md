@@ -47,6 +47,15 @@ primary action and `?` for the complete guide. The layout collapses from a
 dashboard with navigation and live system status to a compact header at narrow
 terminal widths.
 
+Opening any stopped workspace or one of its tabs automatically reconstructs
+the private tmux session from Wipsaw's registry, reconciles new tmux window
+IDs, and resumes Lumbergh. New workspaces start Lumbergh by default. To repair
+or warm one without attaching, run:
+
+```bash
+wipsaw workspace start "workspace name"
+```
+
 On a new Wipsaw registry, the first command automatically adopts the active
 `CODEX_HOME`, or `~/.codex` when that variable is unset, as the `current`
 account and home. Wipsaw references that directory in place, so the user's
@@ -169,7 +178,9 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
 - UUIDv7-backed typed IDs such as `ws_...`, `tab_...`, `acct_...`, and
   `thread_...`.
 - Generated Wipsaw-only tmux config and private socket.
-- Workspace create/list/attach and tab create/list/rename.
+- Workspace create/list/start/attach and tab create/list/rename. Opening a
+  stopped workspace recreates its windows from durable metadata and updates
+  reused tmux targets transactionally.
 - Dependency doctor for tmux, Codex, Docker, Compose, and SSH.
 - Account/home registration with canonical paths and one-account-per-home
   enforcement.
@@ -182,6 +193,9 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   with an optional tab binding.
 - Exact-ID Codex TUI resume inside a mapped tmux tab, with account/home
   compatibility checks and shell restoration after exit.
+- Persistent Lumbergh startup for new and restored workspaces, including
+  process-tree detection that avoids killing an already-running manager hidden
+  beneath its return-to-shell wrapper.
 - A responsive, manager-first dashboard with separate Home, Sessions, Threads,
   and WIPs views, onboarding guidance, live dependency/account summaries, and
   create/rename prompts.

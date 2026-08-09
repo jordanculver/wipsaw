@@ -84,6 +84,8 @@ pub enum WorkspaceCommand {
     },
     /// List registered workspaces.
     List,
+    /// Start or reconstruct a stopped workspace and its manager.
+    Start { workspace: String },
     /// Attach to a workspace by name or ID.
     Attach { workspace: String },
 }
@@ -284,11 +286,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Workspace(args)) => match args.command {
             WorkspaceCommand::Create { name, cwd, attach } => {
                 let workspace = app.create_workspace(&name, &cwd)?;
+                app.start_workspace(&workspace.id)?;
                 if cli.json {
                     print_json(&workspace)?;
                 } else {
                     println!(
-                        "created workspace '{}' ({}) on tmux session {}",
+                        "created workspace '{}' ({}) with Lumbergh ready on tmux session {}",
                         workspace.name, workspace.id, workspace.tmux_session
                     );
                 }
@@ -317,6 +320,22 @@ pub fn run(cli: Cli) -> Result<()> {
                         );
                     }
                 }
+            }
+            WorkspaceCommand::Start { workspace } => {
+                let started = app.start_workspace(&workspace)?;
+                output(cli.json, &started, || {
+                    if started.restored {
+                        format!(
+                            "restored workspace '{}' with Lumbergh ready",
+                            started.workspace.name
+                        )
+                    } else {
+                        format!(
+                            "workspace '{}' is running with Lumbergh ready",
+                            started.workspace.name
+                        )
+                    }
+                })?;
             }
             WorkspaceCommand::Attach { workspace } => app.attach_workspace(&workspace)?,
         },
@@ -546,6 +565,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 tab,
                 attach,
             } => {
+                app.start_workspace(&workspace)?;
                 let launch = app.resume_codex_thread(&thread, &workspace, &tab)?;
                 output(cli.json, &launch, || {
                     format!(

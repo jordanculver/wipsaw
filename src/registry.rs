@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -411,6 +412,61 @@ impl Registry {
                 tab_from_row,
             )
             .map_err(Into::into)
+    }
+
+    /// Replace every persisted tmux target for a workspace in one transaction.
+    ///
+    /// Window IDs belong to a particular tmux server lifetime. When that
+    /// server disappears, restored windows can reuse the same IDs in a
+    /// different order. Moving all rows through unique temporary IDs avoids
+    /// collisions while swapping the stale targets for the restored ones.
+    pub fn replace_workspace_tab_targets(
+        &self,
+        workspace_id: &str,
+        targets: &[(String, String, i64)],
+    ) -> Result<()> {
+        let registered_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM tabs WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get(0),
+        )?;
+        let tab_ids = targets
+            .iter()
+            .map(|(tab_id, _, _)| tab_id.as_str())
+            .collect::<HashSet<_>>();
+        let window_ids = targets
+            .iter()
+            .map(|(_, window_id, _)| window_id.as_str())
+            .collect::<HashSet<_>>();
+        if registered_count != targets.len() as i64
+            || tab_ids.len() != targets.len()
+            || window_ids.len() != targets.len()
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace recovery",
+                message: "restored tmux targets must cover every tab exactly once".to_string(),
+            });
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE tabs SET tmux_window_id = 'wipsaw-recovering:' || id WHERE workspace_id = ?1",
+            [workspace_id],
+        )?;
+        for (tab_id, window_id, window_index) in targets {
+            let changed = transaction.execute(
+                "UPDATE tabs SET tmux_window_id = ?3, tmux_window_index = ?4, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1 AND workspace_id = ?2",
+                params![tab_id, workspace_id, window_id, window_index],
+            )?;
+            if changed != 1 {
+                return Err(WipsawError::NotFound {
+                    entity: "tab",
+                    value: tab_id.clone(),
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn bind_tab_to_codex_thread(&self, tab_id: &str, thread: &CodexThread) -> Result<Tab> {
@@ -1057,6 +1113,58 @@ mod tests {
             tabs.iter().map(|tab| tab.name.as_str()).collect::<Vec<_>>(),
             ["manager", "api"]
         );
+    }
+
+    #[test]
+    fn workspace_recovery_can_swap_reused_tmux_window_ids() {
+        let (_root, mut registry) = registry();
+        let workspace = registry
+            .insert_workspace_with_manager(NewWorkspace {
+                id: "ws_01900000000070008000000000000000",
+                name: "development",
+                tmux_session: "wipsaw-01900000",
+                cwd: Path::new("/tmp"),
+                manager_tab_id: "tab_01900000000070008000000000000000",
+                manager_window_id: "@1",
+                manager_window_index: 0,
+                manager_account_id: None,
+                manager_codex_home_id: None,
+            })
+            .unwrap();
+        let api = registry
+            .insert_tab(NewTab {
+                id: "tab_01900000000070008000000000000001",
+                workspace_id: &workspace.id,
+                name: "api",
+                tmux_window_id: "@2",
+                tmux_window_index: 1,
+                cwd: Path::new("/tmp"),
+                account_id: None,
+                codex_home_id: None,
+                model_profile_id: None,
+                codex_thread_id: None,
+            })
+            .unwrap();
+
+        registry
+            .replace_workspace_tab_targets(
+                &workspace.id,
+                &[
+                    (
+                        "tab_01900000000070008000000000000000".to_string(),
+                        "@2".to_string(),
+                        1,
+                    ),
+                    (api.id.clone(), "@1".to_string(), 0),
+                ],
+            )
+            .unwrap();
+
+        let tabs = registry.list_tabs(&workspace.id).unwrap();
+        assert_eq!(tabs[0].name, "api");
+        assert_eq!(tabs[0].tmux_window_id, "@1");
+        assert_eq!(tabs[1].name, "manager");
+        assert_eq!(tabs[1].tmux_window_id, "@2");
     }
 
     #[test]

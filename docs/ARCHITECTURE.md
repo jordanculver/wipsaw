@@ -125,6 +125,15 @@ status rails; compact terminals preserve the same primary manager action under
 a short header. Unimplemented runtime views are labeled rather than populated
 with simulated data.
 
+Workspace and tab rows are durable; tmux session/window IDs are runtime
+handles. Every mutating or activation path first checks the private tmux
+server. When a session is missing, Wipsaw recreates the manager and remaining
+windows from registry metadata, matches surviving windows by ID/name, and
+transactionally replaces every tab target to tolerate tmux ID reuse. Lumbergh
+is then resumed before attach. Active manager detection walks the Linux pane
+process tree for Wipsaw's thread environment marker because the return-to-shell
+wrapper can leave `pane_current_command` reporting zsh while Codex is active.
+
 A generated shell launcher sits between tmux and Bash/Zsh: it sources the
 user's normal rc files, then defines Wipsaw's tab-aware shortcuts. This keeps
 tmux's PTY durability and the user's Oh My Zsh environment while avoiding

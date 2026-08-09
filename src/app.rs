@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -60,6 +61,14 @@ pub struct WipsawInitialization {
     pub codex: CodexHomeProbe,
     pub shortcut_bin: PathBuf,
     pub tmux_socket: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceStart {
+    pub workspace: Workspace,
+    pub restored: bool,
+    pub manager_thread_id: String,
+    pub native_manager_thread_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -177,14 +186,29 @@ impl WipsawApp {
             })
     }
 
-    pub fn attach_workspace(&self, reference: &str) -> Result<()> {
+    pub fn attach_workspace(&mut self, reference: &str) -> Result<()> {
         self.activate_workspace(reference).map(|_| ())
+    }
+
+    /// Ensure the workspace has a live tmux session, reconcile every durable
+    /// tab with a real window, and keep its persistent manager Codex process
+    /// running. A stopped workspace is reconstructed from registry metadata.
+    pub fn start_workspace(&mut self, reference: &str) -> Result<WorkspaceStart> {
+        let workspace = self.workspace(reference)?;
+        let restored = self.ensure_workspace_runtime(&workspace)?;
+        let manager = self.start_tab_codex(&workspace.id, "manager")?;
+        Ok(WorkspaceStart {
+            workspace,
+            restored,
+            manager_thread_id: manager.id,
+            native_manager_thread_id: manager.native_thread_id,
+        })
     }
 
     /// Attach from a standalone terminal or switch the current Wipsaw client.
     /// Returns `true` when a navigator running inside Wipsaw should close.
-    pub fn activate_workspace(&self, reference: &str) -> Result<bool> {
-        let workspace = self.workspace(reference)?;
+    pub fn activate_workspace(&mut self, reference: &str) -> Result<bool> {
+        let workspace = self.start_workspace(reference)?.workspace;
         if let Some(current) = self.current_workspace()? {
             if current.id != workspace.id {
                 self.tmux.switch_client(&workspace.tmux_session)?;
@@ -198,8 +222,8 @@ impl WipsawApp {
     /// Select a tab and either switch the current Wipsaw client or attach a
     /// standalone terminal. Returns `true` when the caller is already inside
     /// Wipsaw and should close a navigator popup after switching.
-    pub fn activate_tab(&self, workspace_ref: &str, tab_ref: &str) -> Result<bool> {
-        let workspace = self.workspace(workspace_ref)?;
+    pub fn activate_tab(&mut self, workspace_ref: &str, tab_ref: &str) -> Result<bool> {
+        let workspace = self.start_workspace(workspace_ref)?.workspace;
         let tab = self
             .registry
             .tab_by_ref(&workspace.id, tab_ref)?
@@ -220,13 +244,13 @@ impl WipsawApp {
     }
 
     pub fn create_tab(
-        &self,
+        &mut self,
         workspace_ref: &str,
         name: &str,
         cwd: Option<&Path>,
         settings: TabLaunchSettings<'_>,
     ) -> Result<Tab> {
-        let workspace = self.workspace(workspace_ref)?;
+        let workspace = self.start_workspace(workspace_ref)?.workspace;
         let name = validate_display_name("tab name", name)?;
         if self.registry.tab_by_ref(&workspace.id, &name)?.is_some() {
             return Err(WipsawError::AlreadyExists {
@@ -271,8 +295,100 @@ impl WipsawApp {
         Ok((workspace, tabs, live_windows))
     }
 
-    pub fn rename_tab(&self, workspace_ref: &str, tab_ref: &str, name: &str) -> Result<Tab> {
-        let workspace = self.workspace(workspace_ref)?;
+    fn ensure_workspace_runtime(&self, workspace: &Workspace) -> Result<bool> {
+        if !workspace.cwd.is_dir() {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace working directory",
+                message: format!(
+                    "'{}' no longer exists; restore it before starting workspace '{}'",
+                    workspace.cwd.display(),
+                    workspace.name
+                ),
+            });
+        }
+        let mut tabs = self.registry.list_tabs(&workspace.id)?;
+        if !tabs
+            .iter()
+            .any(|tab| tab.name.eq_ignore_ascii_case("manager"))
+        {
+            return Err(WipsawError::NotFound {
+                entity: "manager tab",
+                value: workspace.name.clone(),
+            });
+        }
+        tabs.sort_by_key(|tab| !tab.name.eq_ignore_ascii_case("manager"));
+
+        let was_running = self.tmux.session_exists(&workspace.tmux_session)?;
+        let mut restored = !was_running;
+        let mut windows = if was_running {
+            match self.tmux.list_windows(&workspace.tmux_session) {
+                Ok(windows) => windows,
+                Err(_error) if !self.tmux.session_exists(&workspace.tmux_session)? => {
+                    restored = true;
+                    vec![
+                        self.tmux
+                            .create_workspace(&workspace.tmux_session, &workspace.cwd)?,
+                    ]
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            vec![
+                self.tmux
+                    .create_workspace(&workspace.tmux_session, &workspace.cwd)?,
+            ]
+        };
+
+        let mut used_windows = HashSet::new();
+        let mut targets = Vec::with_capacity(tabs.len());
+        for tab in tabs {
+            let window_position = windows
+                .iter()
+                .position(|window| {
+                    !used_windows.contains(&window.id)
+                        && window.id == tab.tmux_window_id
+                        && window.name.eq_ignore_ascii_case(&tab.name)
+                })
+                .or_else(|| {
+                    windows.iter().position(|window| {
+                        !used_windows.contains(&window.id)
+                            && window.name.eq_ignore_ascii_case(&tab.name)
+                    })
+                })
+                .or_else(|| {
+                    windows.iter().position(|window| {
+                        !used_windows.contains(&window.id) && window.id == tab.tmux_window_id
+                    })
+                });
+            let window = if let Some(position) = window_position {
+                let window = windows[position].clone();
+                if window.name != tab.name {
+                    self.tmux
+                        .rename_tab(&workspace.tmux_session, &window.id, &tab.name)?;
+                }
+                window
+            } else {
+                let cwd = if tab.cwd.is_dir() {
+                    tab.cwd.as_path()
+                } else {
+                    workspace.cwd.as_path()
+                };
+                let window = self
+                    .tmux
+                    .create_tab(&workspace.tmux_session, &tab.name, cwd)?;
+                windows.push(window.clone());
+                window
+            };
+            used_windows.insert(window.id.clone());
+            targets.push((tab.id, window.id, window.index));
+        }
+        self.registry
+            .replace_workspace_tab_targets(&workspace.id, &targets)?;
+        Ok(restored)
+    }
+
+    pub fn rename_tab(&mut self, workspace_ref: &str, tab_ref: &str, name: &str) -> Result<Tab> {
+        let workspace = self.start_workspace(workspace_ref)?.workspace;
         let tab = self
             .registry
             .tab_by_ref(&workspace.id, tab_ref)?
@@ -567,7 +683,7 @@ impl WipsawApp {
     }
 
     pub fn resume_codex_thread(
-        &self,
+        &mut self,
         thread_ref: &str,
         workspace_ref: &str,
         tab_ref: &str,
@@ -587,6 +703,7 @@ impl WipsawApp {
                 value: thread.codex_home_id.clone(),
             })?;
         let workspace = self.workspace(workspace_ref)?;
+        self.ensure_workspace_runtime(&workspace)?;
         let tab = self
             .registry
             .tab_by_ref(&workspace.id, tab_ref)?
@@ -721,7 +838,7 @@ impl WipsawApp {
             return self.exec_codex_thread(&thread, &[]);
         }
 
-        if self.tab_is_at_shell(&workspace, &manager_tab)? {
+        if self.tab_should_start_thread(&workspace, &manager_tab, &thread)? {
             self.resume_codex_thread(&thread.id, &workspace.id, &manager_tab.id)?;
         }
         self.tmux
@@ -732,6 +849,7 @@ impl WipsawApp {
     /// pane is currently at a shell prompt.
     pub fn start_tab_codex(&mut self, workspace_ref: &str, tab_ref: &str) -> Result<CodexThread> {
         let workspace = self.workspace(workspace_ref)?;
+        self.ensure_workspace_runtime(&workspace)?;
         let tab = self
             .registry
             .tab_by_ref(&workspace.id, tab_ref)?
@@ -745,7 +863,7 @@ impl WipsawApp {
             tab.name.clone()
         };
         let thread = self.ensure_tab_thread(&workspace, &tab, &name)?;
-        if self.tab_is_at_shell(&workspace, &tab)? {
+        if self.tab_should_start_thread(&workspace, &tab, &thread)? {
             self.resume_codex_thread(&thread.id, &workspace.id, &tab.id)?;
         }
         Ok(thread)
@@ -755,7 +873,7 @@ impl WipsawApp {
     /// new tab in the preferred workspace; an existing live Codex process is
     /// selected without being killed and respawned.
     pub fn open_codex_thread(
-        &self,
+        &mut self,
         thread_ref: &str,
         preferred_workspace_ref: Option<&str>,
     ) -> Result<bool> {
@@ -797,7 +915,15 @@ impl WipsawApp {
             (workspace, tab)
         };
 
-        if self.tab_is_at_shell(&workspace, &tab)? {
+        self.start_workspace(&workspace.id)?;
+        let tab = self
+            .registry
+            .tab_by_ref(&workspace.id, &tab.id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "tab",
+                value: tab.id.clone(),
+            })?;
+        if self.tab_should_start_thread(&workspace, &tab, &thread)? {
             self.resume_codex_thread(&thread.id, &workspace.id, &tab.id)?;
         }
         self.activate_tab(&workspace.id, &tab.id)
@@ -935,6 +1061,22 @@ impl WipsawApp {
                 command.as_str(),
                 "bash" | "dash" | "fish" | "nu" | "sh" | "zsh"
             ))
+    }
+
+    fn tab_should_start_thread(
+        &self,
+        workspace: &Workspace,
+        tab: &Tab,
+        thread: &CodexThread,
+    ) -> Result<bool> {
+        if self.tmux.window_has_managed_thread(
+            &workspace.tmux_session,
+            &tab.tmux_window_id,
+            &thread.id,
+        )? {
+            return Ok(false);
+        }
+        self.tab_is_at_shell(workspace, tab)
     }
 
     fn available_tab_name(&self, workspace_id: &str, requested: &str) -> Result<String> {
