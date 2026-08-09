@@ -142,33 +142,51 @@ Each generated manager home references the selected account's existing
 authentication but ignores inherited configuration and installs only the
 Wipsaw manager, `skill-creator`, and `skill-installer` skill directories. The
 installer is the manager's default lookup surface. A read-only manager process
-receives one required, private MCP server exposing `manager_guide` and a
-validated `run_wipsaw` capability; shell, personal MCPs, plugins, apps,
+receives one required, private MCP server exposing `manager_guide`, a validated
+`run_wipsaw` capability, and scoped context/list/search/read tools. Lumbergh's
+file scope covers the local filesystem, while each Middle Manager is enforced
+against durable file/directory allowlist rows owned by its workspace. Known
+credential-bearing paths remain blocked. Shell, personal MCPs, plugins, apps,
 unrelated skills, image, and multi-agent capabilities are disabled. Codex's
 stdio MCP launcher receives an explicit map of Wipsaw config/state/data/runtime
-paths, tmux socket and binary, manager executable, and (for Middle Managers)
-workspace ID; its sanitized default environment therefore cannot silently fall
-back to another Wipsaw registry.
+paths, tmux socket and binary, manager executable, serialized context scope,
+and (for Middle Managers) workspace ID; its sanitized default environment
+therefore cannot silently fall back to another Wipsaw registry or broaden its
+file access.
+
+The same workspace-ID capability is checked in the application layer for
+Middle Manager commands. Workspace, tab, and thread reads/mutations are
+filtered to that workspace; Middle Managers cannot create/delete workspaces,
+alter global accounts or Codex homes, or mutate their own context rows.
+Lumbergh and direct human CLI invocations retain cross-workspace authority.
 
 The composer preserves multiline bracketed paste and provides client-side
-completion for scoped `@` files and allowed `$` skills. Wipsaw resolves file
-references beneath the manager context root, rejects credential-like, binary,
-oversized, or escaping files, and appends bounded contents to the model prompt
-while persisting the original human message. The composer renders an empty `λ`
+completion for scoped `@` files and allowed `$` skills. Lumbergh supports lazy
+absolute-path browsing from `/`; Middle Managers index and browse only their
+explicit roots. Wipsaw resolves file references through the same central scope
+policy used by MCP file tools, rejects credential-like, binary, oversized, or
+escaping files, and appends bounded contents to the model prompt while
+persisting the original human message. The composer renders an empty `λ`
 input instead of placeholder or activity text. Clipboard actions copy only the
 latest response or manager transcript through tmux and OSC 52. A separate
 transcript-only view removes adjacent dashboard columns and pauses redraws so
-native terminal selection remains stable; idle dashboard rendering also blocks
-until input. Codex startup, app-server, health checks, and manager turns prepend
+native terminal selection remains stable. Conversation scrolling is stored as
+an offset from the live bottom so Up/Page Up works after long transcripts while
+new turns still follow live output; idle dashboard rendering also blocks until
+input. Codex startup, app-server, health checks, and manager turns prepend
 the Node runtime belonging to the registered npm Codex installation, avoiding
 stale version-manager paths retained by long-lived tmux servers.
 
 Workspace deletion is a shared application operation exposed as
 `workspace delete <id> --yes`. It rejects ambiguous targets, refuses a
 workspace whose Middle Manager is working, prevents a Middle Manager from
-deleting its own scope, stops a live private tmux session, and then relies on
-SQLite foreign-key cascades for tabs and scoped manager history. The private
-manager allowlist requires the same explicit `--yes` argument.
+deleting its own scope, and stops a live private tmux session. It then calls
+Codex app-server `thread/delete` for native tab threads owned exclusively by
+the workspace and for the Middle Manager thread before transactionally removing
+their Wipsaw rows, tabs, contexts, manager history, and workspace. A native
+failure leaves the durable workspace record available for restart/retry. Shared
+thread rows are retained. The private manager allowlist requires the same
+explicit `--yes` argument.
 
 Workspace and tab rows are durable; tmux session/window IDs are runtime
 handles. Every mutating or activation path first checks the private tmux

@@ -28,8 +28,8 @@ use crate::app::{TabLaunchSettings, WipsawApp};
 use crate::doctor::DoctorReport;
 use crate::error::{Result, WipsawError};
 use crate::manager::{
-    MANAGER_MODEL, MANAGER_SKILL_NAMES, ManagerEvent, ManagerProgress, ManagerProgressStatus,
-    sensitive_reference,
+    MANAGER_MODEL, MANAGER_SKILL_NAMES, ManagerContextScope, ManagerEvent, ManagerProgress,
+    ManagerProgressStatus, list_manager_directory, sensitive_reference,
 };
 use crate::model::{
     Account, CodexHome, CodexThread, ManagerMessage, ManagerSession, ModelProfile, Tab, Workspace,
@@ -439,6 +439,7 @@ struct ManagerChat {
     turn: Option<ActiveManagerTurn>,
     scroll: u16,
     references: Vec<ManagerReference>,
+    scope: Option<ManagerContextScope>,
     reference_index: usize,
     reference_dismissed: bool,
     progress: Vec<ManagerProgress>,
@@ -456,6 +457,7 @@ struct ManagerReference {
     kind: ManagerReferenceKind,
     label: String,
     hint: Option<String>,
+    directory: bool,
 }
 
 struct ActiveManagerTurn {
@@ -580,7 +582,8 @@ impl Navigator {
 
     fn load_manager(&mut self, app: &WipsawApp, workspace_ref: Option<&str>) -> Result<()> {
         let (session, messages) = app.manager_messages(workspace_ref)?;
-        let references = manager_reference_catalog(&session.cwd);
+        let scope = app.manager_context_scope(&session)?;
+        let references = manager_reference_catalog(&scope);
         if let Some(existing) = self
             .managers
             .iter_mut()
@@ -593,9 +596,10 @@ impl Navigator {
         self.manager.session = Some(session);
         self.manager.messages = messages;
         self.manager.references = references;
+        self.manager.scope = Some(scope);
         self.manager.reference_index = 0;
         self.manager.reference_dismissed = false;
-        self.manager.scroll = u16::MAX;
+        self.manager.scroll = 0;
         self.manager.activity = None;
         self.manager.progress.clear();
         self.manager.copy_view = false;
@@ -667,7 +671,7 @@ impl Navigator {
             detail: None,
             status: ManagerProgressStatus::Running,
         });
-        self.manager.scroll = u16::MAX;
+        self.manager.scroll = 0;
         if let Some(session) = &self.manager.session {
             match app.registry.list_manager_messages(&session.id, 200) {
                 Ok(messages) => self.manager.messages = messages,
@@ -787,12 +791,16 @@ impl Navigator {
                         {
                             *existing = session.clone();
                         }
+                        if let Ok(scope) = app.manager_context_scope(&session) {
+                            self.manager.references = manager_reference_catalog(&scope);
+                            self.manager.scope = Some(scope);
+                        }
                         self.manager.session = Some(session);
                     }
                     if let Ok(messages) = app.registry.list_manager_messages(&session_id, 200) {
                         self.manager.messages = messages;
                     }
-                    self.manager.scroll = u16::MAX;
+                    self.manager.scroll = 0;
                 }
             }
         }
@@ -818,7 +826,7 @@ impl Navigator {
                 self.manager.progress.remove(removable);
             }
         }
-        self.manager.scroll = u16::MAX;
+        self.manager.scroll = 0;
     }
 
     fn refresh(&mut self, app: &WipsawApp) -> Result<()> {
@@ -846,6 +854,11 @@ impl Navigator {
         self.homes = app.registry.list_codex_homes()?;
         self.profiles = app.registry.list_model_profiles()?;
         self.managers = app.registry.list_manager_sessions()?;
+        if let Some(session) = &self.manager.session {
+            let scope = app.manager_context_scope(session)?;
+            self.manager.references = manager_reference_catalog(&scope);
+            self.manager.scope = Some(scope);
+        }
         self.health = SystemHealth::collect(app);
         select_id(
             &mut self.thread_state,
@@ -948,11 +961,11 @@ impl Navigator {
                     Action::None
                 }
                 KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
-                    self.manager.scroll = self.manager.scroll.saturating_sub(3);
+                    self.manager.scroll = self.manager.scroll.saturating_add(3);
                     Action::None
                 }
                 KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
-                    self.manager.scroll = self.manager.scroll.saturating_add(3);
+                    self.manager.scroll = self.manager.scroll.saturating_sub(3);
                     Action::None
                 }
                 _ => Action::None,
@@ -1118,11 +1131,11 @@ impl Navigator {
                 self.copy_latest_manager_message()
             }
             KeyCode::PageUp | KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.manager.scroll = self.manager.scroll.saturating_sub(3);
+                self.manager.scroll = self.manager.scroll.saturating_add(3);
                 Action::None
             }
             KeyCode::PageDown | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.manager.scroll = self.manager.scroll.saturating_add(3);
+                self.manager.scroll = self.manager.scroll.saturating_sub(3);
                 Action::None
             }
             KeyCode::Enter
@@ -1175,7 +1188,7 @@ impl Navigator {
     fn open_manager_copy_view(&mut self) {
         self.manager.copy_view = true;
         self.manager.focused = false;
-        self.manager.scroll = u16::MAX;
+        self.manager.scroll = 0;
         self.message = None;
     }
 
@@ -1188,19 +1201,19 @@ impl Navigator {
             KeyCode::Char('y') => self.copy_latest_manager_message(),
             KeyCode::Char('Y') => self.copy_manager_transcript(),
             KeyCode::PageUp | KeyCode::Up | KeyCode::Char('k') => {
-                self.manager.scroll = self.manager.scroll.saturating_sub(3);
-                Action::None
-            }
-            KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
                 self.manager.scroll = self.manager.scroll.saturating_add(3);
                 Action::None
             }
+            KeyCode::PageDown | KeyCode::Down | KeyCode::Char('j') => {
+                self.manager.scroll = self.manager.scroll.saturating_sub(3);
+                Action::None
+            }
             KeyCode::Home => {
-                self.manager.scroll = 0;
+                self.manager.scroll = u16::MAX;
                 Action::None
             }
             KeyCode::End | KeyCode::Char('G') => {
-                self.manager.scroll = u16::MAX;
+                self.manager.scroll = 0;
                 Action::None
             }
             _ => Action::None,
@@ -1226,23 +1239,34 @@ impl Navigator {
         self.manager.reference_dismissed = false;
     }
 
-    fn manager_reference_matches(&self) -> Vec<&ManagerReference> {
+    fn manager_reference_matches(&self) -> Vec<ManagerReference> {
         let Some((kind, _, query)) = active_manager_reference(&self.manager.composer) else {
             return Vec::new();
         };
-        let query = query.to_ascii_lowercase();
+        let normalized_query = query.to_ascii_lowercase();
         let mut matches = self
             .manager
             .references
             .iter()
             .filter(|reference| {
-                reference.kind == kind && reference.label.to_ascii_lowercase().contains(&query)
+                reference.kind == kind
+                    && reference
+                        .label
+                        .to_ascii_lowercase()
+                        .contains(&normalized_query)
             })
+            .cloned()
             .collect::<Vec<_>>();
+        if kind == ManagerReferenceKind::File
+            && let Some(scope) = &self.manager.scope
+        {
+            matches.extend(manager_path_reference_matches(scope, query));
+        }
         matches.sort_by_key(|reference| {
             let label = reference.label.to_ascii_lowercase();
-            (!label.starts_with(&query), label.len(), label)
+            (!label.starts_with(&normalized_query), label.len(), label)
         });
+        matches.dedup_by(|left, right| left.kind == right.kind && left.label == right.label);
         matches.truncate(8);
         matches
     }
@@ -1260,13 +1284,20 @@ impl Navigator {
             return;
         };
         let label = reference.label.clone();
+        let directory = reference.directory;
         let sigil = match kind {
             ManagerReferenceKind::File => '@',
             ManagerReferenceKind::Skill => '$',
         };
         let replacement =
             if kind == ManagerReferenceKind::File && label.contains(char::is_whitespace) {
-                format!("{sigil}{{{label}}} ")
+                if directory {
+                    format!("{sigil}{{{label}")
+                } else {
+                    format!("{sigil}{{{label}}} ")
+                }
+            } else if directory {
+                format!("{sigil}{label}")
             } else {
                 format!("{sigil}{label} ")
             };
@@ -1828,6 +1859,18 @@ impl Navigator {
     fn render_manager_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
         let label = self.manager_label();
         let activity = self.manager.activity.as_deref().unwrap_or("ready");
+        let scope = self
+            .manager
+            .scope
+            .as_ref()
+            .map(|scope| {
+                if scope.machine_wide {
+                    "MACHINE READ"
+                } else {
+                    "WORKSPACE READ"
+                }
+            })
+            .unwrap_or("READ SCOPE");
         let block = Block::default()
             .title(Line::from(vec![
                 Span::styled(
@@ -1835,6 +1878,7 @@ impl Navigator {
                     Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("CODEX MANAGER · TERRA MEDIUM", Style::default().fg(MUTED)),
+                Span::styled(format!(" · {scope}"), Style::default().fg(MUTED)),
                 Span::styled(format!(" · {activity} "), Style::default().fg(AMBER)),
             ]))
             .borders(Borders::ALL)
@@ -1851,12 +1895,7 @@ impl Navigator {
             label,
             inner.width.saturating_sub(1).max(12) as usize,
         );
-        let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
-        let scroll = if self.manager.scroll == u16::MAX {
-            max_scroll
-        } else {
-            self.manager.scroll.min(max_scroll)
-        };
+        let scroll = manager_scroll_position(lines.len(), inner.height, self.manager.scroll);
         frame.render_widget(
             Paragraph::new(lines)
                 .block(block)
@@ -1870,7 +1909,7 @@ impl Navigator {
         let working = self.manager.turn.is_some();
         let block = Block::default()
             .title(if area.width >= 76 {
-                " COMPOSER · Enter send · Shift+Enter/Ctrl+J newline · @ files · $ skills "
+                " COMPOSER · Enter send · Ctrl+J newline · Ctrl+↑↓ scroll · @ files · $ skills "
             } else {
                 " COMPOSER · Enter send · Ctrl+J newline "
             })
@@ -2043,12 +2082,7 @@ impl Navigator {
             label,
             rows[1].width.saturating_sub(1).max(12) as usize,
         );
-        let max_scroll = lines.len().saturating_sub(rows[1].height as usize) as u16;
-        let scroll = if self.manager.scroll == u16::MAX {
-            max_scroll
-        } else {
-            self.manager.scroll.min(max_scroll)
-        };
+        let scroll = manager_scroll_position(lines.len(), rows[1].height, self.manager.scroll);
         frame.render_widget(
             Paragraph::new(lines)
                 .scroll((scroll, 0))
@@ -2657,7 +2691,7 @@ impl Navigator {
             (text, false)
         });
         let keys = if self.manager.focused {
-            "Enter send   Ctrl+J newline   @ files   $ skills   Ctrl+O select output   Ctrl+Y copy"
+            "Enter send   Ctrl+J newline   Ctrl+↑↓ scroll   @ files   $ skills   Ctrl+O output"
         } else if self.manager.overlay || self.view == View::Home {
             "Enter compose   v select output   y latest   Y transcript   ↑↓ scroll   ? guide"
         } else if self.prefix_pending {
@@ -2722,6 +2756,7 @@ impl Navigator {
             Line::raw(""),
             Line::styled("MANAGER COMPOSER", Style::default().fg(AMBER)),
             Line::from("  Enter          send · Shift+Enter or Ctrl+J inserts a newline"),
+            Line::from("  Ctrl-Up/Down   scroll the manager conversation while composing"),
             Line::from("  @ / $          find a scoped file / available manager skill"),
             Line::from("  Ctrl+O         open selection view · Ctrl+Y copies latest response"),
             Line::from("  paste          preserves multiple lines"),
@@ -2868,7 +2903,7 @@ fn is_manager_tab(tab: &Tab) -> bool {
     tab.name.eq_ignore_ascii_case("middle-manager") || tab.name.eq_ignore_ascii_case("manager")
 }
 
-fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
+fn manager_reference_catalog(scope: &ManagerContextScope) -> Vec<ManagerReference> {
     const MAX_FILES: usize = 20_000;
     const MAX_DEPTH: usize = 8;
     const SKIPPED_DIRECTORIES: &[&str] = &[
@@ -2902,11 +2937,27 @@ fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
                 }
                 .to_string(),
             ),
+            directory: false,
         })
         .collect::<Vec<_>>();
     let mut files = Vec::new();
-    let mut queue = VecDeque::from([(root.to_path_buf(), 0_usize)]);
-    while let Some((directory, depth)) = queue.pop_front() {
+    let catalog_roots = if scope.machine_wide {
+        vec![scope.cwd.clone()]
+    } else {
+        scope.roots.clone()
+    };
+    let mut queue = VecDeque::new();
+    for root in &catalog_roots {
+        if root.is_file() {
+            let label = manager_reference_label(scope, root, false);
+            if !sensitive_reference(&label) {
+                files.push(label);
+            }
+        } else if root.is_dir() {
+            queue.push_back((root.clone(), root.clone(), 0_usize));
+        }
+    }
+    while let Some((root, directory, depth)) = queue.pop_front() {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -2925,17 +2976,14 @@ fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
             }
             if file_type.is_dir() {
                 if depth < MAX_DEPTH && !SKIPPED_DIRECTORIES.contains(&name.as_ref()) {
-                    queue.push_back((entry.path(), depth + 1));
+                    queue.push_back((root.clone(), entry.path(), depth + 1));
                 }
                 continue;
             }
             if !file_type.is_file() || sensitive_reference(&name) {
                 continue;
             }
-            let Ok(relative) = entry.path().strip_prefix(root).map(Path::to_path_buf) else {
-                continue;
-            };
-            files.push(relative.to_string_lossy().into_owned());
+            files.push(manager_reference_label(scope, &entry.path(), false));
             if files.len() >= MAX_FILES {
                 queue.clear();
                 break;
@@ -2947,11 +2995,80 @@ fn manager_reference_catalog(root: &Path) -> Vec<ManagerReference> {
         kind: ManagerReferenceKind::File,
         label,
         hint: None,
+        directory: false,
     }));
     references
 }
 
+fn manager_path_reference_matches(
+    scope: &ManagerContextScope,
+    query: &str,
+) -> Vec<ManagerReference> {
+    let query = query.strip_prefix('{').unwrap_or(query);
+    let (directory, prefix) = if query.is_empty() {
+        (None, "")
+    } else if query.ends_with('/') {
+        (Some(query), "")
+    } else {
+        let path = Path::new(query);
+        let parent = path
+            .parent()
+            .and_then(Path::to_str)
+            .filter(|value| !value.is_empty());
+        let prefix = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(query);
+        (parent, prefix)
+    };
+    let Ok((entries, _)) = list_manager_directory(scope, directory, 20_000) else {
+        return Vec::new();
+    };
+    let prefix = prefix.to_ascii_lowercase();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().contains(&prefix))
+                || prefix.is_empty()
+        })
+        .map(|entry| {
+            let directory = entry.kind == "directory";
+            ManagerReference {
+                kind: ManagerReferenceKind::File,
+                label: manager_reference_label(scope, &entry.path, directory),
+                hint: Some(entry.kind),
+                directory,
+            }
+        })
+        .collect()
+}
+
+fn manager_reference_label(scope: &ManagerContextScope, path: &Path, directory: bool) -> String {
+    let path = if !scope.machine_wide {
+        path.strip_prefix(&scope.cwd).unwrap_or(path)
+    } else {
+        path
+    };
+    let mut label = path.to_string_lossy().into_owned();
+    if label.is_empty() {
+        label.push('.');
+    }
+    if directory && !label.ends_with('/') {
+        label.push('/');
+    }
+    label
+}
+
 fn active_manager_reference(value: &str) -> Option<(ManagerReferenceKind, usize, &str)> {
+    if let Some(start) = value.rfind("@{")
+        && !value[start + 2..].contains('}')
+    {
+        return Some((ManagerReferenceKind::File, start, &value[start + 2..]));
+    }
     let start = value
         .rfind(char::is_whitespace)
         .map(|index| {
@@ -3026,6 +3143,15 @@ fn manager_transcript_lines(
                 "Loaded skills: $wipsaw-manager, $skill-creator, and $skill-installer (skill lookup/install). Private Wipsaw MCP tools are enabled; shell, personal MCPs, plugins, apps, and unrelated skills stay outside this session.",
                 Style::default().fg(MUTED),
             ),
+            Line::raw(""),
+            Line::styled(
+                if manager_label == "LUMBERGH" {
+                    "File scope: machine-wide read access (credential paths are blocked). Type @/ to browse from the filesystem root."
+                } else {
+                    "File scope: only this workspace's explicit files/directories. Ask Lumbergh to add context when needed."
+                },
+                Style::default().fg(MUTED),
+            ),
         ];
     }
     let mut lines = Vec::new();
@@ -3052,6 +3178,13 @@ fn manager_transcript_lines(
         append_manager_progress_lines(&mut lines, progress, width);
     }
     lines
+}
+
+fn manager_scroll_position(line_count: usize, viewport_height: u16, scroll_back: u16) -> u16 {
+    let max_scroll = line_count
+        .saturating_sub(viewport_height as usize)
+        .min(u16::MAX as usize) as u16;
+    max_scroll.saturating_sub(scroll_back.min(max_scroll))
 }
 
 fn append_manager_progress_lines(
@@ -3370,9 +3503,9 @@ mod tests {
 
     use super::{
         Action, Navigator, active_manager_reference, base64_encode, manager_reference_catalog,
-        wrap_editor_text, wrap_text,
+        manager_scroll_position, wrap_editor_text, wrap_text,
     };
-    use crate::manager::{ManagerProgress, ManagerProgressStatus};
+    use crate::manager::{ManagerContextScope, ManagerProgress, ManagerProgressStatus};
     use crate::model::ManagerMessage;
 
     #[test]
@@ -3397,13 +3530,32 @@ mod tests {
     }
 
     #[test]
+    fn manager_transcript_scrolls_back_from_the_live_bottom() {
+        assert_eq!(manager_scroll_position(100, 20, 0), 80);
+        assert_eq!(manager_scroll_position(100, 20, 3), 77);
+        assert_eq!(manager_scroll_position(100, 20, u16::MAX), 0);
+
+        let mut navigator = Navigator::empty();
+        navigator.manager.focused = true;
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(navigator.manager.scroll, 3);
+        navigator.handle_manager_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(navigator.manager.scroll, 0);
+    }
+
+    #[test]
     fn at_and_dollar_references_offer_files_and_all_manager_skills() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("README.md"), "read me").unwrap();
         fs::write(root.path().join("notes with spaces.md"), "notes").unwrap();
         let mut navigator = Navigator::empty();
         navigator.manager.focused = true;
-        navigator.manager.references = manager_reference_catalog(root.path());
+        let scope = ManagerContextScope::workspace(
+            root.path().to_path_buf(),
+            vec![root.path().to_path_buf()],
+        );
+        navigator.manager.references = manager_reference_catalog(&scope);
+        navigator.manager.scope = Some(scope);
         let skill_names = navigator
             .manager
             .references

@@ -46,21 +46,32 @@ Lumbergh and every Middle Manager run as resumable `codex exec --json` threads
 with `gpt-5.6-terra` and medium reasoning. Their generated Codex homes link the
 selected account's existing `auth.json` without copying it, ignore personal
 Codex configuration, and expose only `$wipsaw-manager`, `$skill-creator`, and
-`$skill-installer` (the built-in skill lookup/installer) plus two private Wipsaw
-MCP tools. Personal MCPs, plugins, apps, unrelated skills, shell execution,
+`$skill-installer` (the built-in skill lookup/installer) plus a private Wipsaw
+MCP surface for validated Wipsaw operations and scoped file browsing/search/read.
+Personal MCPs, plugins, apps, unrelated skills, shell execution,
 image tools, and multi-agent tools are not loaded into manager sessions.
 
 The blank `λ` manager composer accepts multiline paste. `Enter` sends;
 `Shift+Enter` or `Ctrl-J` inserts a newline. Type `@` for a fuzzy file picker
-scoped to that manager's workspace and `$` for its allowed skills. Selected
-text files are attached to the model prompt without broadening the manager's
-tool access; credential-like and out-of-scope paths are rejected. Codex
+and `$` for allowed skills. Lumbergh has machine-wide read access: type `@/` and
+continue through directories to browse from the filesystem root. Each Middle
+Manager is technically confined to an explicit file/directory allowlist seeded
+with the workspace's `--cwd`. Selected text files are attached to the model
+prompt; credential-like and out-of-scope paths are rejected. Codex
 reasoning, tool calls, completion state, failures, and token usage appear in
 the same response box as the final answer. Outside the composer, `v` opens a
 manager-only, redraw-stable selection view for native terminal copying, `y`
 copies the latest manager response, and `Y` copies the transcript; `Ctrl-O`
 opens the selection view and `Ctrl-Y` copies the latest response while
-composing.
+composing. `Ctrl-Up`/`Ctrl-Down` scroll the conversation while composing;
+Up/Down, Page Up/Page Down, Home, and End scroll in the manager-only selection
+view.
+
+Middle Manager authority is enforced by workspace ID as well: it sees and
+manages only its own workspace, tabs, and threads; cannot create or delete
+workspaces; cannot change global accounts or Codex homes; and cannot broaden
+its own file scope. Ask Lumbergh—or use the explicit CLI context commands—to
+make those cross-cutting changes.
 
 Use `1` through `4` for Home, Sessions, Threads, and WIPs; `Tab` cycles between
 those views. `c` creates a workspace, `n` creates and starts a named Codex
@@ -84,6 +95,17 @@ requires `--yes`:
 
 ```bash
 wipsaw workspace delete ws_... --yes
+```
+
+Deletion now removes the workspace's tmux runtime, Middle Manager history and
+native manager thread, and native Codex threads owned by its tabs. A native
+deletion failure leaves the durable workspace record in place for a safe retry.
+Manage a Middle Manager's context explicitly with:
+
+```bash
+wipsaw workspace context list "workspace name"
+wipsaw workspace context add "workspace name" /absolute/project-or-file
+wipsaw workspace context remove "workspace name" /absolute/project-or-file
 ```
 
 On a new Wipsaw registry, the first command automatically adopts the active
@@ -133,6 +155,7 @@ wipsaw thread create "API implementation" \
 
 wipsaw thread list --home company-home
 wipsaw thread inspect thread_...
+wipsaw thread delete thread_... --yes
 wipsaw thread resume thread_... \
   --workspace development \
   --tab api \
@@ -210,10 +233,10 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   `thread_...`.
 - Generated Wipsaw-only tmux config and private socket.
 - Workspace create/list/start/attach/delete and tab create/list/rename. Delete
-  requires `--yes`, stops the workspace's private tmux session, and removes its
-  tabs and Middle Manager history through database cascades. Opening a
-  stopped workspace recreates its windows from durable metadata and updates
-  reused tmux targets transactionally.
+  requires `--yes`, stops the private tmux session, permanently deletes native
+  tab and Middle Manager threads, and removes the workspace registry graph.
+  Opening a stopped workspace recreates its windows from durable metadata and
+  updates reused tmux targets transactionally.
 - Dependency doctor for tmux, Codex, Docker, Compose, and SSH.
 - Account/home registration with canonical paths and one-account-per-home
   enforcement.
@@ -232,15 +255,18 @@ the documented `{ "error": { "code", "message" } }` shape in JSON mode.
   with reasoning/tool progress and token usage rendered inline, persistent
   transcript history, and exact native thread IDs.
 - A blank `λ` multiline manager composer with bracketed paste, scoped `@` file
-  and `$` skill completion, response/transcript clipboard actions, and a
-  manager-only native-selection view that freezes redraws while copying.
+  and `$` skill completion, working transcript scrolling, response/transcript
+  clipboard actions, and a manager-only native-selection view that freezes
+  redraws while copying.
 - Codex launch and health-check PATH repair that selects the Node runtime
   belonging to a registered npm Codex installation instead of inheriting stale
   tmux state.
 - Private manager Codex homes containing only the Wipsaw manager,
-  `skill-creator`, and `skill-installer` skills, plus a two-tool Wipsaw MCP
-  server. Manager turns ignore inherited user configuration and disable shell,
-  personal MCPs, plugins, apps, unrelated skills, image generation, and
+  `skill-creator`, and `skill-installer` skills, plus a capability-scoped Wipsaw MCP
+  server with validated operations and enforced file tools. Lumbergh can read
+  machine-wide while each Middle Manager is confined to durable workspace
+  context rows. Manager turns ignore inherited user configuration and disable
+  shell, personal MCPs, plugins, apps, unrelated skills, image generation, and
   multi-agent tools.
 - A responsive, manager-first dashboard with separate Home, Sessions, Threads,
   and WIPs views, onboarding guidance, live dependency/account summaries, and

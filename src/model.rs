@@ -19,6 +19,16 @@ pub struct Workspace {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceContext {
+    pub workspace_id: String,
+    pub path: PathBuf,
+    /// Either `directory` (the path and its descendants) or `file` (only the
+    /// exact file). Context rows are the Middle Manager's durable read scope.
+    pub kind: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tab {
     pub id: String,
     pub workspace_id: String,

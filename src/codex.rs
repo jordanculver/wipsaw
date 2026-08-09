@@ -158,6 +158,13 @@ pub fn archive_thread(home: &CodexHome, native_thread_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Permanently remove a native Codex thread and its persisted rollout data.
+pub fn delete_thread(home: &CodexHome, native_thread_id: &str) -> Result<()> {
+    let mut client = AppServerClient::connect(home)?;
+    client.request("thread/delete", json!({"threadId": native_thread_id}))?;
+    Ok(())
+}
+
 pub fn inspect_thread(
     home: &CodexHome,
     native_thread_id: &str,
@@ -598,7 +605,7 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{inspect_thread, probe_home, start_named_thread};
+    use super::{delete_thread, inspect_thread, probe_home, start_named_thread};
     use crate::model::{CodexHome, ModelProfile};
 
     fn test_home(binary: std::path::PathBuf, path: std::path::PathBuf) -> CodexHome {
@@ -668,6 +675,10 @@ case "$request" in
   *thread/read*)
     printf '{"id":2,"result":{"thread":{"id":"native-123","name":"API work","preview":"","modelProvider":"openai","createdAt":1700000000,"updatedAt":1700000001,"status":{"type":"notLoaded"},"path":"%s/rollout.jsonl","cwd":"%s/project"}}}\n' "$CODEX_HOME" "$CODEX_HOME"
     ;;
+  *thread/delete*)
+    printf '%s\n' "$request" >> "$CODEX_HOME/requests.jsonl"
+    printf '%s\n' '{"id":2,"result":{}}'
+    ;;
 esac
 "#,
         )
@@ -711,6 +722,13 @@ esac
         assert_eq!(inspection.name.as_deref(), Some("API work"));
         assert_eq!(inspection.status, "notLoaded");
         assert_eq!(inspection.native_updated_at, Some(1_700_000_001));
+
+        delete_thread(&home, "native-123").unwrap();
+        let requests = fs::read_to_string(home_path.join("requests.jsonl")).unwrap();
+        let delete = requests.lines().last().unwrap();
+        let delete: Value = serde_json::from_str(delete).unwrap();
+        assert_eq!(delete["method"], "thread/delete");
+        assert_eq!(delete["params"]["threadId"], "native-123");
     }
 
     #[test]

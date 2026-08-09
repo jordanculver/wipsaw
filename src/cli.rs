@@ -98,8 +98,23 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Manage the exact file and directory allowlist for this workspace's Middle Manager.
+    Context {
+        #[command(subcommand)]
+        command: WorkspaceContextCommand,
+    },
     /// Attach to a workspace by name or ID.
     Attach { workspace: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceContextCommand {
+    /// Add one existing file or directory to the Middle Manager's read scope.
+    Add { workspace: String, path: PathBuf },
+    /// List the Middle Manager's explicit read scope.
+    List { workspace: String },
+    /// Remove one file or directory from the Middle Manager's read scope.
+    Remove { workspace: String, path: PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -241,6 +256,13 @@ pub enum ThreadCommand {
     },
     /// Read current metadata from the owning Codex home by exact native ID.
     Inspect { thread: String },
+    /// Permanently delete a native Codex thread and its Wipsaw record.
+    Delete {
+        thread: String,
+        /// Confirm this destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Replace a tab's shell with the mapped Codex TUI, then return to the shell on exit.
     Resume {
         thread: String,
@@ -363,11 +385,48 @@ pub fn run(cli: Cli) -> Result<()> {
                 let deleted = app.delete_workspace(&workspace)?;
                 output(cli.json, &deleted, || {
                     format!(
-                        "deleted workspace '{}' ({})",
-                        deleted.workspace.name, deleted.workspace.id
+                        "deleted workspace '{}' ({}) and {} native Codex thread(s)",
+                        deleted.workspace.name,
+                        deleted.workspace.id,
+                        deleted.deleted_threads.len()
+                            + usize::from(deleted.deleted_manager_thread_id.is_some())
                     )
                 })?;
             }
+            WorkspaceCommand::Context { command } => match command {
+                WorkspaceContextCommand::Add { workspace, path } => {
+                    let context = app.add_workspace_context(&workspace, &path)?;
+                    output(cli.json, &context, || {
+                        format!(
+                            "added {} '{}' to the Middle Manager context",
+                            context.kind,
+                            context.path.display()
+                        )
+                    })?;
+                }
+                WorkspaceContextCommand::List { workspace } => {
+                    let contexts = app.list_workspace_contexts(&workspace)?;
+                    if cli.json {
+                        print_json(&contexts)?;
+                    } else if contexts.is_empty() {
+                        println!("this workspace's Middle Manager has no file context");
+                    } else {
+                        for context in contexts {
+                            println!("{:<9} {}", context.kind, context.path.display());
+                        }
+                    }
+                }
+                WorkspaceContextCommand::Remove { workspace, path } => {
+                    let context = app.remove_workspace_context(&workspace, &path)?;
+                    output(cli.json, &context, || {
+                        format!(
+                            "removed {} '{}' from the Middle Manager context",
+                            context.kind,
+                            context.path.display()
+                        )
+                    })?;
+                }
+            },
             WorkspaceCommand::Attach { workspace } => app.attach_workspace(&workspace)?,
         },
         Some(Command::Tab(args)) => match args.command {
@@ -589,6 +648,23 @@ pub fn run(cli: Cli) -> Result<()> {
                         println!("  rollout={}", path.display());
                     }
                 }
+            }
+            ThreadCommand::Delete { thread, yes } => {
+                if !yes {
+                    return Err(WipsawError::InvalidInput {
+                        field: "thread delete",
+                        message:
+                            "requires --yes because native Codex history is permanently removed"
+                                .to_string(),
+                    });
+                }
+                let deleted = app.delete_codex_thread(&thread)?;
+                output(cli.json, &deleted, || {
+                    format!(
+                        "deleted Codex thread '{}' ({}, native {})",
+                        deleted.name, deleted.thread_id, deleted.native_thread_id
+                    )
+                })?;
             }
             ThreadCommand::Resume {
                 thread,

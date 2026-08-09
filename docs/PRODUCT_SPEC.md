@@ -122,8 +122,10 @@ policy checks even when invoked by Lumbergh.
 
 - Create, rename, reorder, move, detach, reattach, archive, and delete tabs.
 - Delete a workspace only through an exact resolved target and explicit
-  confirmation; stop its private tmux session and cascade its tabs and scoped
-  Middle Manager history without touching Lumbergh.
+  confirmation; stop its private tmux session, permanently delete native Codex
+  threads owned by its tabs and Middle Manager, and cascade its tabs, context,
+  and scoped manager history without touching Lumbergh. If native deletion
+  fails, keep the durable workspace graph available for a safe retry.
 - Restore Wipsaw after its TUI or daemon restarts; tmux remains the durable PTY
   owner. If the private tmux session itself is gone, opening the workspace must
   reconstruct registered tabs, reconcile ephemeral window IDs, and restore the
@@ -260,15 +262,27 @@ nonexistent implementation.
   is presented as the built-in skill lookup/installer. Managers do not inherit
   personal MCPs, plugins, apps, unrelated skills, shell execution, image tools,
   or multi-agent tools.
+- Lumbergh has machine-wide read access through credential-filtered private
+  file tools and lazy absolute-path `@` browsing. Every Middle Manager is
+  technically restricted to explicit file/directory context rows owned by its
+  workspace; workspace creation seeds the selected working directory, and the
+  user or Lumbergh can add/remove roots.
+- A Middle Manager's workspace ID also constrains Wipsaw operations: it cannot
+  target another workspace, create/delete workspaces, change global identity
+  homes, or mutate its own scope. It escalates those operations to Lumbergh.
 - The embedded composer supports multiline editing and paste, scoped `@` file
   completion, `$` completion over the skills allowed in that manager home, and
   a blank `λ` prompt instead of placeholder content. Referenced file contents
-  are bounded, credential-filtered, and confined to the manager's context root.
+  are bounded, credential-filtered, and confined to the same enforced scope as
+  the private file tools.
 - Codex reasoning, tool calls, completion/failure state, and usage render in
   order inside the manager response box before the final answer.
 - Copy actions target the latest manager response or its transcript. A
   redraw-stable, manager-only selection view also supports native terminal copy
   without selecting the surrounding dashboard.
+- Long manager conversations scroll relative to the live bottom; composer mode
+  uses Ctrl-Up/Down and the transcript-only view supports arrows, Page Up/Down,
+  Home, and End.
 - Human TUI, CLI, and MCP actions call the same application services.
 - The manager can organize tabs, create WIPs, inspect runs, change safe
   settings, and report health.

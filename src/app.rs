@@ -11,19 +11,20 @@ use directories::BaseDirs;
 use serde::Serialize;
 
 use crate::codex::{
-    CodexHomeProbe, NativeCodexThreadInspection, archive_thread, codex_launch_path,
+    CodexHomeProbe, NativeCodexThreadInspection, archive_thread, codex_launch_path, delete_thread,
     inspect_thread as inspect_native_thread, probe_home, start_named_thread,
 };
 use crate::error::{Result, WipsawError};
 use crate::id::{EntityKind, WipsawId};
 use crate::manager::{
-    MANAGER_MODEL, MANAGER_REASONING_EFFORT, ManagerEvent, ManagerTurnRequest, ManagerTurnResult,
-    expand_prompt_references, prepare_runtime, spawn_turn,
+    MANAGER_MODEL, MANAGER_REASONING_EFFORT, ManagerContextScope, ManagerEvent, ManagerTurnRequest,
+    ManagerTurnResult, expand_prompt_references, prepare_runtime, spawn_turn,
 };
 use crate::model::{
     Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ManagerKind,
     ManagerMessage, ManagerSession, ModelProfile, ModelProfileSettings, Tab, Workspace,
-    validate_credential_ref, validate_display_name, validate_model_name, validate_profile_settings,
+    WorkspaceContext, validate_credential_ref, validate_display_name, validate_model_name,
+    validate_profile_settings,
 };
 use crate::paths::AppPaths;
 use crate::registry::{
@@ -79,6 +80,16 @@ pub struct WorkspaceStart {
 pub struct WorkspaceDeletion {
     pub workspace: Workspace,
     pub tmux_session_stopped: bool,
+    pub deleted_threads: Vec<CodexThreadDeletion>,
+    pub deleted_manager_thread_id: Option<String>,
+    pub retained_shared_thread_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexThreadDeletion {
+    pub thread_id: String,
+    pub native_thread_id: String,
+    pub name: String,
 }
 
 pub struct ManagerTurnHandle {
@@ -123,9 +134,13 @@ impl WipsawApp {
         if let Some(home) = app.registry.preferred_codex_home(None)? {
             app.registry
                 .apply_default_codex_home_to_unconfigured_tabs(&home)?;
-            app.ensure_lumbergh()?;
-            for workspace in app.registry.list_workspaces()? {
-                app.ensure_middle_manager(&workspace.id)?;
+            if let Ok(workspace_id) = env::var("WIPSAW_MANAGER_WORKSPACE_ID") {
+                app.ensure_middle_manager(&workspace_id)?;
+            } else {
+                app.ensure_lumbergh()?;
+                for workspace in app.registry.list_workspaces()? {
+                    app.ensure_middle_manager(&workspace.id)?;
+                }
             }
         }
         Ok(app)
@@ -150,6 +165,13 @@ impl WipsawApp {
     }
 
     pub fn create_workspace(&mut self, name: &str, cwd: &Path) -> Result<Workspace> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace create",
+                message: "a Middle Manager cannot create another workspace; ask Lumbergh"
+                    .to_string(),
+            });
+        }
         let name = validate_display_name("workspace name", name)?;
         let cwd = existing_directory(cwd, "working directory")?;
         if self.registry.workspace_by_ref(&name)?.is_some() {
@@ -183,9 +205,15 @@ impl WipsawApp {
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<(Workspace, bool)>> {
+        let manager_workspace_id = env::var("WIPSAW_MANAGER_WORKSPACE_ID").ok();
         self.registry
             .list_workspaces()?
             .into_iter()
+            .filter(|workspace| {
+                manager_workspace_id
+                    .as_ref()
+                    .is_none_or(|workspace_id| workspace_id == &workspace.id)
+            })
             .map(|workspace| {
                 let live = self
                     .tmux
@@ -197,12 +225,145 @@ impl WipsawApp {
     }
 
     pub fn workspace(&self, reference: &str) -> Result<Workspace> {
+        let workspace =
+            self.registry
+                .workspace_by_ref(reference)?
+                .ok_or_else(|| WipsawError::NotFound {
+                    entity: "workspace",
+                    value: reference.to_string(),
+                })?;
+        self.ensure_manager_workspace_scope(&workspace)?;
+        Ok(workspace)
+    }
+
+    pub fn list_workspace_contexts(&self, reference: &str) -> Result<Vec<WorkspaceContext>> {
+        let workspace = self.workspace(reference)?;
+        self.ensure_manager_workspace_scope(&workspace)?;
+        self.registry.list_workspace_contexts(&workspace.id)
+    }
+
+    pub fn add_workspace_context(&self, reference: &str, path: &Path) -> Result<WorkspaceContext> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace context",
+                message: "a Middle Manager cannot broaden its own file scope; ask Lumbergh"
+                    .to_string(),
+            });
+        }
+        let workspace = self.workspace(reference)?;
+        self.ensure_manager_workspace_scope(&workspace)?;
+        let path = absolute_path(path)?;
+        let path = fs::canonicalize(&path).map_err(|error| WipsawError::InvalidInput {
+            field: "workspace context",
+            message: format!("'{}' is unavailable: {error}", path.display()),
+        })?;
+        let kind = if path.is_dir() {
+            "directory"
+        } else if path.is_file() {
+            "file"
+        } else {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace context",
+                message: format!("'{}' must be a regular file or directory", path.display()),
+            });
+        };
+        if crate::manager::sensitive_path(&path) {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace context",
+                message: format!("'{}' looks credential-bearing", path.display()),
+            });
+        }
         self.registry
-            .workspace_by_ref(reference)?
+            .insert_workspace_context(&workspace.id, &path, kind)
+    }
+
+    pub fn remove_workspace_context(
+        &self,
+        reference: &str,
+        path: &Path,
+    ) -> Result<WorkspaceContext> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace context",
+                message: "a Middle Manager cannot change its own file scope; ask Lumbergh"
+                    .to_string(),
+            });
+        }
+        let workspace = self.workspace(reference)?;
+        self.ensure_manager_workspace_scope(&workspace)?;
+        let contexts = self.registry.list_workspace_contexts(&workspace.id)?;
+        let requested = absolute_path(path)?;
+        let canonical = fs::canonicalize(&requested).unwrap_or(requested);
+        let context = contexts
+            .into_iter()
+            .find(|context| context.path == canonical || context.path == path)
             .ok_or_else(|| WipsawError::NotFound {
-                entity: "workspace",
-                value: reference.to_string(),
-            })
+                entity: "workspace context",
+                value: path.display().to_string(),
+            })?;
+        self.registry
+            .delete_workspace_context(&workspace.id, &context.path)?;
+        Ok(context)
+    }
+
+    fn ensure_manager_workspace_scope(&self, workspace: &Workspace) -> Result<()> {
+        if let Ok(manager_workspace_id) = env::var("WIPSAW_MANAGER_WORKSPACE_ID")
+            && manager_workspace_id != workspace.id
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "workspace context",
+                message: "a Middle Manager can manage context only for its own workspace"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_manager_path_scope(
+        &self,
+        workspace: &Workspace,
+        path: &Path,
+        field: &'static str,
+    ) -> Result<()> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_none() {
+            return Ok(());
+        }
+        let roots = self
+            .registry
+            .list_workspace_contexts(&workspace.id)?
+            .into_iter()
+            .map(|context| context.path)
+            .collect();
+        let scope = ManagerContextScope::workspace(workspace.cwd.clone(), roots);
+        let canonical = fs::canonicalize(path)?;
+        if !scope.permits(&canonical) {
+            return Err(WipsawError::InvalidInput {
+                field,
+                message: format!(
+                    "'{}' is outside this Middle Manager's explicit workspace context",
+                    path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_manager_thread_scope(&self, thread: &CodexThread) -> Result<()> {
+        let Ok(manager_workspace_id) = env::var("WIPSAW_MANAGER_WORKSPACE_ID") else {
+            return Ok(());
+        };
+        let bindings = self.registry.codex_thread_workspace_ids(&thread.id)?;
+        if bindings.is_empty()
+            || bindings
+                .iter()
+                .any(|workspace_id| workspace_id != &manager_workspace_id)
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "Codex thread",
+                message: "is outside this Middle Manager's workspace".to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn delete_workspace(&mut self, reference: &str) -> Result<WorkspaceDeletion> {
@@ -214,9 +375,11 @@ impl WipsawApp {
                     .to_string(),
             });
         }
-        if self
+        let manager = self
             .registry
-            .manager_session_for_workspace(Some(&workspace.id))?
+            .manager_session_for_workspace(Some(&workspace.id))?;
+        if manager
+            .as_ref()
             .is_some_and(|manager| manager.status == "working")
         {
             return Err(WipsawError::InvalidInput {
@@ -227,14 +390,106 @@ impl WipsawApp {
                 ),
             });
         }
+        let workspace_threads = self.registry.list_workspace_codex_threads(&workspace.id)?;
+        let mut owned_threads = Vec::new();
+        let mut retained_shared_thread_ids = Vec::new();
+        for thread in workspace_threads {
+            let bindings = self.registry.codex_thread_workspace_ids(&thread.id)?;
+            if bindings.iter().all(|binding| binding == &workspace.id) {
+                owned_threads.push(thread);
+            } else {
+                retained_shared_thread_ids.push(thread.id);
+            }
+        }
         let live = self.tmux.session_exists(&workspace.tmux_session)?;
         if live {
             self.tmux.kill_workspace(&workspace.tmux_session)?;
         }
-        self.registry.delete_workspace(&workspace.id)?;
+
+        let mut deleted_native = HashSet::new();
+        let mut deleted_manager_thread_id = None;
+        if let Some(manager) = manager
+            && let Some(native_thread_id) = manager.native_thread_id
+        {
+            let home = self
+                .registry
+                .codex_home_by_ref(&manager.source_codex_home_id)?
+                .ok_or_else(|| WipsawError::NotFound {
+                    entity: "Codex home",
+                    value: manager.source_codex_home_id.clone(),
+                })?;
+            delete_thread(&home, &native_thread_id)?;
+            deleted_native.insert((home.id, native_thread_id.clone()));
+            deleted_manager_thread_id = Some(native_thread_id);
+        }
+
+        let mut deleted_threads = Vec::new();
+        for thread in &owned_threads {
+            let home = self
+                .registry
+                .codex_home_by_ref(&thread.codex_home_id)?
+                .ok_or_else(|| WipsawError::NotFound {
+                    entity: "Codex home",
+                    value: thread.codex_home_id.clone(),
+                })?;
+            if deleted_native.insert((home.id.clone(), thread.native_thread_id.clone())) {
+                delete_thread(&home, &thread.native_thread_id)?;
+            }
+            deleted_threads.push(CodexThreadDeletion {
+                thread_id: thread.id.clone(),
+                native_thread_id: thread.native_thread_id.clone(),
+                name: thread.name.clone(),
+            });
+        }
+        let thread_ids = owned_threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect::<Vec<_>>();
+        self.registry
+            .delete_workspace_and_threads(&workspace.id, &thread_ids)?;
         Ok(WorkspaceDeletion {
             workspace,
             tmux_session_stopped: live,
+            deleted_threads,
+            deleted_manager_thread_id,
+            retained_shared_thread_ids,
+        })
+    }
+
+    pub fn delete_codex_thread(&self, reference: &str) -> Result<CodexThreadDeletion> {
+        let thread = self
+            .registry
+            .codex_thread_by_ref(reference)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex thread",
+                value: reference.to_string(),
+            })?;
+        let bindings = self.registry.codex_thread_workspace_ids(&thread.id)?;
+        if let Ok(manager_workspace_id) = env::var("WIPSAW_MANAGER_WORKSPACE_ID")
+            && (bindings.is_empty()
+                || bindings
+                    .iter()
+                    .any(|workspace_id| workspace_id != &manager_workspace_id))
+        {
+            return Err(WipsawError::InvalidInput {
+                field: "thread delete",
+                message: "a Middle Manager can delete only a thread bound exclusively to its own workspace"
+                    .to_string(),
+            });
+        }
+        let home = self
+            .registry
+            .codex_home_by_ref(&thread.codex_home_id)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "Codex home",
+                value: thread.codex_home_id.clone(),
+            })?;
+        delete_thread(&home, &thread.native_thread_id)?;
+        self.registry.delete_codex_thread(&thread.id)?;
+        Ok(CodexThreadDeletion {
+            thread_id: thread.id,
+            native_thread_id: thread.native_thread_id,
+            name: thread.name,
         })
     }
 
@@ -311,6 +566,7 @@ impl WipsawApp {
             });
         }
         let cwd = existing_directory(cwd.unwrap_or(&workspace.cwd), "working directory")?;
+        self.ensure_manager_path_scope(&workspace, &cwd, "tab working directory")?;
         let (account_id, home_id, profile_id) = self.resolve_tab_settings(settings)?;
         let tab_id = WipsawId::new(EntityKind::Tab);
         let window = self.tmux.create_tab(&workspace.tmux_session, &name, &cwd)?;
@@ -474,6 +730,12 @@ impl WipsawApp {
         owner_kind: AccountOwnerKind,
         credential_ref: Option<&str>,
     ) -> Result<Account> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() {
+            return Err(WipsawError::InvalidInput {
+                field: "account add",
+                message: "a Middle Manager cannot change global accounts; ask Lumbergh".to_string(),
+            });
+        }
         let alias = validate_display_name("account alias", alias)?;
         let credential_ref =
             validate_credential_ref(credential_ref, auth_kind.requires_credential_ref())?;
@@ -513,6 +775,13 @@ impl WipsawApp {
         codex_binary: &Path,
         create: bool,
     ) -> Result<CodexHome> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() {
+            return Err(WipsawError::InvalidInput {
+                field: "Codex home add",
+                message: "a Middle Manager cannot change global Codex homes; ask Lumbergh"
+                    .to_string(),
+            });
+        }
         let name = validate_display_name("Codex home name", name)?;
         let account =
             self.registry
@@ -599,6 +868,13 @@ impl WipsawApp {
         profile_ref: Option<&str>,
         tab_binding: Option<(&str, &str)>,
     ) -> Result<CodexThread> {
+        if env::var_os("WIPSAW_MANAGER_WORKSPACE_ID").is_some() && tab_binding.is_none() {
+            return Err(WipsawError::InvalidInput {
+                field: "thread create",
+                message: "a Middle Manager must bind a new thread to a tab in its own workspace"
+                    .to_string(),
+            });
+        }
         let name = validate_display_name("Codex thread name", name)?;
         let home =
             self.registry
@@ -673,6 +949,10 @@ impl WipsawApp {
                 .unwrap_or(Path::new(".")),
             "working directory",
         )?;
+        if let Ok(workspace_id) = env::var("WIPSAW_MANAGER_WORKSPACE_ID") {
+            let workspace = self.workspace(&workspace_id)?;
+            self.ensure_manager_path_scope(&workspace, &cwd, "thread working directory")?;
+        }
 
         let native = start_named_thread(&home, &cwd, &name, profile.as_ref())?;
         let id = WipsawId::new(EntityKind::CodexThread);
@@ -709,7 +989,15 @@ impl WipsawApp {
                     })
             })
             .transpose()?;
-        self.registry.list_codex_threads(home_id.as_deref())
+        if let Ok(workspace_id) = env::var("WIPSAW_MANAGER_WORKSPACE_ID") {
+            let mut threads = self.registry.list_workspace_codex_threads(&workspace_id)?;
+            if let Some(home_id) = home_id {
+                threads.retain(|thread| thread.codex_home_id == home_id);
+            }
+            Ok(threads)
+        } else {
+            self.registry.list_codex_threads(home_id.as_deref())
+        }
     }
 
     pub fn ensure_lumbergh(&self) -> Result<ManagerSession> {
@@ -763,6 +1051,29 @@ impl WipsawApp {
         Ok((session, messages))
     }
 
+    pub fn manager_context_scope(&self, session: &ManagerSession) -> Result<ManagerContextScope> {
+        match session.kind {
+            ManagerKind::Lumbergh => Ok(ManagerContextScope::machine_wide(session.cwd.clone())),
+            ManagerKind::MiddleManager => {
+                let workspace_id =
+                    session
+                        .workspace_id
+                        .as_deref()
+                        .ok_or_else(|| WipsawError::InvalidInput {
+                            field: "Middle Manager",
+                            message: "has no workspace".to_string(),
+                        })?;
+                let roots = self
+                    .registry
+                    .list_workspace_contexts(workspace_id)?
+                    .into_iter()
+                    .map(|context| context.path)
+                    .collect();
+                Ok(ManagerContextScope::workspace(session.cwd.clone(), roots))
+            }
+        }
+    }
+
     pub fn start_manager_turn(
         &self,
         workspace_ref: Option<&str>,
@@ -798,8 +1109,9 @@ impl WipsawApp {
                 field: "home directory",
                 message: "could not resolve the Codex launcher home".to_string(),
             })?;
-        let runtime = prepare_runtime(&self.paths, &source_home, &session, &launcher_home)?;
-        let model_prompt = expand_prompt_references(prompt, &session.cwd)?;
+        let scope = self.manager_context_scope(&session)?;
+        let runtime = prepare_runtime(&self.paths, &source_home, &session, &scope, &launcher_home)?;
+        let model_prompt = expand_prompt_references(prompt, &scope)?;
         let executable = env::current_exe()?;
         let mut environment = vec![
             (
@@ -829,6 +1141,10 @@ impl WipsawApp {
             (
                 OsString::from("WIPSAW_TMUX_BIN"),
                 self.tmux.binary().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("WIPSAW_MANAGER_CONTEXT_SCOPE"),
+                OsString::from(serde_json::to_string(&scope)?),
             ),
         ];
         if let Some(workspace_id) = &session.workspace_id {
@@ -896,6 +1212,7 @@ impl WipsawApp {
                 entity: "Codex thread",
                 value: reference.to_string(),
             })?;
+        self.ensure_manager_thread_scope(&managed)?;
         let home = self
             .registry
             .codex_home_by_ref(&managed.codex_home_id)?
@@ -920,6 +1237,7 @@ impl WipsawApp {
                 entity: "Codex thread",
                 value: thread_ref.to_string(),
             })?;
+        self.ensure_manager_thread_scope(&thread)?;
         let home = self
             .registry
             .codex_home_by_ref(&thread.codex_home_id)?

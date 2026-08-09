@@ -9,6 +9,7 @@ use crate::error::{Result, WipsawError};
 use crate::model::{
     Account, AccountAuthKind, AccountOwnerKind, CodexHome, CodexThread, ManagerKind,
     ManagerMessage, ManagerSession, ModelProfile, ModelProfileSettings, Tab, Workspace,
+    WorkspaceContext,
 };
 
 const LOCAL_HOST_ID: &str = "host_local";
@@ -317,6 +318,30 @@ impl Registry {
             transaction.commit()?;
         }
 
+        if version < 5 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workspace_contexts (
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN ('directory', 'file')),
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY(workspace_id, path)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_workspace_contexts_workspace
+                    ON workspace_contexts(workspace_id, kind, path);
+
+                INSERT OR IGNORE INTO workspace_contexts (workspace_id, path, kind)
+                    SELECT id, cwd, 'directory' FROM workspaces;
+
+                PRAGMA user_version = 5;
+                "#,
+            )?;
+            transaction.commit()?;
+        }
+
         self.connection.execute(
             "INSERT OR IGNORE INTO hosts (id, name, kind) VALUES (?1, 'local', 'local')",
             [LOCAL_HOST_ID],
@@ -353,6 +378,10 @@ impl Registry {
                 input.manager_account_id,
                 input.manager_codex_home_id,
             ],
+        )?;
+        transaction.execute(
+            "INSERT INTO workspace_contexts (workspace_id, path, kind) VALUES (?1, ?2, 'directory')",
+            params![input.id, path_text(input.cwd)],
         )?;
         transaction.commit()?;
         self.workspace_by_ref(input.id)?
@@ -404,6 +433,61 @@ impl Registry {
             });
         }
         Ok(())
+    }
+
+    pub fn list_workspace_contexts(&self, workspace_id: &str) -> Result<Vec<WorkspaceContext>> {
+        let mut statement = self.connection.prepare(
+            "SELECT workspace_id, path, kind, created_at FROM workspace_contexts WHERE workspace_id = ?1 ORDER BY kind, path COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([workspace_id], workspace_context_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn insert_workspace_context(
+        &self,
+        workspace_id: &str,
+        path: &Path,
+        kind: &str,
+    ) -> Result<WorkspaceContext> {
+        self.connection.execute(
+            "INSERT INTO workspace_contexts (workspace_id, path, kind) VALUES (?1, ?2, ?3) ON CONFLICT(workspace_id, path) DO UPDATE SET kind = excluded.kind",
+            params![workspace_id, path_text(path), kind],
+        )?;
+        self.workspace_context(workspace_id, path)?
+            .ok_or_else(|| WipsawError::NotFound {
+                entity: "workspace context",
+                value: path.display().to_string(),
+            })
+    }
+
+    pub fn delete_workspace_context(&self, workspace_id: &str, path: &Path) -> Result<()> {
+        let changed = self.connection.execute(
+            "DELETE FROM workspace_contexts WHERE workspace_id = ?1 AND path = ?2",
+            params![workspace_id, path_text(path)],
+        )?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "workspace context",
+                value: path.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn workspace_context(
+        &self,
+        workspace_id: &str,
+        path: &Path,
+    ) -> Result<Option<WorkspaceContext>> {
+        self.connection
+            .query_row(
+                "SELECT workspace_id, path, kind, created_at FROM workspace_contexts WHERE workspace_id = ?1 AND path = ?2 LIMIT 1",
+                params![workspace_id, path_text(path)],
+                workspace_context_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn insert_tab(&self, input: NewTab<'_>) -> Result<Tab> {
@@ -647,6 +731,58 @@ impl Registry {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn list_workspace_codex_threads(&self, workspace_id: &str) -> Result<Vec<CodexThread>> {
+        let mut statement = self.connection.prepare(&format!(
+            "{CODEX_THREAD_SELECT} JOIN tabs tab ON tab.codex_thread_id = t.id WHERE tab.workspace_id = ?1 GROUP BY t.id ORDER BY t.updated_at DESC"
+        ))?;
+        let rows = statement.query_map([workspace_id], codex_thread_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn codex_thread_workspace_ids(&self, thread_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT workspace_id FROM tabs WHERE codex_thread_id = ?1 ORDER BY workspace_id",
+        )?;
+        let rows = statement.query_map([thread_id], |row| row.get(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_codex_thread(&self, thread_id: &str) -> Result<()> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM codex_threads WHERE id = ?1", [thread_id])?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "Codex thread",
+                value: thread_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn delete_workspace_and_threads(
+        &mut self,
+        workspace_id: &str,
+        thread_ids: &[String],
+    ) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for thread_id in thread_ids {
+            transaction.execute("DELETE FROM codex_threads WHERE id = ?1", [thread_id])?;
+        }
+        let changed =
+            transaction.execute("DELETE FROM workspaces WHERE id = ?1", [workspace_id])?;
+        if changed == 0 {
+            return Err(WipsawError::NotFound {
+                entity: "workspace",
+                value: workspace_id.to_string(),
+            });
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn insert_manager_session(&self, input: NewManagerSession<'_>) -> Result<ManagerSession> {
@@ -1077,6 +1213,15 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     })
 }
 
+fn workspace_context_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceContext> {
+    Ok(WorkspaceContext {
+        workspace_id: row.get(0)?,
+        path: PathBuf::from(row.get::<_, String>(1)?),
+        kind: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
 fn tab_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tab> {
     Ok(Tab {
         id: row.get(0)?,
@@ -1230,6 +1375,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(workspace.name, "development");
+        let contexts = registry.list_workspace_contexts(&workspace.id).unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].kind, "directory");
+        assert_eq!(contexts[0].path, Path::new("/tmp"));
+        registry
+            .insert_workspace_context(&workspace.id, Path::new("/tmp/README.md"), "file")
+            .unwrap();
+        assert_eq!(
+            registry
+                .list_workspace_contexts(&workspace.id)
+                .unwrap()
+                .len(),
+            2
+        );
         let tabs = registry.list_tabs(&workspace.id).unwrap();
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].name, "middle-manager");
@@ -1252,6 +1411,12 @@ mod tests {
         registry.delete_workspace(&workspace.id).unwrap();
         assert!(registry.workspace_by_ref(&workspace.id).unwrap().is_none());
         assert!(registry.list_tabs(&workspace.id).unwrap().is_empty());
+        assert!(
+            registry
+                .list_workspace_contexts(&workspace.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1731,5 +1896,17 @@ mod tests {
             second_binding.model_profile_id.as_deref(),
             Some(profile.id.as_str())
         );
+        assert_eq!(
+            registry
+                .list_workspace_codex_threads(&workspace.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        registry
+            .delete_workspace_and_threads(&workspace.id, std::slice::from_ref(&thread.id))
+            .unwrap();
+        assert!(registry.workspace_by_ref(&workspace.id).unwrap().is_none());
+        assert!(registry.codex_thread_by_ref(&thread.id).unwrap().is_none());
     }
 }
